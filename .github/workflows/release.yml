@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -13,6 +16,13 @@ on:
         required: false
         type: boolean
         default: false
+
+# 兼容 tag 触发和手动触发：
+# - tag 触发时，version = tag 名称（github.ref_name），prerelease = false
+# - 手动触发时，version = 用户输入，prerelease = 用户选择
+env:
+  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+  RELEASE_PRERELEASE: ${{ inputs.prerelease || false }}
 
 permissions:
   contents: write
@@ -36,10 +46,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -79,7 +89,7 @@ jobs:
           ls -la dist-final/
 
       - name: Upload backend artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: dist-final/${{ matrix.output_name }}
@@ -91,17 +101,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Download backend binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: sage-backend-windows
           path: dist/
@@ -122,7 +132,7 @@ jobs:
           find ../dist-electron -maxdepth 3 -type f \( -name "*.exe" -o -name "*.blockmap" -o -name "latest.yml" \) -print
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sage-desktop-windows
           path: |
@@ -137,17 +147,17 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Download backend binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: sage-backend-macos
           path: dist/
@@ -171,7 +181,7 @@ jobs:
           find ../dist-electron -maxdepth 3 -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.blockmap" -o -name "latest-mac.yml" \) -print
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sage-desktop-macos
           path: |
@@ -187,17 +197,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Download backend binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: sage-backend-linux
           path: dist/
@@ -221,7 +231,7 @@ jobs:
           find ../dist-electron -maxdepth 3 -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.blockmap" -o -name "latest-linux.yml" \) -print
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: sage-desktop-linux
           path: |
@@ -240,10 +250,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all desktop artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
@@ -265,10 +275,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: Sage ${{ inputs.version }}
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: Sage ${{ env.RELEASE_VERSION }}
           draft: true
-          prerelease: ${{ inputs.prerelease }}
+          prerelease: ${{ env.RELEASE_PRERELEASE }}
           generate_release_notes: true
           files: |
             artifacts/**/*.exe
