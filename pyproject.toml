@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sage-paper"
+dynamic = ["version"]
+description = "Sage — 多智能体协作的学术论文写作辅助系统（SCI/SSCI/CSSCI/EI 多学科支持）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Sage Team" },
+]
+keywords = [
+    "academic-writing", "paper", "research", "multi-agent",
+    "literature-index", "citation", "scholar", "llm",
+    "sci", "ssci", "cssci", "ei",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Text Processing :: Linguistic",
+    "Framework :: FastAPI",
+]
+
+dependencies = [
+    "openai>=1.50.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.5.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "typer>=0.12.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "tiktoken>=0.7.0",
+    "numpy>=1.26.0",
+    "httpx>=0.27.0",
+    "sentence-transformers>=3.0.0",
+    "duckduckgo-search>=6.0.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# Sage 论文写作系统专用依赖（PDF/Word/LaTeX 文档解析）
+paper = [
+    "pymupdf>=1.24.0",
+    "python-docx>=1.1.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "build>=1.2",
+    "twine>=5.0",
+]
+
+[project.scripts]
+sage = "sage.cli:app"
+
+# 版本管理脚本：直接通过 python scripts/xxx.py 调用
+# python scripts/bump_version.py patch
+# python scripts/sync_version.py --check
+
+[tool.setuptools.dynamic]
+version = {attr = "sage.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

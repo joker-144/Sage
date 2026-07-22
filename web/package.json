@@ -1,0 +1,30 @@
+{
+    "name": "sage-paper",
+    "version": "0.5.1",
+    "private": true,
+    "type": "module",
+    "main": "electron/main.cjs",
+    "description": "Sage — 多智能体协作的学术论文写作辅助系统",
+    "scripts": {
+        "version:sync": "python ../scripts/sync_version.py",
+        "prebuild": "python ../scripts/sync_version.py",
+        "prepack": "python ../scripts/sync_version.py",
+        "predev": "python ../scripts/sync_version.py",
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview",
+        "electron:dev": "vite build && electron .",
+        "electron:build": "vite build && electron-builder --config electron-builder.json"
+    },
+    "dependencies": {
+        "vue": "^3.5.0",
+        "marked": "^14.0.0",
+        "highlight.js": "^11.10.0"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-vue": "^5.1.0",
+        "vite": "^5.4.0",
+        "electron": "^33.0.0",
+        "electron-builder": "^25.0.0"
+    }
+}

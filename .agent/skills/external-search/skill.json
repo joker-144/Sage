@@ -1,0 +1,26 @@
+{
+  "name": "External Search",
+  "version": "1.0.0",
+  "description": "外部学术检索技能包，集成Google Scholar/arXiv/CrossRef/Semantic Scholar四大权威学术数据源，用于本地文献库不足时补充检索、引用真实性验证、最新研究进展追踪。",
+  "capabilities": [
+    "Google Scholar 学术搜索（综合检索）",
+    "arXiv 预印本检索（理工科前沿）",
+    "CrossRef DOI 元数据查询（引用验证）",
+    "Semantic Scholar 语义检索（智能推荐相关文献）",
+    "多源交叉验证引用真实性（多重验证机制外部层）"
+  ],
+  "tools": [
+    "search_scholar",
+    "search_arxiv",
+    "search_crossref",
+    "search_semantic_scholar"
+  ],
+  "trigger_conditions": [
+    "本地文献库检索结果不足需要补充时",
+    "需要查找最新研究进展（近1-2年）时",
+    "验证引用真实性时（多重验证机制）",
+    "通过DOI查询文献完整元数据时",
+    "查找特定作者/期刊/年份的论文时",
+    "撰写文献综述需要扩展研究脉络时"
+  ]
+}

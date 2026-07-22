@@ -1,0 +1,30 @@
+{
+  "name": "Literature Index",
+  "version": "1.0.0",
+  "description": "文献索引与引用管理技能包，提供论文向量索引、语义检索、参考文献提取、自动引用插入、多格式参考文献生成、查重检测等核心学术能力。",
+  "capabilities": [
+    "对工作空间论文建立向量索引（基于sentence-transformers）",
+    "语义检索文献库查找相关研究内容",
+    "从论文中提取参考文献列表",
+    "在指定标记位置自动插入引用",
+    "支持APA/MLA/GB-T7714/Vancouver/Chicago/IEEE六大引用格式",
+    "基于文献库的查重检测与重复率统计"
+  ],
+  "tools": [
+    "index_papers",
+    "search_literature",
+    "extract_references",
+    "insert_citation",
+    "format_references",
+    "check_plagiarism"
+  ],
+  "trigger_conditions": [
+    "新论文导入工作空间后需要建立索引时",
+    "撰写文献综述或研究背景需要检索已有文献时",
+    "需要从已上传论文提取参考文献列表时",
+    "撰写论文过程中需要插入引用时",
+    "完成参考文献列表需要按目标期刊格式化时",
+    "论文定稿前需要查重检测时",
+    "智能体需要验证引用真实性时（多重验证机制）"
+  ]
+}

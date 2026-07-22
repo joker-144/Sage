@@ -1,0 +1,10 @@
+include README.md
+include CHANGELOG.md
+include VERSION
+include .env.example
+include LICENSE
+include scripts/sync_version.py
+include scripts/bump_version.py
+recursive-include src *.py
+recursive-include src *.json
+recursive-include .agent *.json *.md

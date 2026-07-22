@@ -1,0 +1,30 @@
+{
+  "appId": "com.sage.paper.desktop",
+  "productName": "Sage",
+  "directories": {
+    "output": "../dist-electron"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "../dist/sage.exe",
+      "to": "backend/sage.exe"
+    },
+    {
+      "from": "../.env.example",
+      "to": ".env.example"
+    }
+  ],
+  "win": {
+    "target": "nsis",
+    "icon": "public/log.ico"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true
+  }
+}

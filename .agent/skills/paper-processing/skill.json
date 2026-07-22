@@ -1,0 +1,27 @@
+{
+  "name": "Paper Processing",
+  "version": "1.0.0",
+  "description": "学术论文文档处理技能包，支持PDF/Word/LaTeX/扫描版文档的解析、元数据提取与文本预处理，是文献导入与索引构建的前置环节。",
+  "capabilities": [
+    "解析PDF论文提取全文文本（基于PyMuPDF）",
+    "解析Word文档提取段落与结构",
+    "解析LaTeX源文件保留章节结构",
+    "提取论文元数据（标题/作者/年份/DOI/摘要/关键词）",
+    "OCR识别扫描版文档与图片型PDF",
+    "识别文档语言与学科领域"
+  ],
+  "tools": [
+    "parse_pdf",
+    "parse_docx",
+    "parse_latex",
+    "extract_metadata",
+    "ocr_document"
+  ],
+  "trigger_conditions": [
+    "用户上传或加载新论文到工作空间时",
+    "需要对PDF/Word/LaTeX文档进行内容分析时",
+    "需要提取论文标题、作者、DOI等元数据时",
+    "遇到扫描版PDF或图片型文档无法直接提取文本时",
+    "构建文献索引前需要对文档进行预处理时"
+  ]
+}

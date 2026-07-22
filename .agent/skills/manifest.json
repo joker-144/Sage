@@ -1,0 +1,145 @@
+{
+  "skills": [
+    {
+      "agent_name": "ai-pattern-reducer",
+      "name": "AI Pattern Reducer",
+      "version": "1.0.0",
+      "description": "降AI味技能包，识别并改写AI生成文本的典型痕迹（重复句式/过度连接词/空洞修饰/机械结构），将论文改写为符合人类学者风格的自然学术表达，规避AI检测。",
+      "capabilities": [
+        "识别AI生成文本的典型模式（句式/词汇/结构特征）",
+        "改写机械重复句式为多样化表达",
+        "消除过度使用的过渡词与连接结构",
+        "替换空洞修饰词为具体学术表达",
+        "打散机械段落结构，增强自然过渡",
+        "保留原意与引用，仅改写表达方式",
+        "改写后回归学术规范校验"
+      ],
+      "tools": [
+        "reduce_ai_pattern"
+      ],
+      "trigger_conditions": [
+        "智能体撰写完成初稿后需要降低AI痕迹时",
+        "整合多智能体产出后需要统一文风时",
+        "用户明确要求降低AI检测率时",
+        "审校核查员检测到AI写作模式特征时",
+        "论文定稿前的最后一道润色工序",
+        "查重后发现重复段落需要改写时（与literature-index.check_plagiarism配合）"
+      ]
+    },
+    {
+      "agent_name": "external-search",
+      "name": "External Search",
+      "version": "1.0.0",
+      "description": "外部学术检索技能包，集成Google Scholar/arXiv/CrossRef/Semantic Scholar四大权威学术数据源，用于本地文献库不足时补充检索、引用真实性验证、最新研究进展追踪。",
+      "capabilities": [
+        "Google Scholar 学术搜索（综合检索）",
+        "arXiv 预印本检索（理工科前沿）",
+        "CrossRef DOI 元数据查询（引用验证）",
+        "Semantic Scholar 语义检索（智能推荐相关文献）",
+        "多源交叉验证引用真实性（多重验证机制外部层）"
+      ],
+      "tools": [
+        "search_scholar",
+        "search_arxiv",
+        "search_crossref",
+        "search_semantic_scholar"
+      ],
+      "trigger_conditions": [
+        "本地文献库检索结果不足需要补充时",
+        "需要查找最新研究进展（近1-2年）时",
+        "验证引用真实性时（多重验证机制）",
+        "通过DOI查询文献完整元数据时",
+        "查找特定作者/期刊/年份的论文时",
+        "撰写文献综述需要扩展研究脉络时"
+      ]
+    },
+    {
+      "agent_name": "literature-index",
+      "name": "Literature Index",
+      "version": "1.0.0",
+      "description": "文献索引与引用管理技能包，提供论文向量索引、语义检索、参考文献提取、自动引用插入、多格式参考文献生成、查重检测等核心学术能力。",
+      "capabilities": [
+        "对工作空间论文建立向量索引（基于sentence-transformers）",
+        "语义检索文献库查找相关研究内容",
+        "从论文中提取参考文献列表",
+        "在指定标记位置自动插入引用",
+        "支持APA/MLA/GB-T7714/Vancouver/Chicago/IEEE六大引用格式",
+        "基于文献库的查重检测与重复率统计"
+      ],
+      "tools": [
+        "index_papers",
+        "search_literature",
+        "extract_references",
+        "insert_citation",
+        "format_references",
+        "check_plagiarism"
+      ],
+      "trigger_conditions": [
+        "新论文导入工作空间后需要建立索引时",
+        "撰写文献综述或研究背景需要检索已有文献时",
+        "需要从已上传论文提取参考文献列表时",
+        "撰写论文过程中需要插入引用时",
+        "完成参考文献列表需要按目标期刊格式化时",
+        "论文定稿前需要查重检测时",
+        "智能体需要验证引用真实性时（多重验证机制）"
+      ]
+    },
+    {
+      "agent_name": "paper-processing",
+      "name": "Paper Processing",
+      "version": "1.0.0",
+      "description": "学术论文文档处理技能包，支持PDF/Word/LaTeX/扫描版文档的解析、元数据提取与文本预处理，是文献导入与索引构建的前置环节。",
+      "capabilities": [
+        "解析PDF论文提取全文文本（基于PyMuPDF）",
+        "解析Word文档提取段落与结构",
+        "解析LaTeX源文件保留章节结构",
+        "提取论文元数据（标题/作者/年份/DOI/摘要/关键词）",
+        "OCR识别扫描版文档与图片型PDF",
+        "识别文档语言与学科领域"
+      ],
+      "tools": [
+        "parse_pdf",
+        "parse_docx",
+        "parse_latex",
+        "extract_metadata",
+        "ocr_document"
+      ],
+      "trigger_conditions": [
+        "用户上传或加载新论文到工作空间时",
+        "需要对PDF/Word/LaTeX文档进行内容分析时",
+        "需要提取论文标题、作者、DOI等元数据时",
+        "遇到扫描版PDF或图片型文档无法直接提取文本时",
+        "构建文献索引前需要对文档进行预处理时"
+      ]
+    },
+    {
+      "agent_name": "writing-assistant",
+      "name": "Writing Assistant",
+      "version": "1.0.0",
+      "description": "学术论文写作辅助技能包，提供大纲生成、段落撰写、学术润色、逻辑检查等核心写作能力，针对SCI/SSCI/CSSCI/EI多学科论文质量标准。",
+      "capabilities": [
+        "生成符合学术规范的研究论文大纲（IMRAD/主题式/综述式）",
+        "撰写符合学科规范的论文段落（含论证结构与引用占位）",
+        "学术化润色：口语化表达转学术化、术语统一、句式优化",
+        "论证逻辑检查：因果链完整性、证据充分性、逻辑跳跃识别",
+        "支持多学科写作风格适配（理工/人文/社科/医学）"
+      ],
+      "tools": [
+        "generate_outline",
+        "write_paragraph",
+        "polish_academic",
+        "check_logic"
+      ],
+      "trigger_conditions": [
+        "用户开始新论文写作需要大纲规划时",
+        "需要撰写论文具体章节段落时",
+        "初稿完成后需要学术化润色时",
+        "需要检查论证逻辑完整性时",
+        "撰写过程中遇到表达不规范需要优化时",
+        "整合多个智能体产出后需要统一文风时"
+      ]
+    }
+  ],
+  "count": 5,
+  "summary": "已安装 5 个技能: ai-pattern-reducer, external-search, literature-index, paper-processing, writing-assistant"
+}

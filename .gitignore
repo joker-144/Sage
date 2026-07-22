@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/
+workspace/
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+web/dist/
+web/.npm-cache/
+web/graphify-out
+# 旧 skills 目录中的垃圾文件
+skills/${APPDATA}
