@@ -1,0 +1,283 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.5.2)"
+        required: true
+        type: string
+        default: "v0.5.2"
+      prerelease:
+        description: "Mark as pre-release?"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-backend:
+    name: Build backend (PyInstaller) · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: sage-backend-windows
+            output_name: sage.exe
+          - os: macos-latest
+            artifact: sage-backend-macos
+            output_name: sage-mac
+          - os: ubuntu-latest
+            artifact: sage-backend-linux
+            output_name: sage-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package with paper extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[paper,dev]"
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean sage.spec
+
+      - name: Locate built binary
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            SRC="dist/sage.exe"
+          else
+            SRC="dist/sage"
+          fi
+          if [ ! -f "$SRC" ]; then
+            echo "::error::Expected binary $SRC not found"
+            ls -la dist/ || true
+            exit 1
+          fi
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mkdir -p dist-final
+          cp "${{ steps.locate.outputs.src }}" "dist-final/${{ matrix.output_name }}"
+          ls -la dist-final/
+
+      - name: Upload backend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist-final/${{ matrix.output_name }}
+          if-no-files-found: error
+
+  build-windows:
+    name: Build desktop · Windows
+    needs: build-backend
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Download backend binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sage-backend-windows
+          path: dist/
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build Electron app
+        working-directory: web
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --config electron-builder.json --win --publish never
+
+      - name: List built artifacts
+        shell: bash
+        run: |
+          find ../dist-electron -maxdepth 3 -type f \( -name "*.exe" -o -name "*.blockmap" -o -name "latest.yml" \) -print
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sage-desktop-windows
+          path: |
+            dist-electron/*.exe
+            dist-electron/*.blockmap
+            dist-electron/latest.yml
+          if-no-files-found: error
+
+  build-macos:
+    name: Build desktop · macOS
+    needs: build-backend
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Download backend binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sage-backend-macos
+          path: dist/
+
+      - name: Make backend executable and rename
+        run: chmod +x dist/sage-mac && cp dist/sage-mac dist/sage
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build Electron app
+        working-directory: web
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --config electron-builder.json --mac --publish never
+
+      - name: List built artifacts
+        shell: bash
+        run: |
+          find ../dist-electron -maxdepth 3 -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.blockmap" -o -name "latest-mac.yml" \) -print
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sage-desktop-macos
+          path: |
+            dist-electron/*.dmg
+            dist-electron/*.zip
+            dist-electron/*.blockmap
+            dist-electron/latest-mac.yml
+          if-no-files-found: error
+
+  build-linux:
+    name: Build desktop · Linux
+    needs: build-backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Download backend binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sage-backend-linux
+          path: dist/
+
+      - name: Make backend executable and rename
+        run: chmod +x dist/sage-linux && cp dist/sage-linux dist/sage
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build Electron app
+        working-directory: web
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --config electron-builder.json --linux --publish never
+
+      - name: List built artifacts
+        shell: bash
+        run: |
+          find ../dist-electron -maxdepth 3 -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.blockmap" -o -name "latest-linux.yml" \) -print
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sage-desktop-linux
+          path: |
+            dist-electron/*.AppImage
+            dist-electron/*.deb
+            dist-electron/*.blockmap
+            dist-electron/latest-linux.yml
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - build-windows
+      - build-macos
+      - build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== All artifacts ==="
+          find artifacts -type f | sort
+          echo ""
+          echo "=== Sizes ==="
+          du -h artifacts/* 2>/dev/null || true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Sage ${{ inputs.version }}
+          draft: true
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.exe
+            artifacts/**/*.dmg
+            artifacts/**/*.AppImage
+            artifacts/**/*.deb
+            artifacts/**/*.zip
+            artifacts/**/*.blockmap
+            artifacts/**/latest*.yml
+            artifacts/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
