@@ -87,6 +87,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist-final/${{ matrix.output_name }}
           if-no-files-found: error
+          retention-days: 1
 
   build-windows:
     name: Build desktop · Windows
@@ -206,11 +207,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Download all desktop artifacts
+      - name: Download Windows desktop artifacts
         uses: actions/download-artifact@v5
         with:
+          name: sage-desktop-windows
           path: artifacts
-          merge-multiple: true
+
+      - name: Download macOS desktop artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: sage-desktop-macos
+          path: artifacts
 
       - name: List downloaded artifacts
         run: |
@@ -223,7 +230,7 @@ jobs:
       - name: Generate checksums
         working-directory: artifacts
         run: |
-          sha256sum * > SHA256SUMS.txt
+          sha256sum *.exe *.dmg > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -235,11 +242,8 @@ jobs:
           prerelease: ${{ env.RELEASE_PRERELEASE }}
           generate_release_notes: true
           files: |
-            artifacts/**/*.exe
-            artifacts/**/*.dmg
-            artifacts/**/*.zip
-            artifacts/**/*.blockmap
-            artifacts/**/latest*.yml
+            artifacts/*.exe
+            artifacts/*.dmg
             artifacts/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

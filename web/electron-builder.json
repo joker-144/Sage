@@ -21,7 +21,8 @@
   ],
   "win": {
     "target": "nsis",
-    "icon": "public/log.ico"
+    "icon": "public/log.ico",
+    "artifactName": "Sage-${version}-Windows.${ext}"
   },
   "nsis": {
     "oneClick": false,
@@ -32,7 +33,8 @@
     "icon": "public/log.ico",
     "category": "public.app-category.education",
     "hardenedRuntime": false,
-    "gatekeeperAssess": false
+    "gatekeeperAssess": false,
+    "artifactName": "Sage-${version}-macOS.${ext}"
   },
   "linux": {
     "target": [
