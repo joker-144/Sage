@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -17,12 +14,11 @@ on:
         type: boolean
         default: false
 
-# 兼容 tag 触发和手动触发：
-# - tag 触发时，version = tag 名称（github.ref_name），prerelease = false
-# - 手动触发时，version = 用户输入，prerelease = 用户选择
 env:
-  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
-  RELEASE_PRERELEASE: ${{ inputs.prerelease || false }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+  # 强制 Python 使用 UTF-8 输出，避免 Windows cp1252 编码错误
+  PYTHONUTF8: "1"
 
 permissions:
   contents: write
@@ -40,9 +36,6 @@ jobs:
           - os: macos-latest
             artifact: sage-backend-macos
             output_name: sage-mac
-          - os: ubuntu-latest
-            artifact: sage-backend-linux
-            output_name: sage-linux
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
@@ -166,8 +159,12 @@ jobs:
           name: sage-backend-macos
           path: dist/
 
-      - name: Make backend executable and rename
-        run: chmod +x dist/sage-mac && cp dist/sage-mac dist/sage
+      - name: Make backend executable and rename for extraResources compatibility
+        run: |
+          chmod +x dist/sage-mac
+          # electron-builder.json 的 extraResources 引用 ../dist/sage.exe
+          # macOS 上将后端二进制复制为 sage.exe 以保持配置一致
+          cp dist/sage-mac dist/sage.exe
 
       - name: Install frontend dependencies
         working-directory: web
@@ -199,66 +196,11 @@ jobs:
             dist-electron/latest-mac.yml
           if-no-files-found: error
 
-  build-linux:
-    name: Build desktop · Linux
-    needs: build-backend
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Setup Node 22
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Download backend binary
-        uses: actions/download-artifact@v5
-        with:
-          name: sage-backend-linux
-          path: dist/
-
-      - name: Make backend executable and rename
-        run: chmod +x dist/sage-linux && cp dist/sage-linux dist/sage
-
-      - name: Install frontend dependencies
-        working-directory: web
-        run: npm ci
-
-      - name: Build frontend (Vite)
-        working-directory: web
-        run: npm run build
-
-      - name: Build Electron app
-        working-directory: web
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npx electron-builder --config electron-builder.json --linux --publish never
-
-      - name: List built artifacts
-        shell: bash
-        run: |
-          find ../dist-electron -maxdepth 3 -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.blockmap" -o -name "latest-linux.yml" \) -print
-
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: sage-desktop-linux
-          path: |
-            dist-electron/*.AppImage
-            dist-electron/*.deb
-            dist-electron/*.blockmap
-            dist-electron/latest-linux.yml
-          if-no-files-found: error
-
   publish-release:
     name: Publish GitHub Release
     needs:
       - build-windows
       - build-macos
-      - build-linux
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -295,8 +237,6 @@ jobs:
           files: |
             artifacts/**/*.exe
             artifacts/**/*.dmg
-            artifacts/**/*.AppImage
-            artifacts/**/*.deb
             artifacts/**/*.zip
             artifacts/**/*.blockmap
             artifacts/**/latest*.yml
