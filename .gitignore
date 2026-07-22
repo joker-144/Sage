@@ -8,6 +8,7 @@ workspace/
 *.egg-info/
 dist/
 build/
+.trae
 
 # Node.js
 node_modules/
