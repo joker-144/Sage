@@ -26,5 +26,22 @@
   "nsis": {
     "oneClick": false,
     "allowToChangeInstallationDirectory": true
+  },
+  "mac": {
+    "target": "dmg",
+    "icon": "public/log.ico",
+    "category": "public.app-category.education",
+    "hardenedRuntime": false,
+    "gatekeeperAssess": false
+  },
+  "linux": {
+    "target": [
+      "AppImage",
+      "deb"
+    ],
+    "icon": "public/log.ico",
+    "category": "Education",
+    "synopsis": "Sage — 学术论文写作辅助多智能体系统",
+    "description": "Sage 是一个多智能体协作的学术论文写作辅助系统，支持 SCI/SSCI/CSSCI/EI 多领域。"
   }
 }
