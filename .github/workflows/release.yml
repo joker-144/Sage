@@ -126,7 +126,7 @@ jobs:
       - name: List built artifacts
         shell: bash
         run: |
-          find ../dist-electron -maxdepth 3 -type f \( -name "*.exe" -o -name "*.blockmap" -o -name "latest.yml" \) -print
+          find dist-electron -maxdepth 3 -type f \( -name "*.exe" -o -name "*.blockmap" -o -name "latest.yml" \) -print
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v5
@@ -183,7 +183,7 @@ jobs:
       - name: List built artifacts
         shell: bash
         run: |
-          find ../dist-electron -maxdepth 3 -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.blockmap" -o -name "latest-mac.yml" \) -print
+          find dist-electron -maxdepth 3 -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.blockmap" -o -name "latest-mac.yml" \) -print
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v5

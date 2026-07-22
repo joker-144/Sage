@@ -5,6 +5,12 @@
     "type": "module",
     "main": "electron/main.cjs",
     "description": "Sage — 多智能体协作的学术论文写作辅助系统",
+    "author": {
+        "name": "Sage Team",
+        "email": "sage@example.com"
+    },
+    "homepage": "https://github.com/joker-144/Sage",
+    "license": "MIT",
     "scripts": {
         "version:sync": "python ../scripts/sync_version.py",
         "prebuild": "python ../scripts/sync_version.py",
