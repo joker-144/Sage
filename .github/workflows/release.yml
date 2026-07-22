@@ -120,6 +120,10 @@ jobs:
         working-directory: web
         run: npm ci
 
+      - name: Build frontend (Vite)
+        working-directory: web
+        run: npm run build
+
       - name: Build Electron app
         working-directory: web
         env:
@@ -168,6 +172,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: web
         run: npm ci
+
+      - name: Build frontend (Vite)
+        working-directory: web
+        run: npm run build
 
       - name: Build Electron app
         working-directory: web
@@ -218,6 +226,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: web
         run: npm ci
+
+      - name: Build frontend (Vite)
+        working-directory: web
+        run: npm run build
 
       - name: Build Electron app
         working-directory: web
