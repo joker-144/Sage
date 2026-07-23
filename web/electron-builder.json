@@ -28,7 +28,7 @@
     "oneClick": false,
     "allowToChangeInstallationDirectory": true,
     "installerIcon": "public/icon.png",
-    "uninstallerHeaderIcon": "public/icon.png",
+    "uninstallerIcon": "public/icon.png",
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true,
     "shortcutName": "Sage",
