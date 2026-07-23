@@ -21,16 +21,22 @@
   ],
   "win": {
     "target": "nsis",
-    "icon": "public/log.ico",
+    "icon": "public/icon.png",
     "artifactName": "Sage-${version}-Windows.${ext}"
   },
   "nsis": {
     "oneClick": false,
-    "allowToChangeInstallationDirectory": true
+    "allowToChangeInstallationDirectory": true,
+    "installerIcon": "public/icon.png",
+    "uninstallerHeaderIcon": "public/icon.png",
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Sage",
+    "include": "build/installer.nsh"
   },
   "mac": {
     "target": "dmg",
-    "icon": "public/log.ico",
+    "icon": "public/icon.png",
     "category": "public.app-category.education",
     "hardenedRuntime": false,
     "gatekeeperAssess": false,
@@ -41,7 +47,7 @@
       "AppImage",
       "deb"
     ],
-    "icon": "public/log.ico",
+    "icon": "public/icon.png",
     "category": "Education",
     "synopsis": "Sage — 学术论文写作辅助多智能体系统",
     "description": "Sage 是一个多智能体协作的学术论文写作辅助系统，支持 SCI/SSCI/CSSCI/EI 多领域。"

@@ -40,6 +40,12 @@ datas += copy_metadata("tiktoken")
 datas += collect_data_files("rich")
 datas += collect_data_files("typer")
 
+# ── 前端构建产物（web/dist）──────────────────────────────
+# 打包后 sage.exe 通过 _MEIPASS/web/dist/ 提供前端界面
+_web_dist = Path("web/dist")
+if _web_dist.exists():
+    datas.append((str(_web_dist), "web/dist"))
+
 # ── 隐式导入（PyInstaller 静态分析可能漏掉的动态导入）───
 hiddenimports = []
 hiddenimports += collect_submodules("sage")
