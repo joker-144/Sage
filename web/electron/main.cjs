@@ -1,4 +1,4 @@
-﻿const {
+const {
   app,
   BrowserWindow,
   dialog,
@@ -29,7 +29,7 @@ function readAppVersion() {
       }
     } catch { /* ignore */ }
   }
-  return '0.5.3';
+  return '0.5.4';
 }
 
 const APP_VERSION = readAppVersion();
@@ -165,28 +165,36 @@ function startBackend() {
 }
 
 function killBackend() {
-  if (backendProcess && !backendProcess.killed) {
-    console.log('[Sage] Stopping backend...');
-    try {
-      backendProcess.kill('SIGTERM');
-    } catch (e) {
-      // ignore
-    }
+  if (!backendProcess) return;
 
-    const forceKillTimeout = setTimeout(() => {
-      if (backendProcess && !backendProcess.killed) {
-        try {
-          backendProcess.kill('SIGKILL');
-        } catch (e) {
-          // ignore
-        }
+  console.log('[Sage] Stopping backend...');
+  const pid = backendProcess.pid;
+
+  try {
+    if (process.platform === 'win32') {
+      // Windows: taskkill 强制终止整个进程树
+      const { execSync } = require('child_process');
+      execSync(`taskkill /pid ${pid} /f /t`, { stdio: 'ignore' });
+      console.log(`[Sage] Backend (pid ${pid}) killed via taskkill`);
+    } else {
+      // macOS/Linux: SIGTERM -> SIGKILL
+      if (!backendProcess.killed) {
+        backendProcess.kill('SIGTERM');
       }
-    }, 5000);
-
-    backendProcess.on('exit', () => {
-      clearTimeout(forceKillTimeout);
-    });
+      setTimeout(() => {
+        try {
+          if (backendProcess && !backendProcess.killed) {
+            backendProcess.kill('SIGKILL');
+          }
+        } catch { /* ignore */ }
+      }, 3000);
+    }
+  } catch (e) {
+    // 进程可能已退出
+    console.log(`[Sage] Backend kill skipped: ${e.message}`);
   }
+
+  backendProcess = null;
 }
 
 function createWindow() {
