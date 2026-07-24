@@ -47,7 +47,8 @@ if _web_dist.exists():
     datas.append((str(_web_dist), "web/dist"))
 
 # ── 智能体定义文件（agents/*/agent.json + skill/）─────────
-# AgentLoader 通过 __file__ 路径查找，打包后需要保持目录结构
+# AgentLoader 通过 __file__ 路径查找，打包后 __file__ 在 _MEIPASS/sage/agents/
+# 所以 data 目标路径必须与 __file__ 解析出的路径一致
 _agents_src = Path("src/sage/agents")
 if _agents_src.exists():
     for agent_dir in _agents_src.iterdir():
@@ -55,14 +56,14 @@ if _agents_src.exists():
             continue
         agent_json = agent_dir / "agent.json"
         if agent_json.exists():
-            dest = f"src/sage/agents/{agent_dir.name}"
+            dest = f"sage/agents/{agent_dir.name}"
             datas.append((str(agent_json), dest))
         # 智能体专属技能
         skill_dir = agent_dir / "skill"
         if skill_dir.exists():
             skill_json = skill_dir / "skill.json"
             if skill_json.exists():
-                dest = f"src/sage/agents/{agent_dir.name}/skill"
+                dest = f"sage/agents/{agent_dir.name}/skill"
                 datas.append((str(skill_json), dest))
 
 # ── 技能系统文件（.agent/skills/）──────────────────────
