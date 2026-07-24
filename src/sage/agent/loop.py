@@ -1,4 +1,4 @@
-﻿"""
+"""
 AgentLoop — 核心智能体循环
 
 2026 增强版 — 集成反思、可观测性、弹性重试、MCP 支持
@@ -189,6 +189,9 @@ class AgentLoop:
 
         rounds = 0
         total_tool_calls = 0
+        # 工具调用去重缓存：同一轮对话中，相同工具+相同参数只执行一次
+        # key: "tool_name:args_json", value: 工具执行结果摘要
+        _dedup_cache: dict[str, str] = {}
 
         while rounds < self.max_tool_rounds:
             rounds += 1
@@ -274,10 +277,32 @@ class AgentLoop:
                         skill_name=skill_name,
                     )
 
+                    # 去重检查：同一轮对话中，相同工具+相同参数只执行一次
+                    args_key = json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
+                    dedup_key = f"{call.name}:{args_key}"
+                    if dedup_key in _dedup_cache:
+                        cached = _dedup_cache[dedup_key]
+                        self.context.add_tool_result(call.id, call.name, cached)
+                        self._persist_message(
+                            "tool", cached,
+                            tool_call_id=call.id,
+                            tool_name=call.name,
+                        )
+                        yield LoopEvent(
+                            type="tool_result",
+                            tool_name=call.name,
+                            content=f"[跳过重复调用] {cached}",
+                        )
+                        continue
+
                     result = await self._execute_tool_with_reflection(
                         call=call,
                         session_id=session_id,
                     )
+
+                    # 缓存成功的工具调用结果
+                    if result.success:
+                        _dedup_cache[dedup_key] = result.summary
 
                     # 将结果加入上下文
                     self.context.add_tool_result(call.id, call.name, result.summary)

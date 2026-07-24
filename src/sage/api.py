@@ -754,7 +754,20 @@ async def list_models(
 
 # ── 用户配置持久化接口 ──
 
-_USER_SETTINGS_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "settings.json"
+def _get_data_dir() -> Path:
+    """获取用户数据目录
+
+    打包后 main.cjs 会将 cwd 设为 %LOCALAPPDATA%/Sage 并通过 SAGE_DATA_DIR 环境变量传递，
+    开发时默认为当前工作目录。
+    """
+    import os as _os
+    env_dir = _os.environ.get("SAGE_DATA_DIR", "")
+    if env_dir:
+        return Path(env_dir)
+    return Path.cwd()
+
+
+_USER_SETTINGS_FILE = _get_data_dir() / "data" / "settings.json"
 
 
 def _load_user_settings() -> dict:
@@ -778,10 +791,15 @@ _DOTENV_KEY_MAP = {
 
 def _save_to_dotenv(data: dict) -> None:
     """将前端用户配置写入 .env 文件，确保后端始终使用前端配置"""
-    dotenv_path = Path(".env").resolve()
+    dotenv_path = _get_data_dir() / ".env"
     if not dotenv_path.exists():
-        print(f"[WARN] .env 文件不存在: {dotenv_path}")
-        return
+        # 打包后首次运行通常没有 .env，自动创建空文件
+        try:
+            dotenv_path.parent.mkdir(parents=True, exist_ok=True)
+            dotenv_path.touch()
+        except Exception as e:
+            print(f"[WARN] 无法创建 .env 文件: {dotenv_path} ({e})")
+            return
 
     # 从 data 中提取值，映射为 .env 变量
     env_values: dict[str, str] = {}
@@ -842,6 +860,14 @@ def _save_user_settings(data: dict) -> None:
     cfg = get_config()
     masked_key = cfg.llm_chat_api_key[:8] + "..." + cfg.llm_chat_api_key[-4:] if len(cfg.llm_chat_api_key) > 12 else "***"
     print(f"[INFO] 配置已重载: model={cfg.llm_chat_model}, base_url={cfg.llm_chat_base_url}, api_key={masked_key}")
+
+    # 3) 清空已缓存的 AgentLoop 实例
+    # 已缓存的 Agent 在创建时就持有了旧 LLMClient（用旧 config 初始化），
+    # 仅 reset_config 不会更新它们的 api_key。清空后下次对话会用新配置重建 AgentLoop。
+    cleared = len(_agents)
+    _agents.clear()
+    if cleared:
+        print(f"[INFO] 已清空 {cleared} 个缓存的 Agent 实例，下次对话将使用新配置")
 
 
 @app.get("/api/user-settings")

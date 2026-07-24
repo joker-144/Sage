@@ -16,18 +16,31 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 # skills 目录路径
 # 开发模式: 项目根目录下的 .agent/skills/
-# 打包模式: PyInstaller _MEIPASS 中的 .agent/skills/
+# 打包模式: 用户数据目录 SAGE_DATA_DIR/.agent/skills/（可写），首次自动从 _MEIPASS 复制默认技能
 if getattr(sys, 'frozen', False):
-    _AGENT_DIR = Path(sys._MEIPASS) / '.agent'
+    import shutil
+    # 用户数据目录中的技能目录（可写）
+    _data_dir_s = Path(os.environ.get("SAGE_DATA_DIR", "")) if os.environ.get("SAGE_DATA_DIR") else Path(sys._MEIPASS)
+    _AGENT_DIR = _data_dir_s / '.agent'
+    _SKILLS_DIR = _AGENT_DIR / 'skills'
+    # 首次运行时，从 _MEIPASS 复制默认技能到用户数据目录
+    _packaged_skills = Path(sys._MEIPASS) / '.agent' / 'skills'
+    if _packaged_skills.exists() and not _SKILLS_DIR.exists():
+        try:
+            _SKILLS_DIR.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(str(_packaged_skills), str(_SKILLS_DIR), dirs_exist_ok=True)
+        except Exception:
+            pass
 else:
     _AGENT_DIR = Path(__file__).resolve().parent.parent.parent / '.agent'
-_SKILLS_DIR = _AGENT_DIR / 'skills'
+    _SKILLS_DIR = _AGENT_DIR / 'skills'
 
 
 def get_skills_dir() -> Path:

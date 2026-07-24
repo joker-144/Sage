@@ -29,6 +29,7 @@ Sage 论文写作系统的工作空间管理核心。每个工作空间是一个
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -481,9 +482,13 @@ class SageWorkspaceManager:
 
         不修改 .env 的其他字段，仅更新 sage_WORKSPACE 行。
         """
-        env_path = Path(".env")
+        # 打包后 .env 在 SAGE_DATA_DIR 中（用户可写），开发时在当前目录
+        env_path = Path(os.environ.get("SAGE_DATA_DIR", "")) / ".env" if os.environ.get("SAGE_DATA_DIR") else Path(".env")
         if not env_path.exists():
+            # 开发模式回退：尝试项目根目录下的 .env
             env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+        if not env_path.exists():
+            return
 
         lines = []
         found = False

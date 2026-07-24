@@ -6,10 +6,22 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 
 const BACKEND_STARTUP_TIMEOUT = 30000;
 const DEFAULT_PORT = 19476;
+
+// 数据目录：打包后使用 %LOCALAPPDATA%/Sage，开发时使用项目根目录
+const DATA_DIR = (() => {
+  if (app.isPackaged) {
+    const dir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Sage');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
+    return dir;
+  }
+  return path.join(__dirname, '..', '..');
+})();
 
 let mainWindow = null;
 let backendProcess = null;
@@ -57,9 +69,10 @@ function _launchBackend(port) {
   const portArg = String(port);
   console.log(`[Sage] Starting backend: ${backendPath} --port ${portArg}`);
   backendProcess = spawn(backendPath, ['serve', '--port', portArg], {
+    cwd: DATA_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    env: { ...process.env, SAGE_VERSION: APP_VERSION },
+    env: { ...process.env, SAGE_VERSION: APP_VERSION, SAGE_DATA_DIR: DATA_DIR },
   });
 }
 
