@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, onMounted, provide, watch } from 'vue'
 import { useChat } from './composables/useChat'
 import TitleBar from './components/TitleBar.vue'
@@ -11,7 +11,6 @@ import AgentsView from './components/AgentsView.vue'
 import SkillsView from './components/SkillsView.vue'
 import WorkspaceView from './components/WorkspaceView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
-import IndexModal from './components/IndexModal.vue'
 import StatsModal from './components/StatsModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 
@@ -21,7 +20,6 @@ const {
 } = useChat()
 
 const activeView = ref('chat')
-const showIndex = ref(false)
 const showStats = ref(false)
 const sidebarExpanded = ref(true)
 const sidebarRefreshKey = ref(0)
@@ -86,7 +84,6 @@ onMounted(() => { reset() })
         :current-conversation-id="conversationId"
         :refresh-key="sidebarRefreshKey"
         @new-chat="handleNewChat"
-        @index="showIndex = true"
         @stats="showStats = true"
         @navigate="handleNavigate"
         @load-conversation="handleLoadConversation"
@@ -131,7 +128,6 @@ onMounted(() => { reset() })
 
     <StatusBar :is-processing="isProcessing" />
 
-    <transition name="fade"><IndexModal v-if="showIndex" @close="showIndex = false" /></transition>
     <transition name="fade"><StatsModal v-if="showStats" @close="showStats = false" /></transition>
     <ConfirmDialog
       :visible="confirmDelete.show"

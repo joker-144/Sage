@@ -46,6 +46,37 @@ _web_dist = Path("web/dist")
 if _web_dist.exists():
     datas.append((str(_web_dist), "web/dist"))
 
+# ── 智能体定义文件（agents/*/agent.json + skill/）─────────
+# AgentLoader 通过 __file__ 路径查找，打包后需要保持目录结构
+_agents_src = Path("src/sage/agents")
+if _agents_src.exists():
+    for agent_dir in _agents_src.iterdir():
+        if not agent_dir.is_dir():
+            continue
+        agent_json = agent_dir / "agent.json"
+        if agent_json.exists():
+            dest = f"src/sage/agents/{agent_dir.name}"
+            datas.append((str(agent_json), dest))
+        # 智能体专属技能
+        skill_dir = agent_dir / "skill"
+        if skill_dir.exists():
+            skill_json = skill_dir / "skill.json"
+            if skill_json.exists():
+                dest = f"src/sage/agents/{agent_dir.name}/skill"
+                datas.append((str(skill_json), dest))
+
+# ── 技能系统文件（.agent/skills/）──────────────────────
+# SkillLoader 通过 __file__ 路径查找 .agent/skills/
+_skills_src = Path(".agent/skills")
+if _skills_src.exists():
+    for skill_dir in _skills_src.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        for f in skill_dir.iterdir():
+            if f.is_file():
+                dest = f".agent/skills/{skill_dir.name}"
+                datas.append((str(f), dest))
+
 # ── 隐式导入（PyInstaller 静态分析可能漏掉的动态导入）───
 hiddenimports = []
 hiddenimports += collect_submodules("sage")

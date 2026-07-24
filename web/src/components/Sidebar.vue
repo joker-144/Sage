@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, onMounted, watch } from 'vue'
 
 const props = defineProps({
@@ -9,7 +9,7 @@ const props = defineProps({
   currentConversationId: { type: String, default: null },
   refreshKey: { type: Number, default: 0 },
 })
-const emit = defineEmits(['new-chat', 'index', 'stats', 'navigate', 'load-conversation', 'delete-conversation'])
+const emit = defineEmits(['new-chat', 'stats', 'navigate', 'load-conversation', 'delete-conversation'])
 
 const conversations = ref([])
 const APP_VERSION = __APP_VERSION__
@@ -81,9 +81,6 @@ watch(() => props.refreshKey, () => {
         </button>
       </div>
       <div class="activity-bottom">
-        <button class="activity-btn" title="索引项目" @click="emit('index')">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3 7l9-4 9 4M3 7v10l9 4 9-4V7M3 7l9 4 9-4M12 11v10" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
-        </button>
         <button class="activity-btn" title="记忆统计" @click="emit('stats')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 19V10M10 19V4M16 19v-7M22 19H2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         </button>

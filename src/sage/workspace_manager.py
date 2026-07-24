@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -40,12 +41,23 @@ from sage.config import get_config
 
 
 # Sage 工作空间根目录（所有 Sage 工作空间的父目录）
-# 默认为项目根目录下的 workspaces/
+# 开发模式: 项目根目录下的 workspaces/
+# 打包模式: 用户数据目录下的 workspaces/（可写）
 def _get_sage_root() -> Path:
     """获取 Sage 工作空间根目录"""
-    # 项目根目录：src/sage/ 的上两级
-    project_root = Path(__file__).resolve().parent.parent.parent
-    return project_root / "workspaces"
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后：使用用户数据目录（可写）
+        import os
+        if os.name == 'nt':  # Windows
+            base = Path(os.environ.get('APPDATA', Path.home())) / 'sage'
+        else:  # macOS / Linux
+            base = Path.home() / '.sage'
+        base.mkdir(parents=True, exist_ok=True)
+        return base / 'workspaces'
+    else:
+        # 开发模式：项目根目录下的 workspaces/
+        project_root = Path(__file__).resolve().parent.parent.parent
+        return project_root / 'workspaces'
 
 
 # 领域标签合法字符正则（字母/数字/连字符/下划线，长度2-32）
