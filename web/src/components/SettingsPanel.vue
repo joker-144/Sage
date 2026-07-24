@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, onMounted, computed, watch } from 'vue'
 
 // ── 供应商定义 ──
@@ -198,13 +198,43 @@ const hasUpdate = ref(false)
 const changelog = ref('')
 const releaseUrl = ref('')
 const downloadUrl = ref('')
+const updateSource = ref('none')
 const checkingUpdate = ref(false)
 const updatingVersion = ref(false)
 const updateLog = ref([])
 const updateDone = ref(false)
 
+// ── 下载进度模态框状态 ──
+const showDownloadModal = ref(false)
+const downloadProgress = ref(0)
+const downloadStatusText = ref('准备中…')
+const downloadMessage = ref('')
+const downloadedFilePath = ref('')
+const downloadError = ref('')
+const downloadPhase = ref('idle')  // idle | downloading | done | error
+
 // 是否运行在 Electron 中
 const isElectron = computed(() => !!window.electronAPI)
+
+// 更新来源徽章文本
+const sourceBadgeText = computed(() => {
+  switch (updateSource.value) {
+    case 'github': return 'GitHub 直连'
+    case 'github-mirror': return 'GitHub 镜像'
+    case 'pypi': return 'PyPI'
+    default: return '—'
+  }
+})
+
+// 模态框标题
+const modalTitleText = computed(() => {
+  switch (downloadPhase.value) {
+    case 'done': return '下载完成'
+    case 'error': return '下载失败'
+    case 'downloading': return '正在下载更新'
+    default: return '准备下载'
+  }
+})
 
 // 所有供应商模型总数
 const totalModelCount = computed(() => {
@@ -295,6 +325,7 @@ async function checkVersion() {
     changelog.value = data.changelog || ''
     releaseUrl.value = data.release_url || ''
     downloadUrl.value = data.download_url || ''
+    updateSource.value = data.source || 'none'
   } catch (e) {
     updateLog.value = [{ text: `检查更新失败: ${e.message}`, url: '' }]
   } finally {
@@ -302,72 +333,150 @@ async function checkVersion() {
   }
 }
 
+// 解析 SSE/IPC 进度消息，更新模态框状态
+function handleProgressMessage(msg) {
+  if (!msg) return
+
+  // 保留到日志（兼容旧 UI 与调试）
+  updateLog.value.push({ text: msg.message || JSON.stringify(msg), url: msg.release_url || '' })
+
+  const status = msg.status
+  const message = msg.message || ''
+  const percent = msg.percent
+
+  if (status === 'info') {
+    // 信息性消息：镜像切换、续传提示等
+    downloadStatusText.value = message
+    downloadMessage.value = message
+  } else if (status === 'progress') {
+    downloadPhase.value = 'downloading'
+    downloadStatusText.value = '下载中'
+    downloadMessage.value = message
+    if (typeof percent === 'number') {
+      downloadProgress.value = Math.min(100, Math.max(0, percent))
+    }
+  } else if (status === 'done') {
+    downloadPhase.value = 'done'
+    downloadProgress.value = 100
+    downloadStatusText.value = '下载完成'
+    downloadMessage.value = message || '下载完成'
+    downloadedFilePath.value = msg.file_path || ''
+    updateDone.value = true
+  } else if (status === 'error') {
+    downloadPhase.value = 'error'
+    downloadStatusText.value = '下载失败'
+    downloadError.value = message
+    downloadMessage.value = message
+    if (msg.release_url) releaseUrl.value = msg.release_url
+  }
+}
+
+function resetDownloadModal() {
+  downloadProgress.value = 0
+  downloadStatusText.value = '准备中…'
+  downloadMessage.value = ''
+  downloadedFilePath.value = ''
+  downloadError.value = ''
+  downloadPhase.value = 'idle'
+  updateLog.value = []
+}
+
 async function startUpdate() {
   updatingVersion.value = true
-  updateLog.value = []
-  updateDone.value = false
+  resetDownloadModal()
+  showDownloadModal.value = true
 
   try {
-    // Electron 模式：下载 → 安装 → 退出
+    // Electron 模式：通过主进程下载（IPC 流式进度）
     if (window.electronAPI) {
       // 监听下载进度
       window.electronAPI.onUpdateProgress((msg) => {
-        updateLog.value.push({ text: msg.message || JSON.stringify(msg), url: '' })
+        handleProgressMessage(msg)
       })
 
       const dlResult = await window.electronAPI.updateDownload()
       if (!dlResult.success) {
-        updateLog.value.push({ text: `下载失败: ${dlResult.error}`, url: '' })
-        updatingVersion.value = false
-        return
+        downloadPhase.value = 'error'
+        downloadStatusText.value = '下载失败'
+        downloadError.value = dlResult.error || '未知错误'
+        downloadMessage.value = dlResult.error || '下载失败'
       }
-
-      updateLog.value.push({ text: '安装包已下载，正在启动安装程序…', url: '' })
-
-      const installResult = await window.electronAPI.updateInstall(dlResult.file_path)
-      if (!installResult.success) {
-        updateLog.value.push({ text: `安装启动失败: ${installResult.error}`, url: '' })
-      }
-      // 安装程序启动后，应用会自动退出
+      // 下载成功后由 handleProgressMessage 的 done 事件处理
     } else {
-      // 浏览器模式：SSE 下载 → 手动安装
+      // 浏览器模式：SSE 流式下载
       const resp = await fetch('/api/version/download', { method: 'POST' })
       const reader = resp.body.getReader()
       const decoder = new TextDecoder()
+      let buffer = ''
 
-      let downloadedFile = ''
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        const text = decoder.decode(value, { stream: true })
-        for (const line of text.split('\n')) {
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
           const trimmed = line.trim()
           if (trimmed.startsWith('data: ')) {
             try {
               const msg = JSON.parse(trimmed.slice(6))
-              updateLog.value.push({ text: msg.message || JSON.stringify(msg), url: msg.release_url || '' })
-              if (msg.status === 'done') {
-                downloadedFile = msg.file_path || ''
-                updateDone.value = true
-              }
+              handleProgressMessage(msg)
             } catch {
-              updateLog.value.push({ text: trimmed.slice(6), url: '' })
+              // 忽略无法解析的行
             }
           }
         }
       }
-
-      if (downloadedFile) {
-        // 浏览器模式提示用户手动运行安装包
-        updateLog.value.push({ text: `安装包已保存到: ${downloadedFile}`, url: '' })
-        updateLog.value.push({ text: '请在文件管理器中双击运行安装包完成更新。', url: '' })
+      // 处理剩余缓冲
+      if (buffer.trim().startsWith('data: ')) {
+        try {
+          const msg = JSON.parse(buffer.trim().slice(6))
+          handleProgressMessage(msg)
+        } catch { /* ignore */ }
       }
     }
   } catch (e) {
-    updateLog.value.push({ text: `更新异常: ${e.message}`, url: '' })
+    downloadPhase.value = 'error'
+    downloadStatusText.value = '更新异常'
+    downloadError.value = e.message
+    downloadMessage.value = `更新异常: ${e.message}`
   } finally {
     updatingVersion.value = false
   }
+}
+
+// 触发安装（Electron 模式）
+async function installUpdate() {
+  if (!downloadedFilePath.value) return
+
+  try {
+    downloadStatusText.value = '正在启动安装程序…'
+    if (window.electronAPI) {
+      const result = await window.electronAPI.updateInstall(downloadedFilePath.value)
+      if (!result.success) {
+        downloadPhase.value = 'error'
+        downloadError.value = result.error || '安装启动失败'
+        downloadStatusText.value = '安装失败'
+        downloadMessage.value = `安装启动失败: ${result.error}`
+      }
+      // 安装程序启动后，应用会自动退出（main.cjs 中 app.quit()）
+    } else {
+      // 浏览器模式：提示用户手动运行安装包
+      downloadStatusText.value = '请在文件管理器中双击运行安装包'
+      downloadMessage.value = `安装包路径: ${downloadedFilePath.value}`
+    }
+  } catch (e) {
+    downloadPhase.value = 'error'
+    downloadError.value = e.message
+    downloadStatusText.value = '安装失败'
+    downloadMessage.value = `安装失败: ${e.message}`
+  }
+}
+
+function closeDownloadModal() {
+  // 下载进行中不允许关闭
+  if (downloadPhase.value === 'downloading') return
+  showDownloadModal.value = false
 }
 </script>
 
@@ -561,22 +670,19 @@ async function startUpdate() {
           <span class="version-label">最新版本</span>
           <span class="version-value latest">{{ latestVersion }}</span>
         </div>
+        <!-- 来源/状态：检测成功显示来源徽章（即使版本相同，让用户确认连上了 GitHub）；
+             检测失败显示检查失败提示，区分 fallback 误报 -->
+        <div v-if="currentVersion && !checkingUpdate" class="version-row">
+          <span class="version-label">{{ updateSource === 'none' ? '检测状态' : '更新来源' }}</span>
+          <span class="version-value source-badge" :style="updateSource === 'none' ? 'color: var(--error)' : ''">
+            {{ updateSource === 'none' ? '检查失败，未获取到版本信息' : sourceBadgeText }}
+          </span>
+        </div>
       </div>
 
       <div v-if="hasUpdate && changelog" class="changelog-box">
         <div class="changelog-title">更新日志</div>
         <pre class="changelog-content">{{ changelog }}</pre>
-      </div>
-
-      <div v-if="updateLog.length" class="update-log-box">
-        <div v-for="(line, i) in updateLog" :key="i" class="log-line">
-          {{ line.text }}
-          <a v-if="line.url" :href="line.url" target="_blank" class="log-link">手动下载</a>
-        </div>
-      </div>
-
-      <div v-if="updateDone" class="update-done-hint">
-        更新完成，请重启应用以生效。
       </div>
 
       <div class="version-actions">
@@ -597,6 +703,113 @@ async function startUpdate() {
         当前运行在浏览器模式，请在桌面端使用一键更新功能以获得最佳体验。
       </p>
     </div>
+
+    <!-- ── 下载进度模态框 ── -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="showDownloadModal" class="modal-overlay" @click.self="closeDownloadModal">
+          <div class="download-modal-card" :class="`phase-${downloadPhase}`">
+            <!-- 头部 -->
+            <div class="modal-header">
+              <div class="modal-title-group">
+                <div class="modal-icon" :class="`icon-${downloadPhase}`">
+                  <svg v-if="downloadPhase === 'done'" width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <svg v-else-if="downloadPhase === 'error'" width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <svg v-else width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </div>
+                <div>
+                  <div class="modal-title">{{ modalTitleText }}</div>
+                  <div class="modal-subtitle">
+                    <span v-if="currentVersion && latestVersion">v{{ currentVersion }} → v{{ latestVersion }}</span>
+                    <span v-else>更新下载</span>
+                  </div>
+                </div>
+              </div>
+              <button
+                v-if="downloadPhase !== 'downloading'"
+                class="modal-close-btn"
+                @click="closeDownloadModal"
+                title="关闭"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                  <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+              </button>
+            </div>
+
+            <!-- 进度条区域 -->
+            <div class="modal-body">
+              <div class="progress-section">
+                <div class="progress-header">
+                  <span class="progress-status">{{ downloadStatusText }}</span>
+                  <span class="progress-percent">{{ downloadProgress }}%</span>
+                </div>
+                <div class="progress-bar-wrapper">
+                  <div class="progress-bar-track">
+                    <div
+                      class="progress-bar-fill"
+                      :style="{ width: downloadProgress + '%' }"
+                      :class="{ 'is-error': downloadPhase === 'error', 'is-done': downloadPhase === 'done', 'is-indeterminate': downloadPhase === 'idle' }"
+                    ></div>
+                  </div>
+                </div>
+                <div v-if="downloadMessage" class="progress-message" :class="{ 'is-error': downloadPhase === 'error' }">
+                  {{ downloadMessage }}
+                </div>
+              </div>
+
+              <!-- 错误时显示手动下载链接 -->
+              <div v-if="downloadPhase === 'error' && releaseUrl" class="error-actions">
+                <a :href="releaseUrl" target="_blank" class="manual-download-link">
+                  手动下载最新版本
+                </a>
+              </div>
+            </div>
+
+            <!-- 底部操作 -->
+            <div class="modal-footer">
+              <button
+                v-if="downloadPhase === 'done'"
+                class="btn-primary modal-install-btn"
+                @click="installUpdate()"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 3v12m0 0l-4-4m4 4l4-4M3 17v2a2 2 0 002 2h14a2 2 0 002-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                立即安装
+              </button>
+              <button
+                v-if="downloadPhase === 'done' && !isElectron"
+                class="btn-secondary"
+                @click="closeDownloadModal"
+              >
+                稍后安装
+              </button>
+              <button
+                v-if="downloadPhase === 'error'"
+                class="btn-secondary"
+                @click="closeDownloadModal"
+              >
+                关闭
+              </button>
+              <button
+                v-if="downloadPhase === 'downloading' || downloadPhase === 'idle'"
+                class="btn-secondary modal-cancel-btn"
+                disabled
+              >
+                下载中…
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
 
     <div class="actions">
       <button class="btn-save" @click="saveSettings" :class="{ saved }">
@@ -793,11 +1006,11 @@ select:focus { outline: none; border-color: var(--accent-border); box-shadow: 0 
 .changelog-title { font-size: 11.5px; font-weight: 600; color: var(--text-secondary); padding: 9px 13px; background: var(--bg-input); border-bottom: 1px solid var(--border); }
 .changelog-content { font-size: 10.5px; font-family: var(--font-mono); color: var(--text-muted); padding: 11px 13px; margin: 0; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; line-height: 1.6; }
 
-.update-log-box { background: var(--bg-code); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 9px 13px; margin-bottom: 11px; max-height: 200px; overflow-y: auto; }
-.log-line { font-size: 10.5px; font-family: var(--font-mono); color: var(--text-muted); line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
-.log-link { color: var(--accent); text-decoration: underline; margin-left: 6px; white-space: nowrap; }
-
-.update-done-hint { font-size: 11.5px; color: var(--success); font-weight: 600; margin-bottom: 11px; padding: 7px 13px; background: var(--success-soft); border: 1px solid var(--success); border-radius: var(--radius-md); }
+.source-badge {
+  font-size: 10.5px; font-family: var(--font-sans); font-weight: 500;
+  color: var(--accent); background: var(--accent-soft);
+  padding: 2px 9px; border-radius: 10px;
+}
 
 .version-actions { display: flex; gap: 9px; margin-top: 7px; }
 .btn-primary {
@@ -835,8 +1048,164 @@ select:focus { outline: none; border-color: var(--accent-border); box-shadow: 0 
 }
 .btn-reset:hover { border-color: var(--error); color: var(--error); }
 
+/* ── 下载进度模态框 ── */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 10000;
+  background: rgba(15, 23, 42, 0.42);
+  backdrop-filter: blur(6px) saturate(140%);
+  -webkit-backdrop-filter: blur(6px) saturate(140%);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+
+.download-modal-card {
+  width: 100%; max-width: 460px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg), 0 0 0 1px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+  animation: scaleIn 0.24s var(--ease-spring);
+}
+.download-modal-card.phase-error { border-color: rgba(239, 68, 68, 0.28); }
+.download-modal-card.phase-done { border-color: rgba(16, 185, 129, 0.28); }
+
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border-light);
+}
+.modal-title-group { display: flex; align-items: center; gap: 12px; }
+
+.modal-icon {
+  width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft); color: var(--accent);
+  transition: all 0.2s var(--ease-out-expo);
+}
+.modal-icon.icon-downloading { background: var(--accent-soft); color: var(--accent); }
+.modal-icon.icon-done { background: var(--success-soft); color: var(--success); }
+.modal-icon.icon-error { background: var(--error-soft); color: var(--error); }
+.modal-icon.icon-idle { background: var(--bg-soft); color: var(--text-muted); }
+
+.modal-title {
+  font-size: 14.5px; font-weight: 650; color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.modal-subtitle {
+  font-size: 11px; color: var(--text-muted);
+  font-family: var(--font-mono); margin-top: 1px;
+}
+
+.modal-close-btn {
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm);
+  border: none; background: transparent;
+  color: var(--text-faint);
+  cursor: pointer; transition: all 0.15s var(--ease-out-expo);
+}
+.modal-close-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.modal-body { padding: 18px 20px; }
+
+.progress-section { display: flex; flex-direction: column; gap: 9px; }
+.progress-header {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.progress-status {
+  font-size: 12.5px; font-weight: 600; color: var(--text-primary);
+}
+.progress-percent {
+  font-family: var(--font-mono);
+  font-size: 13px; font-weight: 600; color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.phase-error .progress-percent { color: var(--error); }
+.phase-done .progress-percent { color: var(--success); }
+
+.progress-bar-wrapper {
+  padding: 2px 0;
+}
+.progress-bar-track {
+  position: relative;
+  height: 7px;
+  background: var(--bg-soft);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.progress-bar-fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.32s var(--ease-out-expo);
+  box-shadow: 0 0 8px rgba(13, 148, 136, 0.32);
+}
+.progress-bar-fill.is-done {
+  background: var(--success);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.32);
+}
+.progress-bar-fill.is-error {
+  background: var(--error);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.32);
+}
+.progress-bar-fill.is-indeterminate {
+  width: 32% !important;
+  animation: indeterminate-slide 1.4s var(--ease-in-out) infinite;
+}
+
+@keyframes indeterminate-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(360%); }
+}
+
+.progress-message {
+  font-size: 11.5px; color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.55;
+  word-break: break-all;
+  margin-top: 2px;
+}
+.progress-message.is-error { color: var(--error); }
+
+.error-actions {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-light);
+}
+.manual-download-link {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--accent);
+  text-decoration: none;
+  padding: 5px 11px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  transition: all 0.15s var(--ease-out-expo);
+}
+.manual-download-link:hover {
+  background: var(--accent); color: white;
+  border-color: var(--accent);
+}
+
+.modal-footer {
+  display: flex; justify-content: flex-end; gap: 9px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--border-light);
+}
+.modal-install-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.modal-cancel-btn { cursor: not-allowed; opacity: 0.6; }
+
 @media (max-width: 768px) {
   .settings { padding: 18px 14px; }
   .provider-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+  .download-modal-card { max-width: calc(100vw - 28px); }
+  .modal-header, .modal-body, .modal-footer { padding-left: 16px; padding-right: 16px; }
 }
 </style>

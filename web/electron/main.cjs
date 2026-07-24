@@ -332,17 +332,39 @@ ipcMain.handle('update-download', async () => {
 
 ipcMain.handle('update-install', async (_event, filePath) => {
   try {
-    const { exec } = require('child_process');
-    // 以管理员权限静默安装
-    exec(
-      `"${filePath}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`,
-      (error) => {
-        if (error) {
-          console.error('[Sage] Install error:', error);
-        }
+    const { spawn } = require('child_process');
+    const fs = require('fs');
+
+    // 校验安装包路径
+    if (!filePath || !fs.existsSync(filePath)) {
+      return { success: false, error: `安装包不存在: ${filePath}` };
+    }
+
+    console.log(`[Sage] Launching installer (detached): ${filePath}`);
+
+    // 使用 detached:true + stdio:'ignore' + unref()
+    // 使安装程序脱离 Electron 进程组，应用退出后安装程序可继续运行
+    // 否则 app.quit() 会连带杀死子进程，导致下载完成后无法安装
+    const child = spawn(
+      filePath,
+      ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-'],
+      {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
       }
     );
+
+    // unref() 允许父进程独立退出，不等待子进程
+    child.unref();
+
+    // 监听启动错误（如文件不可执行）
+    child.on('error', (err) => {
+      console.error('[Sage] Installer launch error:', err);
+    });
+
     // 给安装程序一点启动时间，然后退出应用
+    // killBackend 会用 taskkill /t 终止后端进程树，但安装程序已 detached 不受影响
     setTimeout(() => {
       app.quit();
     }, 2000);

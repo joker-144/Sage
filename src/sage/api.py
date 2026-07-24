@@ -872,7 +872,15 @@ async def save_user_settings(payload: UserSettingsPayload):
 
 @app.get("/api/version/check")
 async def version_check():
-    """检查最新版本（优先 GitHub Releases，回退 PyPI）"""
+    """检查最新版本（优先 GitHub Releases，回退 PyPI）
+
+    国内访问 api.github.com 经常失败，因此采用多镜像回退机制：
+    1. 优先尝试 api.github.com（VPN 或可直连环境）
+    2. 失败时通过 kkgithub.com 镜像解析 releases.atom + expanded_assets
+    3. 最后回退到 PyPI
+
+    下载 URL 始终包装为 mirror.ghproxy.com 代理，确保国内无需 VPN 即可下载。
+    """
     import httpx
 
     current = __version__
@@ -886,11 +894,12 @@ async def version_check():
         "source": "none",
     }
 
-    # 优先尝试 GitHub Releases
+    # 优先尝试 GitHub Releases API（直连）
+    gh_api_ok = False
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
             gh_resp = client.get(
-                "https://api.github.com/repos/joker-144/Sage/releases/latest",
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                 headers={
                     "User-Agent": "Sage-Updater",
                     "Accept": "application/vnd.github.v3+json",
@@ -919,11 +928,60 @@ async def version_check():
                 result["latest"] = tag
                 result["changelog"] = changelog_body[:4096]
                 result["release_url"] = html_url
-                result["download_url"] = download_url
+                # 始终包装为国内加速镜像
+                result["download_url"] = _wrap_ghproxy(download_url)
                 result["has_update"] = _compare_versions(tag, current) > 0
                 result["source"] = "github"
+                gh_api_ok = True
     except Exception:
-        # GitHub 失败，回退 PyPI
+        pass  # 进入镜像回退逻辑
+
+    # 直连失败 → 优先用国内镜像代理 api.github.com（已验证 gh-proxy.com 可代理该 API）
+    if not gh_api_ok:
+        proxied_data = _fetch_latest_release_via_ghproxy_api()
+        if proxied_data:
+            tag = proxied_data.get("tag_name", "").lstrip("v")
+            changelog_body = proxied_data.get("body", "") or ""
+            html_url = proxied_data.get("html_url", "")
+            download_url = ""
+            for asset in proxied_data.get("assets", []):
+                name = asset.get("name", "")
+                if name.endswith(".exe") and ("Setup" in name or "setup" in name or "install" in name or "Installer" in name or "Windows" in name):
+                    download_url = asset.get("browser_download_url", "")
+                    break
+            if not download_url:
+                for asset in proxied_data.get("assets", []):
+                    if asset.get("name", "").endswith(".exe"):
+                        download_url = asset.get("browser_download_url", "")
+                        break
+
+            if tag:
+                result["latest"] = tag
+                result["changelog"] = changelog_body[:4096]
+                result["release_url"] = html_url
+                result["download_url"] = _wrap_ghproxy(download_url)
+                result["has_update"] = _compare_versions(tag, current) > 0
+                result["source"] = "github-mirror"
+                gh_api_ok = True  # 标记成功，跳过 atom feed 回退
+
+    # 镜像代理也失败 → 使用 atom feed 解析
+    if not gh_api_ok:
+        atom_info = _fetch_latest_release_via_atom()
+        if atom_info and atom_info.get("tag"):
+            tag = atom_info["tag"]
+            release_url = atom_info.get("release_url", "") or f"https://github.com/{GITHUB_REPO}/releases/tag/v{tag}"
+
+            # 通过 expanded_assets 接口获取资源下载 URL（kkgithub 镜像）
+            asset_url = _fetch_asset_url_via_mirror(tag)
+
+            result["latest"] = tag
+            result["release_url"] = release_url
+            result["download_url"] = _wrap_ghproxy(asset_url) if asset_url else ""
+            result["has_update"] = _compare_versions(tag, current) > 0
+            result["source"] = "github-mirror"
+
+    # GitHub 与镜像均失败 → 回退 PyPI
+    if result["source"] == "none":
         try:
             with httpx.Client(timeout=15.0, follow_redirects=True) as client:
                 py_resp = client.get(
@@ -950,37 +1008,76 @@ async def version_check():
 
 @app.post("/api/version/download")
 async def version_download():
-    """下载最新版本的安装包到下载目录，返回本地文件路径（SSE 流式进度）"""
+    """下载最新版本的安装包到下载目录，返回本地文件路径（SSE 流式进度）
+
+    流程：
+    1. 获取最新 release 信息（优先 api.github.com，失败时使用 kkgithub.com 镜像）
+    2. 下载 URL 包装为 mirror.ghproxy.com 代理，确保国内可下载
+    3. 支持断点续传与失败重试，镜像失败时自动切换备用镜像
+    """
     import asyncio
     import httpx
 
     async def download_stream():
         import time
         release_url = ""
+        tag = ""
+        download_url = ""
+        file_name = ""
 
         try:
-            # 获取最新 Release 信息
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                gh_resp = await client.get(
-                    "https://api.github.com/repos/joker-144/Sage/releases/latest",
-                    headers={
-                        "User-Agent": "Sage-Updater",
-                        "Accept": "application/vnd.github.v3+json",
-                    },
-                )
-                gh_resp.raise_for_status()
-                gh_data = gh_resp.json()
-                tag = gh_data.get("tag_name", "").lstrip("v")
-                release_url = gh_data.get("html_url", "")
+            # 获取最新 Release 信息 — 优先 api.github.com
+            gh_api_ok = False
+            try:
+                async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+                    gh_resp = await client.get(
+                        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                        headers={
+                            "User-Agent": "Sage-Updater",
+                            "Accept": "application/vnd.github.v3+json",
+                        },
+                    )
+                    if gh_resp.status_code == 200:
+                        gh_data = gh_resp.json()
+                        tag = gh_data.get("tag_name", "").lstrip("v")
+                        release_url = gh_data.get("html_url", "")
+                        for asset in gh_data.get("assets", []):
+                            name = asset.get("name", "")
+                            if name.endswith(".exe"):
+                                download_url = asset.get("browser_download_url", "")
+                                file_name = name
+                                break
+                        if download_url:
+                            gh_api_ok = True
+            except Exception:
+                pass
 
-            download_url = ""
-            file_name = ""
-            for asset in gh_data.get("assets", []):
-                name = asset.get("name", "")
-                if name.endswith(".exe"):
-                    download_url = asset.get("browser_download_url", "")
-                    file_name = name
-                    break
+            # 直连失败 → 优先用国内镜像代理 api.github.com（与 version_check 一致）
+            if not gh_api_ok:
+                proxied_data = await asyncio.to_thread(_fetch_latest_release_via_ghproxy_api)
+                if proxied_data:
+                    tag = proxied_data.get("tag_name", "").lstrip("v")
+                    release_url = proxied_data.get("html_url", "") or release_url
+                    for asset in proxied_data.get("assets", []):
+                        name = asset.get("name", "")
+                        if name.endswith(".exe"):
+                            download_url = asset.get("browser_download_url", "")
+                            file_name = name
+                            break
+                    if download_url:
+                        gh_api_ok = True
+
+            # 镜像代理也失败 → 使用 atom feed 解析版本号 + 资源 URL
+            if not gh_api_ok:
+                # 同步函数包装为异步执行
+                atom_info = await asyncio.to_thread(_fetch_latest_release_via_atom)
+                if atom_info and atom_info.get("tag"):
+                    tag = atom_info["tag"]
+                    release_url = atom_info.get("release_url", "") or f"https://github.com/{GITHUB_REPO}/releases/tag/v{tag}"
+                    asset_url = await asyncio.to_thread(_fetch_asset_url_via_mirror, tag)
+                    if asset_url:
+                        download_url = asset_url
+                        file_name = asset_url.rsplit("/", 1)[-1] if asset_url else ""
 
             if not download_url:
                 msg = "未找到可用安装包"
@@ -989,16 +1086,24 @@ async def version_download():
                 yield f"data: {json.dumps({'status': 'error', 'message': msg, 'release_url': release_url}, ensure_ascii=False)}\n\n"
                 return
 
+            # 始终使用国内加速镜像下载（ghproxy 代理）
+            mirrored_download_url = _wrap_ghproxy(download_url)
+            if not file_name:
+                file_name = download_url.rsplit("/", 1)[-1]
+
             download_dir = Path.home() / "Downloads"
             download_dir.mkdir(exist_ok=True)
             dest = download_dir / file_name
 
             total_size = 0
             # 先获取文件大小并检查已下载多少
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                head_resp = await client.head(download_url, headers={"User-Agent": "Sage-Updater"})
-                if head_resp.status_code == 200:
-                    total_size = int(head_resp.headers.get("Content-Length", 0))
+            try:
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                    head_resp = await client.head(mirrored_download_url, headers={"User-Agent": "Sage-Updater"})
+                    if head_resp.status_code == 200:
+                        total_size = int(head_resp.headers.get("Content-Length", 0))
+            except Exception:
+                pass
 
             existing_size = dest.stat().st_size if dest.exists() else 0
             if existing_size > 0 and total_size > 0 and existing_size >= total_size:
@@ -1008,7 +1113,7 @@ async def version_download():
             elif existing_size > 0 and total_size > 0:
                 yield f"data: {json.dumps({'status': 'info', 'message': f'发现未完成的下载，从 {existing_size/1024/1024:.1f}MB 处续传…'}, ensure_ascii=False)}\n\n"
             else:
-                yield f"data: {json.dumps({'status': 'info', 'message': f'找到版本 {tag}，开始下载 {file_name}…'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'status': 'info', 'message': f'找到版本 {tag}，开始下载 {file_name}（使用国内镜像）…'}, ensure_ascii=False)}\n\n"
 
             # 进度报告间隔控制
             last_report = 0.0
@@ -1022,15 +1127,33 @@ async def version_download():
             max_retries = 3
             total_downloaded = existing_size
 
+            # 镜像列表：失败时切换备用镜像
+            # 第一个为首选，后续为备用
+            mirror_urls_to_try = [mirrored_download_url]
+            if "github.com" in download_url:
+                for mirror_prefix in _GH_PROXY_MIRRORS[1:]:
+                    mirror_urls_to_try.append(mirror_prefix + download_url)
+                # 最后回退到原始 URL（可能需要 VPN）
+                mirror_urls_to_try.append(download_url)
+
+            download_success = False
+            current_url_idx = 0
+
             for attempt in range(max_retries + 1):
                 try:
+                    current_url = mirror_urls_to_try[current_url_idx]
                     headers = {"User-Agent": "Sage-Updater"}
                     resume_from = dest.stat().st_size if dest.exists() else 0
                     if resume_from > 0:
                         headers["Range"] = f"bytes={resume_from}-"
 
-                    async with download_client.stream("GET", download_url, headers=headers) as resp:
+                    async with download_client.stream("GET", current_url, headers=headers) as resp:
                         if resp.status_code not in (200, 206):
+                            # 切换备用镜像
+                            if current_url_idx < len(mirror_urls_to_try) - 1:
+                                current_url_idx += 1
+                                yield f"data: {json.dumps({'status': 'info', 'message': '当前镜像不可用，切换备用镜像…'}, ensure_ascii=False)}\n\n"
+                                continue
                             resp.raise_for_status()
 
                         # 206 = 断点续传
@@ -1051,9 +1174,14 @@ async def version_download():
                                     yield f"data: {json.dumps({'status': 'progress', 'message': f'下载中 {total_downloaded//1024//1024}MB / {total_size//1024//1024}MB ({pct}%)', 'percent': pct}, ensure_ascii=False)}\n\n"
 
                     # 下载成功，跳出重试循环
+                    download_success = True
                     break
 
-                except Exception:
+                except Exception as e:
+                    if current_url_idx < len(mirror_urls_to_try) - 1:
+                        current_url_idx += 1
+                        yield f"data: {json.dumps({'status': 'info', 'message': f'镜像下载失败，切换备用镜像… ({str(e)[:80]})'}, ensure_ascii=False)}\n\n"
+                        continue
                     if attempt < max_retries:
                         delay = 2 ** attempt
                         yield f"data: {json.dumps({'status': 'info', 'message': f'连接中断，{delay}秒后重试 (第{attempt+1}次)…'}, ensure_ascii=False)}\n\n"
@@ -1062,7 +1190,8 @@ async def version_download():
                         raise
 
             await download_client.aclose()
-            yield f"data: {json.dumps({'status': 'done', 'message': '下载完成', 'file_path': str(dest)}, ensure_ascii=False)}\n\n"
+            if download_success:
+                yield f"data: {json.dumps({'status': 'done', 'message': '下载完成', 'file_path': str(dest)}, ensure_ascii=False)}\n\n"
 
         except Exception as e:
             err_msg = f"下载失败: {str(e)}"
@@ -1194,6 +1323,200 @@ def _compare_versions(v1: str, v2: str) -> int:
     elif p1 < p2:
         return -1
     return 0
+
+
+# ── GitHub 镜像辅助函数 ──
+# 国内访问 api.github.com 经常失败，使用多镜像回退机制确保可用性
+GITHUB_REPO = "joker-144/Sage"
+# GitHub 下载加速镜像列表（按优先级排序，已验证可用性）
+# gh-proxy.com: 支持 Range 断点续传，国内可直连
+# gh.api.99988866.xyz: Cloudflare 加速
+# mirror.ghproxy.com: 备用
+_GH_PROXY_MIRRORS = [
+    "https://gh-proxy.com/",
+    "https://gh.api.99988866.xyz/",
+    "https://mirror.ghproxy.com/",
+]
+
+
+def _wrap_ghproxy(download_url: str) -> str:
+    """将 GitHub 下载 URL 包装为国内加速镜像 URL
+
+    仅对 github.com 域名生效，其他域名原样返回。
+    若镜像包装后 URL 异常则回退到原始 URL。
+    """
+    if not download_url or "github.com" not in download_url:
+        return download_url
+    # 优先使用第一个镜像，下载失败时由上层重试逻辑切换
+    return _GH_PROXY_MIRRORS[0] + download_url
+
+
+def _fetch_latest_release_via_ghproxy_api() -> dict | None:
+    """通过国内镜像代理 api.github.com 的 releases/latest 接口
+
+    国内直连 api.github.com 经常超时，但 gh-proxy.com 等镜像可代理该 API 请求
+    并返回完整 JSON（含 tag_name、assets、html_url）。
+
+    Returns:
+        解析后的 release JSON dict，或 None（所有镜像均失败时）
+    """
+    import httpx
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    for mirror_prefix in _GH_PROXY_MIRRORS:
+        proxied_url = mirror_prefix + api_url
+        try:
+            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                resp = client.get(
+                    proxied_url,
+                    headers={
+                        "User-Agent": "Sage-Updater",
+                        "Accept": "application/vnd.github.v3+json",
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("tag_name"):
+                        return data
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_latest_release_via_atom() -> dict | None:
+    """通过 GitHub releases.atom 获取最新版本信息
+
+    Atom feed 比 api.github.com 更易访问（走 github.com 而非 api 子域），
+    格式稳定且易解析。kkgithub.com 作为备用镜像。
+
+    Returns:
+        {"tag": "0.5.5", "release_url": "..."} 或 None
+    """
+    import xml.etree.ElementTree as ET
+
+    import httpx
+
+    # 优先直连 github.com（许多国内环境可直连 github.com 但无法访问 api.github.com）
+    # kkgithub.com 作为备用镜像
+    atom_urls = [
+        f"https://github.com/{GITHUB_REPO}/releases.atom",
+        f"https://kkgithub.com/{GITHUB_REPO}/releases.atom",
+    ]
+
+    for atom_url in atom_urls:
+        try:
+            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+                resp = client.get(
+                    atom_url,
+                    headers={"User-Agent": "Sage-Updater"},
+                )
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+                # Atom namespace
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                entries = root.findall("atom:entry", ns)
+                if not entries:
+                    # 退而求其次：使用无命名空间解析
+                    entries = root.findall("entry")
+                if not entries:
+                    return None
+
+                # 第一条 entry 即为最新 release
+                entry = entries[0]
+                # 提取版本号：从 <title> 或 <id> 中解析
+                title_el = entry.find("atom:title", ns) or entry.find("title")
+                id_el = entry.find("atom:id", ns) or entry.find("id")
+                link_el = entry.find("atom:link", ns) or entry.find("link")
+
+                title = (title_el.text or "").strip() if title_el is not None else ""
+                id_text = (id_el.text or "").strip() if id_el is not None else ""
+                release_url = ""
+                if link_el is not None:
+                    release_url = link_el.get("href", "") or id_text
+
+                # 从 title 中提取版本号（常见格式: "v0.5.5" 或 "Release 0.5.5" 或 "0.5.5"）
+                tag = ""
+                for candidate in (title, id_text):
+                    if not candidate:
+                        continue
+                    # 提取 v?数字.数字.数字 格式
+                    import re
+                    m = re.search(r"v?(\d+\.\d+(?:\.\d+)*)", candidate)
+                    if m:
+                        tag = m.group(1)
+                        break
+
+                if tag:
+                    if not release_url:
+                        release_url = id_text
+                    return {"tag": tag, "release_url": release_url}
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_asset_url_via_mirror(tag: str) -> str:
+    """获取指定版本 release 的 Windows 安装包下载 URL
+
+    使用 GitHub 的 expanded_assets 端点，返回 HTML 页面列出该 release 的所有资源。
+    解析 HTML 找到 .exe 安装包的下载链接。
+    kkgithub.com 作为备用镜像。
+
+    Args:
+        tag: 版本号（如 "0.5.5"）
+
+    Returns:
+        原始 github.com 下载 URL（未包装 ghproxy），失败返回空字符串
+    """
+    import re
+
+    import httpx
+
+    # 尝试带 v 前缀和不带 v 前缀两种 tag 格式
+    tag_variants = [f"v{tag}", tag] if not tag.startswith("v") else [tag, tag.lstrip("v")]
+
+    for tag_variant in tag_variants:
+        # 优先直连 github.com，kkgithub.com 作为备用
+        for base in ["https://github.com", "https://kkgithub.com"]:
+            url = f"{base}/{GITHUB_REPO}/releases/expanded_assets/{tag_variant}"
+            try:
+                with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+                    resp = client.get(
+                        url,
+                        headers={"User-Agent": "Sage-Updater"},
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    html = resp.text
+
+                    # 解析所有 href 中的下载链接
+                    # 格式: href="/joker-144/Sage/releases/download/v0.5.5/Sage-0.5.5-Windows.exe"
+                    pattern = re.compile(
+                        r'href="(/[^"]*?/releases/download/[^"]*\.exe)"',
+                        re.IGNORECASE,
+                    )
+                    matches = pattern.findall(html)
+
+                    if not matches:
+                        continue
+
+                    # 优先选择包含 Setup/installer/Windows 关键字的资源
+                    preferred = ""
+                    for path in matches:
+                        lower = path.lower()
+                        if "setup" in lower or "installer" in lower or "install" in lower or "windows" in lower:
+                            preferred = path
+                            break
+                    if not preferred:
+                        preferred = matches[0]
+
+                    # 将相对路径转为绝对 URL（始终使用 github.com 域名，由上层 _wrap_ghproxy 包装代理）
+                    if preferred.startswith("/"):
+                        return f"https://github.com{preferred}"
+                    return preferred
+            except Exception:
+                continue
+    return ""
 
 
 # ── Sage 工作空间管理 API（新增，不修改原有 /api/workspace 接口）──
