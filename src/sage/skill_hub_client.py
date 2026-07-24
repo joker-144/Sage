@@ -24,16 +24,26 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-# ── SkillHub 远程端点（从 skillhub CLI 的 defaults 提取）──
+# ── SkillHub 远程端点（可通过环境变量覆盖） ──
+# 所有端点支持 SAGE_SKILLHUB_* 环境变量覆盖，便于服务迁移或私有部署。
+import os
 
-SKILLS_INDEX_URL = (
-    "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills.json"
+SKILLS_INDEX_URL = os.environ.get(
+    "SAGE_SKILLHUB_INDEX",
+    "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills.json",
 )
-PRIMARY_DOWNLOAD_URL = "https://lightmake.site/api/v1/download?slug={slug}"
-FALLBACK_DOWNLOAD_URL = (
-    "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/{slug}.zip"
+PRIMARY_DOWNLOAD_URL = os.environ.get(
+    "SAGE_SKILLHUB_DOWNLOAD",
+    "https://lightmake.site/api/v1/download?slug={slug}",
 )
-SEARCH_URL = "https://lightmake.site/api/v1/search"
+FALLBACK_DOWNLOAD_URL = os.environ.get(
+    "SAGE_SKILLHUB_FALLBACK",
+    "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/{slug}.zip",
+)
+SEARCH_URL = os.environ.get(
+    "SAGE_SKILLHUB_SEARCH",
+    "https://lightmake.site/api/v1/search",
+)
 
 DEFAULT_TIMEOUT = 30.0
 

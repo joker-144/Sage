@@ -87,6 +87,10 @@ hiddenimports += collect_submodules("transformers")
 hiddenimports += collect_submodules("tiktoken")
 hiddenimports += collect_submodules("fitz")        # pymupdf
 hiddenimports += collect_submodules("docx")       # python-docx
+hiddenimports += collect_submodules("torch")
+hiddenimports += collect_submodules("scipy")
+hiddenimports += collect_submodules("sklearn")
+hiddenimports += collect_submodules("tokenizers")
 hiddenimports += [
     "openai",
     "httpx",
@@ -121,7 +125,6 @@ excludes = [
     "jupyter",
     "notebook",
     "pandas",
-    "scipy",
     "PIL.ImageQt",
     "PyQt5",
     "PyQt6",

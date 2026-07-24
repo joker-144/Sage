@@ -2,14 +2,37 @@
 Sage 配置系统
 基于 pydantic-settings，从 .env 和环境变量加载配置
 单模型运行时，Provider 可切换（OpenAI 兼容协议）
+
+打包后（PyInstaller frozen）自动将 .env 和数据文件路径定位到
+%LOCALAPPDATA%/Sage/（与 Electron main.cjs 的 SAGE_DATA_DIR 对齐）。
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
 from pathlib import Path
 from typing import Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _get_data_dir() -> Path:
+    """获取用户数据目录。
+
+    优先级：
+    1. 环境变量 SAGE_DATA_DIR（Electron main.cjs 设置）
+    2. PyInstaller frozen 模式 → %LOCALAPPDATA%/Sage
+    3. 开发模式 → 当前工作目录
+    """
+    env_dir = _os.environ.get("SAGE_DATA_DIR", "")
+    if env_dir:
+        return Path(env_dir)
+    if getattr(_sys, "frozen", False):
+        local_appdata = _os.environ.get("LOCALAPPDATA", "")
+        if local_appdata:
+            return Path(local_appdata) / "Sage"
+    return Path.cwd()
 
 
 class AgentConfig(BaseSettings):
@@ -20,7 +43,7 @@ class AgentConfig(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_get_data_dir() / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -36,7 +59,10 @@ class AgentConfig(BaseSettings):
     llm_chat_max_tool_rounds: int = Field(default=12, validation_alias="LLM_CHAT_MAX_TOOL_ROUNDS")
 
     # ── 记忆系统配置 ──
-    memory_sqlite_path: str = Field(default="data/memory.db", validation_alias="MEMORY_SQLITE_PATH")
+    memory_sqlite_path: str = Field(
+        default=str(_get_data_dir() / "data" / "memory.db"),
+        validation_alias="MEMORY_SQLITE_PATH",
+    )
 
     # ── Embedding 配置（LLM_EMBEDDING_* 前缀）──
     # 本地 sentence-transformers 模型（all-MiniLM-L6-v2，384 维，约 80MB）

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -28,9 +29,23 @@ app = FastAPI(
 )
 
 # CORS 允许前端直连后端（绕过 Vite 代理的 SSE 缓冲问题）
+# 开发模式：仅允许 Vite dev server
+# 生产模式（PyInstaller 打包或 Electron）：允许任意 localhost 端口 + file:// + app://
+if getattr(sys, 'frozen', False) or os.environ.get("SAGE_PRODUCTION", ""):
+    _cors_origins = [
+        "http://localhost:*",
+        "https://localhost:*",
+        "http://127.0.0.1:*",
+        "file://",
+        "app://",
+        "tauri://localhost",
+    ]
+else:
+    _cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,14 +53,32 @@ app.add_middleware(
 
 # 静态 Web 界面托管（Vue 构建产物）
 if getattr(sys, 'frozen', False):
-    # PyInstaller 打包后：多个可能的路径尝试
+    # PyInstaller 打包后：多候选路径尝试，覆盖常见的 datas 放置布局变更
     _base = Path(sys._MEIPASS)
-    for _p in [_base / "web" / "dist", _base / "_internal" / "web" / "dist"]:
-        if _p.exists() and (_p / "index.html").exists():
+    _index_found = False
+    for _p in [
+        _base / "web" / "dist",
+        _base / "_internal" / "web" / "dist",
+        _base / "web",                          # 未构建 dist 时直接托管 web/
+        _base / "_internal" / "web",
+    ]:
+        if (_p / "index.html").exists():
             WEB_DIR = _p
+            _index_found = True
             break
-    else:
-        WEB_DIR = _base / "web" / "dist"  # 默认路径
+
+    if not _index_found:
+        # 最后手段：递归搜索 _MEIPASS 下任意包含 index.html 的目录
+        for _p in sorted(_base.glob("**/index.html"), key=lambda x: len(str(x))):
+            _candidate = _p.parent
+            if (_candidate / "assets").is_dir():
+                WEB_DIR = _candidate
+                _index_found = True
+                break
+
+    if not _index_found:
+        # 所有路径都失效时返回一个占位目录，后续挂载时跳过
+        WEB_DIR = _base / "web" / "dist"
 else:
     WEB_DIR = Path(__file__).parent.parent.parent / "web" / "dist"
 
@@ -1234,10 +1267,15 @@ async def version_download():
 
 @app.post("/api/version/install")
 async def version_install(request: Request):
-    """先卸载旧版本（如已安装），再安装新版本。返回 JSON 状态。"""
-    import os
+    """先卸载旧版本（如已安装），再安装新版本。返回 JSON 状态。
+
+    改进点：
+    - 安装后等待 3 秒检查进程状态，若已退出则返回退出码
+    - 卸载操作增加错误信息收集
+    """
     import subprocess
     import winreg
+    import time
 
     body = await request.json()
     file_path = body.get("file_path", "")
@@ -1249,7 +1287,7 @@ async def version_install(request: Request):
         uninstalled = False
         uninstall_result = ""
 
-        # 查找已安装的 Sage（Inno Setup 注册表项）
+        # 查找已安装的 Sage（Inno Setup 注册表项 / NSIS）
         base_keys = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
@@ -1270,7 +1308,6 @@ async def version_install(request: Request):
                                     if "Sage" in display_name or "sage-paper" in display_name.lower():
                                         try:
                                             uninstaller_path = winreg.QueryValueEx(app_key, "UninstallString")[0]
-                                            # UninstallString 通常带引号: "C:\...\unins000.exe"
                                             uninstaller_path = uninstaller_path.strip('"')
                                         except FileNotFoundError:
                                             pass
@@ -1285,33 +1322,59 @@ async def version_install(request: Request):
             except OSError:
                 continue
 
-        # 如果注册表没找到，尝试常见路径
+        # 如果注册表没找到，尝试常见安装路径
         if not uninstaller_path:
+            program_files = os.environ.get("ProgramFiles", "") or "C:\\Program Files"
+            program_files_x86 = os.environ.get("ProgramFiles(x86)", "") or "C:\\Program Files (x86)"
+            local_appdata = os.environ.get("LOCALAPPDATA", "") or ""
             common_paths = [
-                Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "Sage" / "unins000.exe",
-                Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")) / "Sage" / "unins000.exe",
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Sage" / "unins000.exe",
+                Path(program_files) / "Sage" / "unins000.exe",
+                Path(program_files_x86) / "Sage" / "unins000.exe",
             ]
+            if local_appdata:
+                common_paths.append(Path(local_appdata) / "Sage" / "unins000.exe")
             for p in common_paths:
                 if p.exists():
                     uninstaller_path = str(p)
                     break
 
-        # 执行卸载
+        # 执行卸载（等待完成 + 超时保护）
         if uninstaller_path and Path(uninstaller_path).exists():
-            proc = subprocess.run(
-                [uninstaller_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-                capture_output=True, text=True, timeout=120,
-            )
-            uninstalled = True
-            uninstall_result = f"旧版本已卸载 (返回码 {proc.returncode})"
+            try:
+                proc = subprocess.run(
+                    [uninstaller_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                uninstalled = True
+                uninstall_result = f"旧版本已卸载 (返回码 {proc.returncode})"
+                if proc.returncode != 0:
+                    stderr_tail = proc.stderr.strip()[-200:] if proc.stderr else "(无错误输出)"
+                    uninstall_result += f"，stderr: {stderr_tail}"
+            except subprocess.TimeoutExpired:
+                uninstall_result = "旧版本卸载超时（120秒），可能仍需管理员权限"
 
-        # 安装新版本
+        # 安装新版本 — 启动后短暂等待确认进程未立即崩溃
         proc = subprocess.Popen(
             [file_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        # 等待 3 秒检测是否立即失败
+        time.sleep(3)
+        exit_code = proc.poll()
+        if exit_code is not None and exit_code != 0:
+            stdout_tail = ""
+            stderr_tail = ""
+            try:
+                out, err = proc.communicate(timeout=5)
+                stdout_tail = (out or b"").decode("utf-8", errors="replace")[-200:]
+                stderr_tail = (err or b"").decode("utf-8", errors="replace")[-200:]
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "error": f"安装程序启动失败 (退出码 {exit_code})。可能需要以管理员身份运行。\nstdout: {stdout_tail}\nstderr: {stderr_tail}",
+            }
 
         msg_parts = []
         if uninstalled:
@@ -1891,3 +1954,128 @@ async def sage_get_citation_styles():
             {"code": "IEEE", "name": "IEEE", "description": "工程/计算机"},
         ]
     }
+
+
+# ──────────────────────────── 模型下载进度 SSE ────────────────────────────
+
+# 全局进度队列: 每个 model_download 任务通过此队列推送进度事件
+# key: session_id (str) → value: asyncio.Queue
+_model_progress_queues: dict[str, asyncio.Queue] = {}
+_model_progress_lock = asyncio.Lock()
+
+
+class ModelLoadRequest(BaseModel):
+    """模型加载请求"""
+    session_id: str = Field(default="default", description="客户端生成的会话ID，用于 SSE 匹配")
+
+
+@app.post("/api/model/preload")
+async def model_preload(req: ModelLoadRequest):
+    """触发 Embedding 模型预加载。
+
+    返回 {"cached": true} 表示模型已在缓存，直接完成；
+    返回 {"cached": false} 表示需要下载，请连接 SSE 端点查看进度。
+    后端会异步启动下载任务并通过 SSE 队列推送进度。
+    """
+    from sage.context.index import LocalEmbedder
+    from sage.config import get_config
+
+    embedder = LocalEmbedder()
+
+    # 检查是否已加载或已缓存
+    if LocalEmbedder._model is not None:
+        return {"cached": True, "message": "模型已在内存中"}
+
+    if embedder._is_model_cached(get_config().llm_embedding_model):
+        # 已缓存，同步加载
+        try:
+            embedder._ensure_model()
+            return {"cached": True, "message": "模型从缓存加载完成"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 需要下载 → 启动异步下载任务
+    sid = req.session_id
+    async with _model_progress_lock:
+        # 同一个 session 复用已有队列（避免重复启动）
+        if sid in _model_progress_queues:
+            return {"cached": False, "message": "下载已在进行中，请连接 SSE 端点"}
+
+        q: asyncio.Queue = asyncio.Queue()
+        _model_progress_queues[sid] = q
+
+    # 在后台线程中执行下载（避免阻塞 asyncio 事件循环）
+    async def _run_download():
+        loop = asyncio.get_running_loop()
+
+        def _progress_callback(stage: str, percent: int, message: str):
+            """将进度事件推送到 asyncio 队列"""
+            event = json.dumps({
+                "stage": stage,
+                "percent": percent,
+                "message": message,
+            })
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            except Exception:
+                pass
+
+        def _do_download():
+            try:
+                embedder._ensure_model(progress_callback=_progress_callback)
+            except Exception as e:
+                loop.call_soon_threadsafe(
+                    q.put_nowait,
+                    json.dumps({"stage": "error", "percent": 0, "message": str(e)}),
+                )
+
+        await asyncio.to_thread(_do_download)
+
+        # 发送结束信号
+        await q.put(None)
+
+    asyncio.create_task(_run_download())
+    return {"cached": False, "message": "下载已启动"}
+
+
+@app.get("/api/model/download-progress")
+async def model_download_progress(request: Request, session_id: str = "default"):
+    """SSE 端点：流式推送模型下载进度。
+
+    连接后持续接收 JSON 格式的事件:
+        {"stage": "checking"|"downloading"|"loading"|"ready"|"error",
+         "percent": 0-100, "message": "..."}
+
+    下载完成后流自动关闭。
+    """
+    async with _model_progress_lock:
+        q = _model_progress_queues.get(session_id)
+        if q is None:
+            q = asyncio.Queue()
+            _model_progress_queues[session_id] = q
+
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                data = await asyncio.wait_for(q.get(), timeout=600)  # 10 分钟超时
+                if data is None:
+                    break
+                yield f"data: {data}\n\n"
+        except asyncio.TimeoutError:
+            yield "data: {\"stage\":\"error\",\"percent\":0,\"message\":\"下载超时\"}\n\n"
+        finally:
+            async with _model_progress_lock:
+                if session_id in _model_progress_queues:
+                    del _model_progress_queues[session_id]
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

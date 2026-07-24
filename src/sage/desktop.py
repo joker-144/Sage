@@ -12,12 +12,24 @@ DEFAULT_PORT = 5173  # Vite dev server default
 DEFAULT_URL = f"http://localhost:{DEFAULT_PORT}"
 
 
+def _get_project_root() -> Path:
+    """获取项目根目录。
+
+    开发模式下基于 __file__ 向上找两层（sage/desktop.py → src → 项目根）。
+    PyInstaller 打包后基于 sys._MEIPASS 查找。
+    """
+    if getattr(sys, 'frozen', False):
+        # 打包后 __file__ 指向 _MEIPASS/sage/desktop.py，但 _MEIPASS 本身即项目根
+        return Path(sys._MEIPASS)
+    else:
+        return Path(__file__).resolve().parent.parent.parent
+
+
 def _is_electron_available() -> bool:
     """
     Check if Electron build artifacts exist alongside this package.
     """
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
+    project_root = _get_project_root()
 
     electron_indicators = [
         project_root / "dist-electron" / "win-unpacked" / "Sage.exe",
@@ -37,8 +49,7 @@ def _launch_electron():
     """
     Launch the Electron app.
     """
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
+    project_root = _get_project_root()
     web_dir = project_root / "web"
 
     if not web_dir.is_dir():

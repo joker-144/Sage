@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -54,22 +55,252 @@ class LocalEmbedder:
     """
 
     _model = None  # 类级单例（避免重复加载模型）
+    _download_lock = None  # 类级下载锁（避免并发下载）
 
     def __init__(self):
+        import threading
+        if LocalEmbedder._download_lock is None:
+            LocalEmbedder._download_lock = threading.Lock()
         # 优先从 .env 读取 HF_ENDPOINT，未设置时默认走国内镜像（避免连接超时）
         if not os.environ.get("HF_ENDPOINT"):
             os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
         os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+        # 设置下载超时（默认 30 秒），防止打包后首次启动在无网络环境无限等待
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
-    def _ensure_model(self):
-        """延迟加载模型（类级单例，所有实例共享）"""
-        if LocalEmbedder._model is None:
-            from sentence_transformers import SentenceTransformer
+    def _ensure_model(self, progress_callback=None):
+        """延迟加载模型（类级单例，所有实例共享）
+
+        Args:
+            progress_callback: 可选的回调函数，签名为 fn(stage: str, percent: int, message: str)
+                stage: "checking" | "downloading" | "loading" | "ready" | "error"
+                percent: 0-100 的整数进度
+                message: 当前阶段描述
+
+        若模型下载失败（超时/网络不可达），给出明确提示而非静默阻塞。
+        """
+        if LocalEmbedder._model is not None:
+            if progress_callback:
+                progress_callback("ready", 100, "模型已就绪")
+            return LocalEmbedder._model
+
+        with LocalEmbedder._download_lock:
+            # 双重检查（锁内再次确认）
+            if LocalEmbedder._model is not None:
+                if progress_callback:
+                    progress_callback("ready", 100, "模型已就绪")
+                return LocalEmbedder._model
+
             from sage.config import get_config
             config = get_config()
             model_name = config.llm_embedding_model
-            LocalEmbedder._model = SentenceTransformer(model_name)
+
+            if progress_callback:
+                progress_callback("checking", 0, "正在检查模型缓存...")
+
+            # 已缓存 → 直接加载
+            if self._is_model_cached(model_name):
+                if progress_callback:
+                    progress_callback("loading", 50, "正在加载模型到内存...")
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    LocalEmbedder._model = SentenceTransformer(model_name)
+                    if progress_callback:
+                        progress_callback("ready", 100, "模型就绪")
+                    return LocalEmbedder._model
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback("error", 0, f"加载失败: {e}")
+                    raise
+
+            # 需要下载 → 流式下载并报告进度
+            try:
+                from sentence_transformers import SentenceTransformer
+                model_dir = self._download_model_streaming(model_name, progress_callback)
+
+                if progress_callback:
+                    progress_callback("loading", 95, "正在加载模型到内存...")
+
+                LocalEmbedder._model = SentenceTransformer(model_dir or model_name)
+
+                if progress_callback:
+                    progress_callback("ready", 100, "模型就绪")
+
+            except Exception as e:
+                if progress_callback:
+                    progress_callback("error", 0, f"下载失败: {e}")
+                # 给出友好提示
+                error_msg = (
+                    f"Embedding 模型加载失败: {e}\n"
+                    f"模型 '{model_name}' 无法下载。可能原因:\n"
+                    "  1. 当前网络环境无法访问 HuggingFace（可尝试设置代理）\n"
+                    "  2. 防火墙阻止了 HTTPS 连接\n"
+                    "  3. 磁盘空间不足\n"
+                    "语义搜索和记忆检索功能将降级不可用，但对话功能不受影响。"
+                )
+                print(f"[Sage] {error_msg}", file=sys.stderr)
+                raise RuntimeError(error_msg) from e
+
         return LocalEmbedder._model
+
+    def _download_model_streaming(self, model_name: str, progress_callback=None) -> str:
+        """使用 httpx 流式下载模型文件，通过 progress_callback 报告进度。
+
+        下载策略：
+        1. 使用 huggingface_hub API 获取文件列表
+        2. 仅下载必需文件（.json, .safetensors, .txt 等），跳过 .bin/.h5/.msgpack 等
+        3. 对 >1MB 的文件启用流式下载 + 进度回调
+        4. 小文件直接走 hf_hub_download（有缓存/断点续传支持）
+
+        Returns:
+            模型缓存目录的路径
+        """
+        import shutil
+        import tempfile
+        from huggingface_hub import hf_hub_download, list_repo_files
+
+        if progress_callback:
+            progress_callback("downloading", 0, "正在获取文件列表...")
+
+        # 获取仓库文件列表
+        try:
+            all_files = list_repo_files(model_name)
+        except Exception:
+            # API 不可达时回退到直接让 SentenceTransformer 下载
+            return None
+
+        # 筛选需要下载的文件（排除不必要的大文件）
+        download_files: list[str] = []
+        skip_extensions = {".bin", ".h5", ".msgpack", ".pt", ".pth", ".ckpt", ".onnx"}
+        for f in all_files:
+            ext = Path(f).suffix.lower()
+            if ext in skip_extensions:
+                continue
+            download_files.append(f)
+
+        if not download_files:
+            return None
+
+        # 估算总大小（通过 Content-Length）
+        total_bytes = 0
+        file_sizes: dict[str, int] = {}
+        from huggingface_hub import hf_hub_url
+
+        try:
+            import httpx
+            hf_endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+            base_url = hf_endpoint.rstrip("/")
+
+            for fname in download_files:
+                try:
+                    url = f"{base_url}/{model_name}/resolve/main/{fname}"
+                    with httpx.Client(timeout=10, follow_redirects=True) as client:
+                        head_resp = client.head(url)
+                        if head_resp.status_code == 200:
+                            size = int(head_resp.headers.get("content-length", 0))
+                            file_sizes[fname] = size
+                            total_bytes += size
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if total_bytes == 0:
+            total_bytes = 90 * 1024 * 1024  # all-MiniLM-L6-v2 约 90MB
+
+        total_mb = total_bytes / (1024 * 1024)
+        if progress_callback:
+            progress_callback("downloading", 0, f"开始下载 ({total_mb:.0f}MB)...")
+
+        # 逐文件下载
+        downloaded_bytes = 0
+
+        for fname in download_files:
+            fsize = file_sizes.get(fname, 0)
+            is_large = fsize > 1 * 1024 * 1024  # >1MB 用流式下载
+
+            if is_large:
+                # 流式下载大文件（如 model.safetensors）
+                try:
+                    import httpx
+                    url = f"{base_url}/{model_name}/resolve/main/{fname}"
+                    # 获取缓存目录
+                    from huggingface_hub.constants import HF_HUB_CACHE
+                    cache_dir = Path(HF_HUB_CACHE) if HF_HUB_CACHE else Path.home() / ".cache" / "huggingface" / "hub"
+                    repo_cache = cache_dir / f"models--{model_name.replace('/', '--')}" / "snapshots"
+                    # 先确保目录存在
+                    repo_cache.mkdir(parents=True, exist_ok=True)
+
+                    # 下载到临时文件
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(fname).suffix) as tmp:
+                        tmp_path = tmp.name
+
+                    try:
+                        with httpx.Client(timeout=120, follow_redirects=True) as client:
+                            with client.stream("GET", url) as resp:
+                                resp.raise_for_status()
+                                with open(tmp_path, "wb") as f:
+                                    chunk_idx = 0
+                                    for chunk in resp.iter_bytes(1024 * 1024):
+                                        f.write(chunk)
+                                        chunk_idx += 1
+                                        downloaded_bytes += len(chunk)
+                                        if progress_callback and total_bytes > 0:
+                                            pct = min(int(downloaded_bytes * 100 / total_bytes), 95)
+                                            dl_mb = downloaded_bytes / (1024 * 1024)
+                                            progress_callback(
+                                                "downloading", pct,
+                                                f"下载中 {dl_mb:.1f}/{total_mb:.1f}MB ({pct}%)"
+                                            )
+
+                        # 移动到缓存目录
+                        dest = repo_cache / fname
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(tmp_path, str(dest))
+                    except Exception:
+                        # 清理临时文件
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        raise
+
+                except Exception as e:
+                    # 大文件流式下载失败 → 回退到 hf_hub_download
+                    if progress_callback:
+                        progress_callback("downloading", min(int(downloaded_bytes * 100 / total_bytes), 95),
+                                          f"切换下载方式: {Path(fname).name}")
+                    try:
+                        hf_hub_download(model_name, fname, resume_download=True)
+                        # 更新已下载字节（无法精确获取，用文件大小估算）
+                        if fsize > 0:
+                            downloaded_bytes += fsize
+                    except Exception:
+                        # 跳过此文件，让 SentenceTransformer 自己处理
+                        pass
+            else:
+                # 小文件直接用 hf_hub_download（有缓存支持）
+                try:
+                    hf_hub_download(model_name, fname, resume_download=True)
+                except Exception:
+                    pass
+                if fsize > 0:
+                    downloaded_bytes += fsize
+
+        if progress_callback:
+            progress_callback("downloading", 95, "下载完成")
+
+        return None  # 让 SentenceTransformer 从缓存加载
+
+    @staticmethod
+    def _is_model_cached(model_name: str) -> bool:
+        """检查模型是否已在 HuggingFace 缓存中"""
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            return try_to_load_from_cache(model_name, "config.json") is not None
+        except Exception:
+            # 无法检测缓存状态时假定未缓存（保守策略）
+            return False
 
     def encode(self, texts: list[str]) -> np.ndarray:
         """批量生成向量
