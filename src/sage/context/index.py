@@ -1,4 +1,4 @@
-﻿"""
+"""
 论文文档索引 — 文件分块 + Embedding + 向量检索
 
 Sage 论文写作系统的核心组件。它让 Agent 能"看到"工作空间中所有论文文档的内容，
@@ -40,6 +40,13 @@ class CodeChunk:
     end_line: int
     content: str
     score: float = 0.0  # 搜索时的相似度得分
+    # 论文元数据（索引时提取，供检索结果标注来源）
+    title: Optional[str] = None
+    authors: Optional[str] = None
+    year: Optional[str] = None
+    doi: Optional[str] = None
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
 
 
 # ── 本地 Embedder（sentence-transformers）──
@@ -329,6 +336,74 @@ class LocalEmbedder:
 ZhipuEmbedder = LocalEmbedder
 
 
+# ── Cross-Encoder 重排器（二阶段精排）──
+
+class CrossEncoderReranker:
+    """Cross-Encoder 重排器 — 对召回结果精排
+
+    特点:
+      - 基于 cross-encoder/ms-marco-MiniLM-L-6-v2（约 80MB）
+      - 接受 (query, candidate) 对，输出相关性分数
+      - 首次使用通过 hf-mirror.com 国内镜像下载，无需 VPN
+      - 模型加载失败时优雅降级（跳过重排，返回原顺序）
+    """
+
+    _model = None  # 类级单例
+    _load_failed = False  # 加载失败标记（避免反复尝试）
+
+    def __init__(self):
+        # 优先从 .env 读取 HF_ENDPOINT，未设置时默认走国内镜像
+        if not os.environ.get("HF_ENDPOINT"):
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+
+    def _ensure_model(self):
+        """延迟加载模型（类级单例）"""
+        if CrossEncoderReranker._model is not None:
+            return True
+        if CrossEncoderReranker._load_failed:
+            return False
+        try:
+            from sentence_transformers import CrossEncoder
+            CrossEncoderReranker._model = CrossEncoder(
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                max_length=512,
+            )
+            return True
+        except Exception:
+            # 模型下载/加载失败 — 标记降级，后续调用跳过重排
+            CrossEncoderReranker._load_failed = True
+            return False
+
+    def rerank(self, query: str, chunks: list[CodeChunk], top_k: int = 5) -> list[CodeChunk]:
+        """对召回结果重排
+
+        Args:
+            query: 用户查询
+            chunks: 召回的文档块（bi-encoder 阶段结果）
+            top_k: 重排后返回的数量
+
+        Returns:
+            重排后的 top_k 文档块（score 字段更新为 cross-encoder 分数）
+        """
+        if not chunks:
+            return []
+        if not self._ensure_model():
+            # 降级：返回原顺序的 top_k
+            return chunks[:top_k]
+        try:
+            pairs = [(query, c.content[:1500]) for c in chunks]
+            scores = CrossEncoderReranker._model.predict(pairs, batch_size=32)
+            for chunk, score in zip(chunks, scores):
+                chunk.score = float(score)
+            chunks.sort(key=lambda c: c.score, reverse=True)
+            return chunks[:top_k]
+        except Exception:
+            # 重排出错 — 降级返回原顺序
+            return chunks[:top_k]
+
+
 # ── 项目索引 ──
 
 class ProjectIndex:
@@ -372,6 +447,7 @@ class ProjectIndex:
         self.workspace = workspace.resolve()
         self.store = store or MemoryStore()
         self._embedder = None  # 延迟初始化（首次使用时创建）
+        self._reranker = None  # Cross-Encoder 重排器（延迟初始化）
         self._embeddings_cache: list[dict] | None = None  # 向量缓存（索引后失效）
 
     @property
@@ -380,6 +456,13 @@ class ProjectIndex:
         if self._embedder is None:
             self._embedder = LocalEmbedder()
         return self._embedder
+
+    @property
+    def reranker(self) -> CrossEncoderReranker:
+        """延迟创建 Cross-Encoder 重排器"""
+        if self._reranker is None:
+            self._reranker = CrossEncoderReranker()
+        return self._reranker
 
     # ── 索引 ──
 
@@ -421,6 +504,24 @@ class ProjectIndex:
             if not chunks:
                 continue
 
+            # 提取论文元数据（标题/作者/年份/DOI），用于检索结果标注来源
+            metadata = self._extract_paper_metadata(content, file_path)
+
+            # PDF 文件：为每个 chunk 补充页码信息
+            if file_path.suffix.lower() == ".pdf":
+                page_map = self._build_pdf_page_map(file_path)
+                for chunk in chunks:
+                    ps, pe = self._lines_to_pages(chunk.start_line, chunk.end_line, page_map)
+                    chunk.page_start = ps
+                    chunk.page_end = pe
+
+            # 将元数据附加到每个 chunk
+            for chunk in chunks:
+                chunk.title = metadata.get("title")
+                chunk.authors = metadata.get("authors")
+                chunk.year = metadata.get("year")
+                chunk.doi = metadata.get("doi")
+
             # 批量生成 Embedding（本地 sentence-transformers）
             chunk_texts = [c.content for c in chunks]
             embeddings = self.embedder.encode(chunk_texts)
@@ -434,6 +535,12 @@ class ProjectIndex:
                     content=chunk.content,
                     embedding=emb_bytes,
                     file_hash=file_hash,
+                    title=chunk.title,
+                    authors=chunk.authors,
+                    year=chunk.year,
+                    doi=chunk.doi,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
                 )
                 stats["chunks"] += 1
 
@@ -473,7 +580,11 @@ class ProjectIndex:
         return ""
 
     def _extract_pdf_text(self, file_path: Path) -> str:
-        """使用 PyMuPDF (fitz) 提取 PDF 文本"""
+        """使用 PyMuPDF (fitz) 提取 PDF 文本
+
+        对于有文本层的原生 PDF 直接提取；
+        对于文本层为空的扫描版 PDF，自动调用 RapidOCR 识别图片文字。
+        """
         try:
             import fitz  # PyMuPDF
         except ImportError:
@@ -483,10 +594,151 @@ class ProjectIndex:
                 return ""
         text_parts = []
         doc = fitz.open(str(file_path))
-        for page in doc:
-            text_parts.append(page.get_text())
-        doc.close()
+        try:
+            # 延迟初始化 OCR 引擎（仅扫描版 PDF 需要时才加载）
+            ocr_engine = None
+            for page in doc:
+                page_text = page.get_text()
+                if page_text.strip():
+                    # 有文本层 — 直接使用
+                    text_parts.append(page_text)
+                else:
+                    # 文本层为空 — 可能是扫描版，调用 OCR
+                    if ocr_engine is None:
+                        ocr_engine = self._get_ocr_engine()
+                    if ocr_engine is not None:
+                        ocr_text = self._ocr_page(page, ocr_engine)
+                        text_parts.append(ocr_text if ocr_text else f"[页面 {page.number + 1} OCR 无识别结果]")
+                    else:
+                        text_parts.append(f"[页面 {page.number + 1} 为扫描版，OCR 引擎未安装]")
+        finally:
+            doc.close()
         return "\n\n".join(text_parts)
+
+    def _get_ocr_engine(self):
+        """延迟加载 RapidOCR 引擎（类级单例）
+
+        Returns:
+            RapidOCR 实例，加载失败返回 None
+        """
+        if hasattr(self, "_ocr_engine_cached") and self._ocr_engine_cached is not None:
+            return self._ocr_engine_cached
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            self._ocr_engine_cached = RapidOCR()
+            return self._ocr_engine_cached
+        except Exception:
+            self._ocr_engine_cached = None
+            return None
+
+    def _ocr_page(self, page, ocr_engine) -> str:
+        """对单页 PDF 执行 OCR
+
+        Args:
+            page: fitz.Page 对象
+            ocr_engine: RapidOCR 实例
+
+        Returns:
+            识别出的文本（多行拼接），失败返回空字符串
+        """
+        try:
+            # 将页面渲染为图片（DPI=200 兼顾清晰度与速度）
+            pix = page.get_pixmap(dpi=200)
+            import numpy as np
+            img_bytes = pix.tobytes("png")
+            # RapidOCR 接受图片字节或 numpy 数组
+            result, _ = ocr_engine(img_bytes)
+            if not result:
+                return ""
+            # result 是 list of [box, text, score]
+            lines = [item[1] for item in result if item and len(item) >= 2]
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    def _build_pdf_page_map(self, file_path: Path) -> list[tuple[int, int]]:
+        """构建 PDF 行号→页号映射表
+
+        Returns:
+            list of (start_line, page_number)，按 start_line 升序
+            每页的文本用两个换行连接，页内首行即为该页起始行号（1-based）
+        """
+        try:
+            import fitz
+        except ImportError:
+            try:
+                import pymupdf as fitz
+            except ImportError:
+                return []
+        page_map: list[tuple[int, int]] = []
+        line_offset = 1  # 全局行号从 1 开始
+        try:
+            doc = fitz.open(str(file_path))
+            for page_idx, page in enumerate(doc, start=1):
+                page_map.append((line_offset, page_idx))
+                # 每页文本的行数 + 页间分隔的 2 个空行（与 _extract_pdf_text 一致）
+                page_text = page.get_text()
+                line_count = page_text.count("\n") + 1 + 2  # +2 为页间 "\n\n" 分隔
+                line_offset += line_count
+            doc.close()
+        except Exception:
+            return []
+        return page_map
+
+    def _lines_to_pages(
+        self, start_line: int, end_line: int, page_map: list[tuple[int, int]]
+    ) -> tuple[Optional[int], Optional[int]]:
+        """根据行号范围反查 PDF 页号范围
+
+        Args:
+            start_line: chunk 起始行（1-based）
+            end_line: chunk 结束行
+            page_map: _build_pdf_page_map 的返回值
+
+        Returns:
+            (page_start, page_end)，查不到返回 (None, None)
+        """
+        if not page_map:
+            return None, None
+        page_start = None
+        page_end = None
+        for line_offset, page_num in page_map:
+            if line_offset <= start_line:
+                page_start = page_num
+            if line_offset <= end_line:
+                page_end = page_num
+            else:
+                break
+        return page_start, page_end
+
+    def _extract_paper_metadata(self, content: str, file_path: Path) -> dict:
+        """从论文内容提取元数据（标题/作者/年份/DOI）
+
+        优先调用 paper_ops.PaperOps._extract_paper_metadata 的正则规则，失败时用简单正则兜底。
+        """
+        metadata: dict = {"title": None, "authors": None, "year": None, "doi": None}
+        try:
+            # 调用 tools/paper_ops.py 中的同步私有方法（接收 content 字符串）
+            from sage.tools.paper_ops import PaperOps
+            ops = PaperOps(self.workspace)
+            extracted = ops._extract_paper_metadata(content)
+            metadata["title"] = extracted.get("title")
+            metadata["authors"] = extracted.get("authors")
+            metadata["year"] = extracted.get("year")
+            metadata["doi"] = extracted.get("doi")
+        except Exception:
+            pass
+
+        # 兜底：用简单正则补充缺失字段
+        if not metadata["doi"]:
+            m = re.search(r"\b10\.\d{4,9}/[^\s\"<>]+\b", content)
+            if m:
+                metadata["doi"] = m.group(0).rstrip(".,;)")
+        if not metadata["year"]:
+            m = re.search(r"\b(19|20)\d{2}\b", content[:2000])
+            if m:
+                metadata["year"] = m.group(0)
+        return metadata
 
     def _extract_docx_text(self, file_path: Path) -> str:
         """使用 python-docx 提取 Word 文档文本"""
@@ -649,17 +901,26 @@ class ProjectIndex:
 
     # ── 搜索 ──
 
-    def search(self, query: str, top_k: int = 5) -> list[CodeChunk]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        threshold: float = 0.3,
+        rerank: bool = True,
+    ) -> list[CodeChunk]:
         """语义搜索代码库
 
+        二阶段检索：bi-encoder 召回 + cross-encoder 精排。
         余弦相似度计算与维度无关，自动适配本地 Embedder 的向量维度。
 
         Args:
             query: 自然语言查询
-            top_k: 返回结果数量
+            top_k: 最终返回结果数量
+            threshold: bi-encoder 相似度阈值，低于此值的结果不进入重排（默认 0.3）
+            rerank: 是否启用 cross-encoder 重排（默认启用）
 
         Returns:
-            最相关的代码块列表（按相似度降序）
+            最相关的代码块列表（按相似度降序，含论文元数据）
         """
         # 1. 将 query 转为 embedding
         query_vec = self.embedder.encode([query])[0]
@@ -671,7 +932,7 @@ class ProjectIndex:
         if not rows:
             return []
 
-        # 计算相似度（维度自动适配）
+        # 计算相似度（维度自动适配）+ 阈值过滤
         scored: list[CodeChunk] = []
         for row in rows:
             if row["embedding"] is None:
@@ -683,14 +944,34 @@ class ProjectIndex:
             score = float(np.dot(query_vec, emb) / (
                 np.linalg.norm(query_vec) * np.linalg.norm(emb) + 1e-8
             ))
+            # 阈值过滤：低于阈值的不召回
+            if score < threshold:
+                continue
             scored.append(CodeChunk(
                 file_path=row["file_path"],
                 start_line=row["start_line"],
                 end_line=row["end_line"],
                 content=row["content"],
                 score=score,
+                title=row.get("title"),
+                authors=row.get("authors"),
+                year=row.get("year"),
+                doi=row.get("doi"),
+                page_start=row.get("page_start"),
+                page_end=row.get("page_end"),
             ))
 
-        # 3. 按相似度降序，返回 top_k
+        if not scored:
+            return []
+
+        # 3. 按相似度降序取候选集（top_k * 4，为重排提供更大候选池）
         scored.sort(key=lambda c: c.score, reverse=True)
-        return scored[:top_k]
+        candidates = scored[: max(top_k * 4, top_k)]
+
+        # 4. 二阶段：cross-encoder 重排
+        if rerank and len(candidates) > 1:
+            candidates = self.reranker.rerank(query, candidates, top_k=top_k)
+        else:
+            candidates = candidates[:top_k]
+
+        return candidates

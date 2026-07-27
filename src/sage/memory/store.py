@@ -1,4 +1,4 @@
-﻿"""
+"""
 记忆层 — SQLite 统一存储
 
 存储内容:
@@ -85,7 +85,14 @@ CREATE TABLE IF NOT EXISTS file_index (
     content TEXT NOT NULL,
     embedding BLOB,
     file_hash TEXT,
-    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- 论文元数据（索引时提取，供检索结果标注来源）
+    title TEXT,
+    authors TEXT,
+    year TEXT,
+    doi TEXT,
+    page_start INTEGER,
+    page_end INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS lessons (
@@ -154,8 +161,38 @@ class MemoryStore:
 
         智谱 Embedding-3 为 1024 维，本地 all-MiniLM-L6-v2 为 384 维。
         首次启动时自动检测并清空不兼容的向量，避免搜索时维度冲突。
+        同时检测 file_index 表是否包含论文元数据字段，缺失时重建表（用户确认清空重建）。
         """
         try:
+            # 检测 file_index 表是否含元数据字段（旧表升级时需重建）
+            cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(file_index)").fetchall()}
+            required_new_cols = {"title", "authors", "year", "doi", "page_start", "page_end"}
+            if not required_new_cols.issubset(cols):
+                # 旧表缺失元数据字段 — 重建表（清空老索引数据，用户已确认）
+                self._conn.execute("DROP TABLE IF EXISTS file_index")
+                self._conn.execute(
+                    """CREATE TABLE file_index (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    content TEXT NOT NULL,
+                    embedding BLOB,
+                    file_hash TEXT,
+                    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    title TEXT,
+                    authors TEXT,
+                    year TEXT,
+                    doi TEXT,
+                    page_start INTEGER,
+                    page_end INTEGER
+                    )"""
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_file_index_path ON file_index(file_path)"
+                )
+                self._conn.commit()
+
             # 检查 file_index 表
             row = self._conn.execute(
                 "SELECT embedding FROM file_index WHERE embedding IS NOT NULL LIMIT 1"
@@ -356,13 +393,21 @@ class MemoryStore:
         content: str,
         embedding: bytes,
         file_hash: str,
+        title: Optional[str] = None,
+        authors: Optional[str] = None,
+        year: Optional[str] = None,
+        doi: Optional[str] = None,
+        page_start: Optional[int] = None,
+        page_end: Optional[int] = None,
     ) -> None:
-        """存储代码块（含向量）"""
+        """存储代码块（含向量与论文元数据）"""
         self._conn.execute(
             """INSERT INTO file_index
-               (file_path, start_line, end_line, content, embedding, file_hash)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (file_path, start_line, end_line, content, embedding, file_hash),
+               (file_path, start_line, end_line, content, embedding, file_hash,
+                title, authors, year, doi, page_start, page_end)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (file_path, start_line, end_line, content, embedding, file_hash,
+             title, authors, year, doi, page_start, page_end),
         )
         self._conn.commit()
 
@@ -386,10 +431,13 @@ class MemoryStore:
         """加载所有代码块向量（供向量搜索）
 
         Returns:
-            list of {"id", "file_path", "start_line", "end_line", "content", "embedding"}
+            list of {"id", "file_path", "start_line", "end_line", "content", "embedding",
+                     "title", "authors", "year", "doi", "page_start", "page_end"}
         """
         rows = self._conn.execute(
-            "SELECT id, file_path, start_line, end_line, content, embedding FROM file_index"
+            """SELECT id, file_path, start_line, end_line, content, embedding,
+                      title, authors, year, doi, page_start, page_end
+               FROM file_index"""
         ).fetchall()
         return [dict(r) for r in rows]
 

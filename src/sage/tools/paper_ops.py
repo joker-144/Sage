@@ -1,4 +1,4 @@
-﻿"""
+"""
 Sage 论文写作专用工具集 — 文献检索、文档解析、引用管理、写作辅助、外部检索
 
 这些工具在 ToolEngine 中注册，供 Sage 智能体调用。
@@ -47,30 +47,63 @@ class PaperOps:
             return ToolResult(success=False, error=f"索引失败: {e}")
 
     async def search_literature(self, query: str, top_k: int = 5) -> ToolResult:
-        """语义检索已索引的文献库"""
+        """语义检索已索引的文献库
+
+        二阶段检索：bi-encoder 召回（阈值 0.3 过滤）+ cross-encoder 重排。
+        返回结果包含完整来源信息（标题/作者/年份/DOI/页码），供智能体标注引用。
+        """
         try:
             from sage.context.index import ProjectIndex
             from sage.memory.store import MemoryStore
             store = MemoryStore()
             indexer = ProjectIndex(self.workspace, store)
-            results = indexer.search(query, top_k=top_k)
+            results = indexer.search(query, top_k=top_k, threshold=0.3, rerank=True)
             if not results:
                 return ToolResult(
                     success=True,
-                    output="未找到相关文献。请先使用 index_papers 工具索引文献库。",
+                    output="未找到相关文献。请先使用 index_papers 工具索引文献库，或当前问题与文献库内容相关度不足。",
                     data=[],
                 )
             formatted = []
             for i, r in enumerate(results, 1):
+                # 组装来源行（仅展示存在的字段）
+                source_parts = []
+                if r.title:
+                    source_parts.append(f"标题: {r.title}")
+                if r.authors:
+                    source_parts.append(f"作者: {r.authors}")
+                if r.year:
+                    source_parts.append(f"年份: {r.year}")
+                if r.doi:
+                    source_parts.append(f"DOI: {r.doi}")
+                page_info = ""
+                if r.page_start is not None and r.page_end is not None:
+                    page_info = f" (P{r.page_start}-{r.page_end})"
+                elif r.page_start is not None:
+                    page_info = f" (P{r.page_start})"
+                source_line = " | ".join(source_parts) if source_parts else "来源信息缺失"
                 formatted.append(
-                    f"### 结果 {i}（相似度: {r.score:.3f}）\n"
+                    f"### 结果 {i}（相关度: {r.score:.3f}）\n"
+                    f"**来源**: {source_line}{page_info}\n"
                     f"**文件**: {r.file_path} (L{r.start_line}-{r.end_line})\n"
                     f"**内容**:\n{r.content[:500]}\n"
                 )
             return ToolResult(
                 success=True,
                 output="\n".join(formatted),
-                data=[{"file": r.file_path, "score": r.score} for r in results],
+                data=[
+                    {
+                        "file": r.file_path,
+                        "score": r.score,
+                        "title": r.title,
+                        "authors": r.authors,
+                        "year": r.year,
+                        "doi": r.doi,
+                        "page_start": r.page_start,
+                        "page_end": r.page_end,
+                    }
+                    for r in results
+                ],
             )
         except Exception as e:
             return ToolResult(success=False, error=f"检索失败: {e}")
@@ -262,7 +295,11 @@ class PaperOps:
             return ToolResult(success=False, error=f"元数据提取失败: {e}")
 
     async def ocr_document(self, file_path: str) -> ToolResult:
-        """OCR 识别扫描版文档"""
+        """OCR 识别扫描版文档
+
+        使用 RapidOCR (ONNX Runtime) 识别扫描版 PDF。
+        对于有文本层的原生 PDF 页面，优先直接提取文本；文本层为空的页面才调用 OCR。
+        """
         try:
             full_path = self.workspace / file_path
             if not full_path.exists():
@@ -279,29 +316,50 @@ class PaperOps:
                         error="OCR 需要 PyMuPDF (fitz) 库，请安装: pip install pymupdf"
                     )
 
-            # 使用 PyMuPDF 进行 OCR（如果支持）
+            # 延迟加载 RapidOCR
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                ocr_engine = RapidOCR()
+            except ImportError:
+                return ToolResult(
+                    success=False,
+                    error="OCR 需要 rapidocr-onnxruntime 库，请安装: pip install rapidocr-onnxruntime"
+                )
+            except Exception as e:
+                return ToolResult(success=False, error=f"OCR 引擎初始化失败: {e}")
+
             doc = fitz.open(str(full_path))
             text_parts = []
-            for page in doc:
-                # 先尝试直接提取文本
-                page_text = page.get_text()
-                if page_text.strip():
-                    text_parts.append(page_text)
-                else:
-                    # 文本为空，可能是扫描版，尝试 OCR
-                    try:
-                        pix = page.get_pixmap()
-                        # 这里简化处理，实际 OCR 需要 pytesseract
-                        text_parts.append(f"[扫描页面 {page.number + 1}，需要 OCR]")
-                    except Exception:
-                        text_parts.append(f"[页面 {page.number + 1} 无法解析]")
-            doc.close()
+            ocr_page_count = 0
+            try:
+                for page in doc:
+                    # 先尝试直接提取文本层
+                    page_text = page.get_text()
+                    if page_text.strip():
+                        text_parts.append(page_text)
+                    else:
+                        # 文本层为空 — 调用 RapidOCR
+                        try:
+                            pix = page.get_pixmap(dpi=200)
+                            img_bytes = pix.tobytes("png")
+                            result, _ = ocr_engine(img_bytes)
+                            if result:
+                                lines = [item[1] for item in result if item and len(item) >= 2]
+                                ocr_text = "\n".join(lines)
+                                text_parts.append(ocr_text)
+                                ocr_page_count += 1
+                            else:
+                                text_parts.append(f"[页面 {page.number + 1} OCR 无识别结果]")
+                        except Exception as e:
+                            text_parts.append(f"[页面 {page.number + 1} OCR 失败: {e}]")
+            finally:
+                doc.close()
 
             text = "\n\n".join(text_parts)
             return ToolResult(
                 success=True,
-                output=f"OCR 处理完成, 共 {len(text)} 字符:\n{text[:3000]}",
-                data={"char_count": len(text)},
+                output=f"OCR 处理完成, 共 {len(text)} 字符 (其中 {ocr_page_count} 页使用 OCR):\n{text[:3000]}",
+                data={"char_count": len(text), "ocr_pages": ocr_page_count},
             )
         except Exception as e:
             return ToolResult(success=False, error=f"OCR 失败: {e}")
