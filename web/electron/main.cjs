@@ -41,7 +41,7 @@ function readAppVersion() {
       }
     } catch { /* ignore */ }
   }
-  return '0.5.6';
+  return '0.5.7';
 }
 
 const APP_VERSION = readAppVersion();
@@ -358,9 +358,12 @@ ipcMain.handle('update-install', async (_event, filePath) => {
     // 使用 detached:true + stdio:'ignore' + unref()
     // 使安装程序脱离 Electron 进程组，应用退出后安装程序可继续运行
     // 否则 app.quit() 会连带杀死子进程，导致下载完成后无法安装
+    // 使用 /SILENT 而非 /VERYSILENT：
+    // /SILENT 显示安装进度条（无需用户交互），且能触发 runAfterFinish 自动启动新版本
+    // /VERYSILENT 完全无界面，不会触发安装后自动启动
     const child = spawn(
       filePath,
-      ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-'],
+      ['/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-'],
       {
         detached: true,
         stdio: 'ignore',

@@ -27,6 +27,7 @@
   "nsis": {
     "oneClick": false,
     "allowToChangeInstallationDirectory": true,
+    "runAfterFinish": true,
     "installerIcon": "public/icon.ico",
     "uninstallerIcon": "public/icon.ico",
     "createDesktopShortcut": true,
