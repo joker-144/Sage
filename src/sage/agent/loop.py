@@ -49,7 +49,7 @@ from sage.tools.engine import ToolEngine
 @dataclass
 class LoopEvent:
     """AgentLoop 产生的事件（供 CLI/API 展示）"""
-    type: str  # "tool_start" | "tool_result" | "text" | "error" | "done"
+    type: str  # "tool_start" | "tool_result" | "text" | "reasoning" | "error" | "done"
     content: str = ""
     tool_name: str = ""
     tool_args: dict = None
@@ -236,7 +236,11 @@ class AgentLoop:
             # 持久化 token 用量到 SQLite（供仪表盘统计）
             self._persist_token_usage(round_usage, session_id)
 
-            # 4. 判断 LLM 是否要调用工具
+            # 4. 输出模型思考内容（推理模型才有 reasoning_content，如 DeepSeek-R1）
+            if response.reasoning_content:
+                yield LoopEvent(type="reasoning", content=response.reasoning_content)
+
+            # 5. 判断 LLM 是否要调用工具
             if response.has_tool_calls:
                 # 记录助手消息（含 tool_calls）
                 tool_calls_openai = [

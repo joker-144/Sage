@@ -161,7 +161,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息", min_length=1)
     conversation_id: str | None = Field(None, description="对话 ID（首次对话不传，后续传入以保持上下文）")
     settings: dict | None = Field(None, description="前端设置覆盖（已弃用，配置从 .env 读取）")
-    mode: str = Field("single", description="运行模式: single=单Agent, collaborate=多Agent协作")
+    mode: str = Field("single", description="运行模式: single=单Agent, writing=写作模式(智能选择流程)")
 
 
 class HealthResponse(BaseModel):
@@ -233,15 +233,16 @@ async def chat_stream(req: ChatRequest):
       - event: tool_start   工具调用开始
       - event: tool_result  工具执行结果
       - event: text         Agent 文本回复
-      - event: collaborate  多智能体协作事件（mode=collaborate 时）
+      - event: reasoning    模型思考内容（reasoning_content，推理模型才有）
+      - event: collaborate  多智能体协作事件（mode=writing 时）
       - event: error        错误
       - event: done         完成（data 中含 conversation_id）
 
     通过传入 conversation_id 实现多轮对话上下文保持。
-    mode=collaborate 时启动多智能体协作流程。
+    mode=writing 时启动写作模式（智能选择流程：简单任务单Agent，复杂任务多智能体）。
     """
-    # 协作模式走多 Agent 流程
-    if req.mode == "collaborate":
+    # 写作模式走多 Agent 流程（内部根据任务复杂度智能选择单/多智能体）
+    if req.mode == "writing":
         return StreamingResponse(
             _collaborate_stream(req),
             media_type="text/event-stream",
@@ -290,6 +291,8 @@ async def chat_stream(req: ChatRequest):
                         yield f"event: tool_start\ndata: {json.dumps({'tool': event.tool_name, 'args': event.tool_args, 'content': event.content, 'tokens': event.tokens or {}, 'is_agent': is_agent, 'agent_name': event.skill_name or ''}, ensure_ascii=False)}\n\n"
                     elif event.type == "tool_result":
                         yield f"event: tool_result\ndata: {json.dumps({'tool': event.tool_name, 'content': event.content}, ensure_ascii=False)}\n\n"
+                    elif event.type == "reasoning":
+                        yield f"event: reasoning\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "text":
                         yield f"event: text\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "error":
@@ -318,7 +321,7 @@ async def chat_stream(req: ChatRequest):
 
 
 async def _collaborate_stream(req: ChatRequest):
-    """多智能体协作 SSE 流"""
+    """写作模式 SSE 流（智能选择流程：简单任务单Agent，复杂任务多智能体）"""
     from sage.agents.orchestrator import create_orchestrator
 
     orchestrator = create_orchestrator()
@@ -329,11 +332,13 @@ async def _collaborate_stream(req: ChatRequest):
             if event.type == "task_created":
                 yield f"event: collaborate\ndata: {json.dumps({'phase': 'plan', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
             elif event.type == "worker_start":
-                yield f"event: collaborate\ndata: {json.dumps({'phase': 'start', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
+                yield f"event: collaborate\ndata: {json.dumps({'phase': 'start', 'role': event.role, 'content': event.content, 'tokens': event.tokens or {}}, ensure_ascii=False)}\n\n"
             elif event.type == "worker_done":
                 yield f"event: collaborate\ndata: {json.dumps({'phase': 'done', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
             elif event.type == "reflection":
                 yield f"event: collaborate\ndata: {json.dumps({'phase': 'reflection', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
+            elif event.type == "reasoning":
+                yield f"event: reasoning\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n"
             elif event.type == "text":
                 yield f"event: text\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n"
             elif event.type == "done":

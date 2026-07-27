@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, computed } from 'vue'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
@@ -17,6 +17,19 @@ marked.setOptions({
 
 const props = defineProps({
   message: { type: Object, required: true },
+})
+
+/* 思考内容卡片 — 默认折叠 */
+const reasoningExpanded = ref(false)
+
+const hasReasoning = computed(() => !!(props.message.reasoning && props.message.reasoning.trim()))
+
+const reasoningPreview = computed(() => {
+  const text = props.message.reasoning || ''
+  if (!text) return ''
+  // 预览取首行或前 80 字符
+  const firstLine = text.split('\n').find(l => l.trim()) || ''
+  return firstLine.length > 80 ? firstLine.slice(0, 80) + '…' : firstLine
 })
 
 /* 打字机效果 */
@@ -84,11 +97,34 @@ const renderedContent = computed(() => {
         <span>Sage</span>
       </div>
 
+      <!-- 思考内容卡片（默认折叠） -->
+      <div v-if="hasReasoning" class="reasoning-card" :class="{ expanded: reasoningExpanded }">
+        <div class="reasoning-header" @click="reasoningExpanded = !reasoningExpanded">
+          <div class="reasoning-badge">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+              <path d="M9 21h6M10 17.5v3.5M14 17.5v3.5M12 3a6 6 0 0 0-4 10.5c.5.5 1 1.5 1 2.5h6c0-1 .5-2 1-2.5A6 6 0 0 0 12 3z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <span class="reasoning-title">思考过程</span>
+          <span v-if="!reasoningExpanded && reasoningPreview" class="reasoning-preview">{{ reasoningPreview }}</span>
+          <div class="reasoning-right">
+            <svg class="chevron" :class="{ rotated: reasoningExpanded }" width="12" height="12" viewBox="0 0 24 24" fill="none">
+              <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </div>
+        </div>
+        <transition name="fade">
+          <div v-if="reasoningExpanded" class="reasoning-body">
+            <pre class="reasoning-content">{{ message.reasoning }}</pre>
+          </div>
+        </transition>
+      </div>
+
       <ToolCall v-for="(tool, i) in message.tools" :key="i" :tool="tool" />
 
       <div v-if="renderedContent" class="assistant-content markdown" v-html="renderedContent"></div>
 
-      <div v-if="(!message.content || isTyping) && message.tools.length === 0 && !typedContent" class="typing">
+      <div v-if="(!message.content || isTyping) && message.tools.length === 0 && !typedContent && !hasReasoning" class="typing">
         <span></span><span></span><span></span>
       </div>
     </div>
@@ -177,6 +213,55 @@ const renderedContent = computed(() => {
   background: var(--bg-card); font-weight: 600; color: var(--text-primary);
 }
 .markdown :deep(td) { color: var(--text-secondary); }
+
+/* 思考内容卡片 */
+.reasoning-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 2px solid #a78bfa;
+  border-radius: var(--radius-md);
+  margin: 4px 0 4px 26px;
+  overflow: hidden;
+  transition: all 0.16s var(--ease-out-expo);
+  animation: slideInRight 0.22s var(--ease-out-expo);
+}
+.reasoning-card:hover { border-color: var(--border-strong); }
+.reasoning-card.expanded {
+  border-color: #a78bfa;
+  box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.18);
+}
+.reasoning-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 9px; cursor: pointer; user-select: none;
+}
+.reasoning-header:hover { background: rgba(167, 139, 250, 0.06); }
+.reasoning-badge {
+  width: 19px; height: 19px; border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  color: white; background: #a78bfa; flex-shrink: 0;
+}
+.reasoning-title {
+  font-size: 10.5px; font-weight: 600; color: #7c3aed;
+  font-family: var(--font-mono); flex-shrink: 0;
+  letter-spacing: 0.01em;
+}
+.reasoning-preview {
+  font-size: 10px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
+.reasoning-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+.reasoning-body { padding: 0 9px 9px; }
+.reasoning-content {
+  background: rgba(167, 139, 250, 0.04);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--text-muted);
+  overflow-x: auto; max-height: 320px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all;
+  line-height: 1.6;
+}
 
 /* 打字指示器 */
 .typing {

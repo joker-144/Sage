@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 
 const props = defineProps({ disabled: { type: Boolean, default: false } })
@@ -269,7 +269,7 @@ function shortLabel(modelId) {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  z-index: 100; overflow: hidden;
+  z-index: 1000; overflow: hidden;
   display: flex; flex-direction: column;
 }
 .picker-header {

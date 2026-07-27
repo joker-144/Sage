@@ -1,4 +1,4 @@
-﻿"""
+"""
 LLM 客户端 — 支持 function calling + streaming
 
 核心能力:
@@ -34,6 +34,7 @@ class ChatMessage:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
+    reasoning_content: str = ""  # 推理模型的思考链（DeepSeek-R1/DeepSeek-Thinking 等）
 
     @property
     def has_tool_calls(self) -> bool:
@@ -176,11 +177,16 @@ class LLMClient:
                 "completion_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
             }
 
+        # 提取推理模型的思考链（reasoning_content）
+        # DeepSeek-R1 / DeepSeek-Thinking 等模型在 message.reasoning_content 返回思考过程
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+
         return ChatMessage(
             content=msg.content or "",
             tool_calls=tool_calls,
             finish_reason=response.choices[0].finish_reason,
             usage=usage,
+            reasoning_content=reasoning,
         )
 
     # ── 流式输出 ──

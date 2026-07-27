@@ -1,4 +1,4 @@
-﻿import { ref, nextTick } from 'vue'
+import { ref, nextTick } from 'vue'
 
 const SSE_TIMEOUT_MS = 60000   // 60 秒无响应超时（配合后端 10s 心跳保活）
 const CONV_ID_KEY = 'sage-conversation-id'
@@ -17,7 +17,7 @@ export function useChat() {
   const conversationId = ref(loadConvId())  // 从 localStorage 恢复
   const messagesRef = ref(null)
   const messageSentCount = ref(0)  // 每发一条消息+1，父组件 watch 后刷新侧栏
-  const collaborateMode = ref(false)  // 多智能体协作模式开关
+  const writingMode = ref(false)  // 写作模式开关（智能选择流程：简单任务单Agent，复杂任务多智能体）
 
   let currentAssistant = null
   let abortController = null
@@ -59,7 +59,7 @@ export function useChat() {
           if (msg.tool_name || hasToolCalls) {
             // 工具调用消息 — 合并到当前 assistant
             if (!currentAssistant) {
-              currentAssistant = { role: 'assistant', content: '', tools: [] }
+              currentAssistant = { role: 'assistant', content: '', tools: [], reasoning: '' }
               loaded.push(currentAssistant)
             }
             if (hasToolCalls) {
@@ -101,13 +101,13 @@ export function useChat() {
               currentAssistant.content = msg.content || ''
               currentAssistant = null
             } else {
-              loaded.push({ role: 'assistant', content: msg.content || '', tools: [] })
+              loaded.push({ role: 'assistant', content: msg.content || '', tools: [], reasoning: '' })
             }
           }
         } else if (msg.role === 'tool') {
           // 工具执行结果 — 更新当前 assistant 中对应工具的结果
           if (!currentAssistant) {
-            currentAssistant = { role: 'assistant', content: '', tools: [] }
+            currentAssistant = { role: 'assistant', content: '', tools: [], reasoning: '' }
             loaded.push(currentAssistant)
           }
           // 查找通过 tool_args 创建的占位符工具（name 匹配且 done=false）
@@ -206,6 +206,7 @@ export function useChat() {
       role: 'assistant',
       content: '',
       tools: [],
+      reasoning: '',  // 模型思考内容（reasoning_content）
     })
     currentAssistant = messages.value[messages.value.length - 1]
     scrollToBottom()
@@ -254,8 +255,8 @@ export function useChat() {
       if (settings) {
         body.settings = settings
       }
-      if (collaborateMode.value) {
-        body.mode = 'collaborate'
+      if (writingMode.value) {
+        body.mode = 'writing'
       }
 
       // SSE 超时兜底：3 分钟无任何数据则中止
@@ -357,6 +358,12 @@ export function useChat() {
         scrollToBottom()
         break
 
+      case 'reasoning':
+        // 模型思考内容（reasoning_content）— 拼接到 currentAssistant.reasoning
+        currentAssistant.reasoning = (currentAssistant.reasoning || '') + (data.content || '')
+        scrollToBottom()
+        break
+
       case 'text':
         // 协作模式下 text 事件带 role 字段，在内容前标注角色
         if (data.role) {
@@ -364,6 +371,7 @@ export function useChat() {
             supervisor: '主编', planner: '方法论专家', coder: '撰写员',
             reviewer: '审校核查员', debugger: '修订员',
             literature: '文献调研员', citation: '引用管理员', consolidator: '整理汇报员',
+            general: '通用助手',
           }
           const label = roleLabels[data.role] || data.role
           if (!currentAssistant.content) {
@@ -387,6 +395,7 @@ export function useChat() {
             supervisor: '主编', planner: '方法论专家', coder: '撰写员',
             reviewer: '审校核查员', debugger: '修订员',
             literature: '文献调研员', citation: '引用管理员', consolidator: '整理汇报员',
+            general: '通用助手',
           }
           const label = roleLabels[data.role] || data.role
           const phase = phaseLabels[data.phase] || data.phase
@@ -401,6 +410,7 @@ export function useChat() {
               result: '',
               expanded: false,
               done: false,
+              tokens: data.tokens || {},
               isCollaborate: true,
               agentName: label,
             })
@@ -420,6 +430,7 @@ export function useChat() {
                 result: data.content || '',
                 expanded: false,
                 done: true,
+                tokens: {},
                 isCollaborate: true,
                 agentName: label,
               })
@@ -466,7 +477,7 @@ export function useChat() {
     conversationId,
     messagesRef,
     messageSentCount,
-    collaborateMode,
+    writingMode,
     sendMessage,
     cancel,
     reset,

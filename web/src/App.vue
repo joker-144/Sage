@@ -16,7 +16,7 @@ import ConfirmDialog from './components/ConfirmDialog.vue'
 
 const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
-  collaborateMode, sendMessage, cancel, reset, loadConversation, deleteConversation,
+  writingMode, sendMessage, cancel, reset, loadConversation, deleteConversation,
 } = useChat()
 
 const activeView = ref('chat')
@@ -101,9 +101,9 @@ onMounted(() => { reset() })
             <div class="input-toolbar">
               <button
                 class="collab-toggle"
-                :class="{ active: collaborateMode }"
-                :title="collaborateMode ? '当前为多智能体协作模式，点击切换单 Agent' : '点击切换到多智能体协作模式'"
-                @click="collaborateMode = !collaborateMode"
+                :class="{ active: writingMode }"
+                :title="writingMode ? '当前为写作模式（智能选择流程），点击切换单 Agent' : '点击切换到写作模式（智能选择流程）'"
+                @click="writingMode = !writingMode"
               >
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
                   <circle cx="12" cy="6" r="2.5" stroke="currentColor" stroke-width="1.8"/>
@@ -111,7 +111,7 @@ onMounted(() => { reset() })
                   <circle cx="18" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
                   <path d="M12 8.5v3M9.5 15.5l-2-1M14.5 15.5l2-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                 </svg>
-                {{ collaborateMode ? '协作模式' : '单 Agent' }}
+                {{ writingMode ? '写作模式' : '单 Agent' }}
               </button>
             </div>
             <ChatInput :disabled="isProcessing" @send="sendMessage" @stop="cancel" @open-settings="activeView = 'settings'" />
@@ -154,6 +154,7 @@ onMounted(() => { reset() })
 .input-section {
   flex-shrink: 0; padding: 0 28px 16px;
   background: linear-gradient(to top, var(--bg-base) 70%, rgba(248,250,252,0));
+  position: relative; z-index: 10;
 }
 .input-section :deep(.input-area) { max-width: 760px; margin: 0 auto; }
 
