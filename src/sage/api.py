@@ -940,14 +940,28 @@ async def version_check():
 
     国内访问 api.github.com 经常失败，因此采用多镜像回退机制：
     1. 优先尝试 api.github.com（VPN 或可直连环境）
-    2. 失败时通过 kkgithub.com 镜像解析 releases.atom + expanded_assets
-    3. 最后回退到 PyPI
+    2. 失败时通过 gh-proxy.com 等镜像代理 api.github.com
+    3. 镜像也失败时通过 kkgithub.com 解析 releases.atom + expanded_assets
+    4. 最后回退到 PyPI
+
+    带 1 小时缓存，避免短时间内重复请求触发 GitHub API 速率限制（60次/小时）。
 
     下载 URL 始终包装为 mirror.ghproxy.com 代理，确保国内无需 VPN 即可下载。
     """
     import httpx
+    import time as _time
 
+    global _version_cache
     current = __version__
+
+    # ── 缓存检查（成功结果 1 小时；速率限制 5 分钟；普通失败不缓存）──
+    now = _time.time()
+    if _version_cache is not None:
+        age = now - _version_cache["ts"]
+        ttl = _version_cache.get("ttl", 3600)
+        if age < ttl and _version_cache.get("current") == current:
+            return _version_cache["data"]
+
     result = {
         "current": current,
         "latest": current,
@@ -958,7 +972,10 @@ async def version_check():
         "source": "none",
     }
 
-    # 优先尝试 GitHub Releases API（直连）
+    rate_limited = False       # 是否命中 GitHub API 速率限制
+    rate_reset_at: float = 0   # 速率限制重置时间（Unix timestamp）
+
+    # ── 第 1 步：直连 GitHub API ──
     gh_api_ok = False
     try:
         with httpx.Client(timeout=8.0, follow_redirects=True) as client:
@@ -992,16 +1009,27 @@ async def version_check():
                 result["latest"] = tag
                 result["changelog"] = changelog_body[:4096]
                 result["release_url"] = html_url
-                # 始终包装为国内加速镜像
                 result["download_url"] = _wrap_ghproxy(download_url)
                 result["has_update"] = _compare_versions(tag, current) > 0
                 result["source"] = "github"
                 gh_api_ok = True
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            # 检查是否是速率限制
+            remaining = e.response.headers.get("x-ratelimit-remaining", "")
+            reset_at = e.response.headers.get("x-ratelimit-reset", "")
+            if remaining == "0" or "rate limit" in (e.response.text or "").lower():
+                rate_limited = True
+                if reset_at:
+                    try:
+                        rate_reset_at = float(reset_at)
+                    except ValueError:
+                        pass
     except Exception:
-        pass  # 进入镜像回退逻辑
+        pass
 
-    # 直连失败 → 优先用国内镜像代理 api.github.com（已验证 gh-proxy.com 可代理该 API）
-    if not gh_api_ok:
+    # ── 第 2 步：国内镜像代理 api.github.com ──
+    if not gh_api_ok and not rate_limited:
         proxied_data = _fetch_latest_release_via_ghproxy_api()
         if proxied_data:
             tag = proxied_data.get("tag_name", "").lstrip("v")
@@ -1026,16 +1054,14 @@ async def version_check():
                 result["download_url"] = _wrap_ghproxy(download_url)
                 result["has_update"] = _compare_versions(tag, current) > 0
                 result["source"] = "github-mirror"
-                gh_api_ok = True  # 标记成功，跳过 atom feed 回退
+                gh_api_ok = True
 
-    # 镜像代理也失败 → 使用 atom feed 解析
+    # ── 第 3 步：Atom Feed 解析（绕过 API 速率限制）──
     if not gh_api_ok:
         atom_info = _fetch_latest_release_via_atom()
         if atom_info and atom_info.get("tag"):
             tag = atom_info["tag"]
             release_url = atom_info.get("release_url", "") or f"https://github.com/{GITHUB_REPO}/releases/tag/v{tag}"
-
-            # 通过 expanded_assets 接口获取资源下载 URL（kkgithub 镜像）
             asset_url = _fetch_asset_url_via_mirror(tag)
 
             result["latest"] = tag
@@ -1043,8 +1069,9 @@ async def version_check():
             result["download_url"] = _wrap_ghproxy(asset_url) if asset_url else ""
             result["has_update"] = _compare_versions(tag, current) > 0
             result["source"] = "github-mirror"
+            gh_api_ok = True
 
-    # GitHub 与镜像均失败 → 回退 PyPI
+    # ── 第 4 步：回退 PyPI ──
     if result["source"] == "none":
         try:
             with httpx.Client(timeout=15.0, follow_redirects=True) as client:
@@ -1067,6 +1094,25 @@ async def version_check():
         except Exception as e:
             result["error"] = f"检查更新失败: {str(e)}"
 
+    # ── 速率限制提示 ──
+    if rate_limited and result["source"] == "none":
+        wait_minutes = "几"
+        if rate_reset_at > 0:
+            wait_seconds = max(0, int(rate_reset_at - now))
+            wait_minutes = str(max(1, wait_seconds // 60))
+        result["error"] = (
+            f"GitHub API 速率限制（每小时 60 次），请等待约 {wait_minutes} 分钟后重试。\n"
+            f"您也可以直接访问 {f'https://github.com/{GITHUB_REPO}/releases'} 手动下载。"
+        )
+        # 速率限制场景：缓存 5 分钟，避免用户疯狂重试触发更多限制
+        _version_cache = {"ts": now, "data": result, "current": current, "ttl": 300}
+        return result
+
+    # 成功时写缓存（1 小时）；普通失败（source='none'）不缓存，允许用户立即重试
+    if result["source"] != "none":
+        _version_cache = {"ts": now, "data": result, "current": current, "ttl": 3600}
+    else:
+        _version_cache = None
     return result
 
 
@@ -1261,6 +1307,11 @@ async def version_download():
             err_msg = f"下载失败: {str(e)}"
             if release_url:
                 err_msg += f" | 请手动下载: {release_url}"
+            # 清理半下载文件，避免残留文件影响下次断点续传判断
+            try:
+                dest.unlink(missing_ok=True)
+            except (NameError, AttributeError, OSError):
+                pass
             yield f"data: {json.dumps({'status': 'error', 'message': err_msg, 'release_url': release_url}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -1962,6 +2013,13 @@ async def sage_get_citation_styles():
 
 
 # ──────────────────────────── 模型下载进度 SSE ────────────────────────────
+
+# 版本检查缓存（避免检测更新时反复触发 GitHub API 速率限制）
+# 结构: {"ts": timestamp, "data": result_dict, "current": version_str, "ttl": 缓存有效期秒数}
+# - 成功(source!=none): ttl=3600 (1小时)
+# - 速率限制: ttl=300 (5分钟)
+# - 普通失败(source==none): 不缓存(=None)，允许用户立即重试
+_version_cache: dict | None = None
 
 # 全局进度队列: 每个 model_download 任务通过此队列推送进度事件
 # key: session_id (str) → value: asyncio.Queue
