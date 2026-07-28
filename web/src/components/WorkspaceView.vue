@@ -251,6 +251,62 @@ function getFileIcon(ext) {
   return iconMap[ext] || 'FILE'
 }
 
+async function downloadPaper(paper) {
+  if (!selectedWs.value || !paper?.path) return
+  try {
+    const url = `/api/sage/workspaces/${selectedWs.value}/papers/download?path=${encodeURIComponent(paper.path)}`
+    const res = await fetch(url)
+    if (!res.ok) {
+      let msg = `下载失败 (${res.status})`
+      try {
+        const err = await res.json()
+        msg = `下载失败: ${err.detail || msg}`
+      } catch { /* ignore */ }
+      showAction(msg, 'error')
+      return
+    }
+    // 将响应体转为 Blob 并触发浏览器下载
+    const blob = await res.blob()
+    const objectUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objectUrl
+    a.download = paper.name || 'download'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(objectUrl)
+  } catch (e) {
+    showAction(`下载失败: ${e.message}`, 'error')
+  }
+}
+
+async function deletePaper(paper) {
+  if (!selectedWs.value || !paper?.path) return
+  // 二次确认，避免误删
+  if (!window.confirm(`确定删除「${paper.name}」？\n该操作会同时清除其索引数据，不可恢复。`)) return
+  try {
+    const res = await fetch(
+      `/api/sage/workspaces/${selectedWs.value}/papers?path=${encodeURIComponent(paper.path)}`,
+      { method: 'DELETE' },
+    )
+    if (!res.ok) {
+      let msg = `删除失败 (${res.status})`
+      try {
+        const err = await res.json()
+        msg = `删除失败: ${err.detail || msg}`
+      } catch { /* ignore */ }
+      showAction(msg, 'error')
+      return
+    }
+    showAction(`已删除「${paper.name}」`, 'success')
+    // 刷新论文列表 + 索引状态（papers_count 已变）
+    await loadPapers()
+    await loadIndexStatus()
+  } catch (e) {
+    showAction(`删除失败: ${e.message}`, 'error')
+  }
+}
+
 function getLevelColor(level) {
   const colors = { SCI: '#8b5cf6', SSCI: '#0ea5e9', CSSCI: '#f59e0b', EI: '#10b981' }
   return colors[level] || 'var(--text-faint)'
@@ -371,7 +427,11 @@ onMounted(loadWorkspaces)
         <!-- 索引状态 -->
         <div v-if="indexStatus" class="index-status">
           <span class="status-dot" :class="{ indexed: indexStatus.indexed }"></span>
-          <span>{{ indexStatus.indexed ? `已索引 (${indexStatus.chunks || 0} 个文档块)` : '未索引' }}</span>
+          <span v-if="indexStatus.indexed">{{ `已索引 (${indexStatus.chunks || 0} 个文档块)` }}</span>
+          <span v-else-if="indexStatus.stats?.error" class="status-error" :title="indexStatus.stats.error">
+            {{ `索引失败: ${indexStatus.stats.error.slice(0, 60)}${indexStatus.stats.error.length > 60 ? '...' : ''}` }}
+          </span>
+          <span v-else>未索引</span>
         </div>
       </div>
 
@@ -402,6 +462,24 @@ onMounted(loadWorkspaces)
               <span>{{ formatDate(paper.modified) }}</span>
             </div>
           </div>
+          <button
+            class="paper-download-btn"
+            title="下载论文"
+            @click.stop="downloadPaper(paper)"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button
+            class="paper-delete-btn"
+            title="删除论文"
+            @click.stop="deletePaper(paper)"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+              <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
           <span class="paper-ext">{{ paper.ext }}</span>
         </div>
       </div>
@@ -587,6 +665,7 @@ onMounted(loadWorkspaces)
 .index-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
 .status-dot.indexed { background: var(--success); }
+.status-error { color: #dc2626; cursor: help; }
 
 /* 论文列表 */
 .paper-list { display: flex; flex-direction: column; gap: 4px; }
@@ -613,6 +692,30 @@ onMounted(loadWorkspaces)
 .paper-meta { font-size: 10px; color: var(--text-faint); margin-top: 2px; display: flex; gap: 4px; }
 .dot-sep { color: var(--text-faint); }
 .paper-ext { font-size: 10px; color: var(--text-faint); font-family: var(--font-mono); }
+
+.paper-download-btn {
+  width: 28px; height: 28px; border-radius: 6px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--text-muted); cursor: pointer; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.18s var(--ease-out-expo);
+}
+.paper-download-btn:hover {
+  background: var(--accent-soft); color: var(--accent);
+  border-color: var(--accent-border);
+}
+
+.paper-delete-btn {
+  width: 28px; height: 28px; border-radius: 6px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--text-muted); cursor: pointer; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.18s var(--ease-out-expo);
+}
+.paper-delete-btn:hover {
+  background: #fef2f2; color: #dc2626;
+  border-color: #fecaca;
+}
 
 /* 弹窗通用 */
 .modal-overlay {

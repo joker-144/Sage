@@ -1878,6 +1878,73 @@ async def sage_list_papers(ws_id: str):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/api/sage/workspaces/{ws_id}/papers/download")
+async def sage_download_paper(ws_id: str, path: str):
+    """下载工作空间中的论文文件
+
+    Args:
+        ws_id: 工作空间 ID
+        path: 论文相对于工作空间根目录的路径（如 "papers/xxx.pdf"）
+              —— 与 /papers 端点返回的 path 字段一致
+    """
+    from pathlib import Path as _Path
+    from sage.workspace_manager import get_workspace_manager
+
+    try:
+        manager = get_workspace_manager()
+        ws_path = manager.get_workspace_path(ws_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"工作空间不存在: {e}")
+
+    # 安全校验：解析后的绝对路径必须仍位于工作空间内，防止路径穿越
+    try:
+        rel = _Path(path)
+        # 拒绝绝对路径和 .. 穿越
+        if rel.is_absolute() or ".." in rel.parts:
+            raise HTTPException(status_code=400, detail="非法路径")
+        target = (ws_path / rel).resolve()
+        ws_root = ws_path.resolve()
+        # 使用 is_relative_to 而非字符串 startswith，避免 'ws1' 误匹配 'ws10' 前缀
+        if not target.is_relative_to(ws_root):
+            raise HTTPException(status_code=400, detail="路径越界")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"路径解析失败: {e}")
+
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    return FileResponse(
+        path=str(target),
+        filename=target.name,
+        media_type="application/octet-stream",
+    )
+
+
+@app.delete("/api/sage/workspaces/{ws_id}/papers")
+async def sage_delete_paper(ws_id: str, path: str):
+    """删除工作空间中的论文文件，并同步清理索引块
+
+    Args:
+        ws_id: 工作空间 ID
+        path: 论文相对于工作空间根目录的路径（如 "papers/xxx.pdf"）
+              —— 与 /papers 端点返回的 path 字段一致
+    """
+    from sage.workspace_manager import get_workspace_manager
+
+    try:
+        manager = get_workspace_manager()
+        result = manager.delete_paper(ws_id, path)
+        return {"success": True, **result}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除失败: {e}")
+
+
 # ── Sage 论文工具直接 API（封装 PaperOps，不通过 Agent 对话）──
 # 路由前缀: /api/sage
 # 功能: 文献检索/引用提取/格式化/查重/外部检索

@@ -372,6 +372,60 @@ class SageWorkspaceManager:
             "index_result": index_result,
         }
 
+    def delete_paper(self, ws_id: str, paper_path: str) -> dict:
+        """删除工作空间中的论文文件，并同步清理其索引块
+
+        Args:
+            ws_id: 工作空间 ID
+            paper_path: 论文相对于工作空间根目录的路径（与 /papers 返回的 path 字段一致）
+
+        Returns:
+            删除结果
+        """
+        ws_path = self.get_workspace_path(ws_id)
+
+        # 路径安全校验：拒绝绝对路径和 .. 穿越
+        rel = Path(paper_path)
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError(f"非法路径: {paper_path}")
+
+        target = (ws_path / rel).resolve()
+        ws_root = ws_path.resolve()
+        # 使用 is_relative_to 而非字符串 startswith，避免 'ws1' 误匹配 'ws10' 前缀
+        if not target.is_relative_to(ws_root):
+            raise ValueError(f"路径越界: {paper_path}")
+
+        if not target.is_file():
+            raise FileNotFoundError(f"文件不存在: {paper_path}")
+
+        # 1. 删除文件
+        target.unlink()
+
+        # 2. 同步清理索引块（避免索引残留导致搜索命中已删除的论文）
+        rel_path_str = str(rel).replace("\\", "/")
+        sage_dir = ws_path / ".sage"
+        db_path = sage_dir / "index.db"
+        if db_path.exists():
+            try:
+                store = WorkspaceStore(db_path=str(db_path))
+                store.delete_file_chunks(rel_path_str)
+                store.close()
+            except Exception:
+                # 索引清理失败不影响文件删除主流程
+                pass
+
+        # 3. 更新论文计数
+        meta = self.get_workspace(ws_id)
+        new_count = max(0, meta.get("papers_count", 0) - 1)
+        self._update_registry_entry(ws_id, papers_count=new_count)
+        self._update_meta(ws_id, papers_count=new_count)
+
+        return {
+            "workspace_id": ws_id,
+            "deleted_path": rel_path_str,
+            "papers_count": new_count,
+        }
+
     # ── 自动向量化索引 ──
 
     def trigger_indexing(self, ws_id: str, force: bool = False) -> dict:
@@ -406,13 +460,17 @@ class SageWorkspaceManager:
 
         try:
             stats = index.index_project(force=force)
+            index_failed = "error" in stats and stats.get("chunks", 0) == 0
         except Exception as e:
             stats = {"error": str(e), "files": 0, "chunks": 0, "skipped": 0}
+            index_failed = True
 
         # 保存索引统计
         index_stats = {
             "workspace_id": ws_id,
-            "indexed": True,
+            # 索引失败（异常或 0 块带 error）时不标记 indexed=True，
+            # 避免前端误显示"已索引但 0 块"
+            "indexed": not index_failed,
             "indexed_at": datetime.now().isoformat(),
             "force": force,
             "stats": stats,
@@ -426,12 +484,12 @@ class SageWorkspaceManager:
         # 更新注册表
         self._update_registry_entry(
             ws_id,
-            indexed=True,
+            indexed=not index_failed,
             index_stats=index_stats,
         )
         self._update_meta(
             ws_id,
-            indexed=True,
+            indexed=not index_failed,
             index_stats=index_stats,
         )
 
@@ -546,7 +604,15 @@ CREATE TABLE IF NOT EXISTS file_index (
     end_line INTEGER NOT NULL,
     content TEXT NOT NULL,
     embedding BLOB,
-    file_hash TEXT NOT NULL
+    file_hash TEXT NOT NULL,
+    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- 论文元数据（索引时提取，供检索结果标注来源）
+    title TEXT,
+    authors TEXT,
+    year TEXT,
+    doi TEXT,
+    page_start INTEGER,
+    page_end INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_file_path ON file_index(file_path);
 """
@@ -572,7 +638,44 @@ class WorkspaceStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_WORKSPACE_INDEX_SCHEMA)
+        # 表迁移：旧版数据库可能缺少论文元数据字段，使用 ALTER TABLE 补全
+        # （CREATE TABLE IF NOT EXISTS 不会更新已存在表的 schema）
+        self._migrate_file_index_columns()
         self._conn.commit()
+
+    def _migrate_file_index_columns(self) -> None:
+        """检查并补全 file_index 表的论文元数据字段
+
+        旧版 WorkspaceStore 创建的表仅有 6 个基础字段，缺少
+        title/authors/year/doi/page_start/page_end，导致 ProjectIndex
+        传入这些参数时抛 TypeError。这里通过 ALTER TABLE ADD COLUMN
+        补齐字段，保留已有索引数据。
+        """
+        import sqlite3
+        required_cols = {
+            "indexed_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "title": "TEXT",
+            "authors": "TEXT",
+            "year": "TEXT",
+            "doi": "TEXT",
+            "page_start": "INTEGER",
+            "page_end": "INTEGER",
+        }
+        try:
+            existing = {row["name"] for row in self._conn.execute(
+                "PRAGMA table_info(file_index)"
+            ).fetchall()}
+        except sqlite3.Error:
+            return
+        for col, col_type in required_cols.items():
+            if col not in existing:
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE file_index ADD COLUMN {col} {col_type}"
+                    )
+                except sqlite3.Error:
+                    # 字段已存在或添加失败（如并发迁移）— 忽略
+                    pass
 
     def get_file_hash(self, file_path: str) -> Optional[str]:
         """获取文件已索引的 hash"""
@@ -598,13 +701,26 @@ class WorkspaceStore:
         content: str,
         embedding: bytes,
         file_hash: str,
+        title: Optional[str] = None,
+        authors: Optional[str] = None,
+        year: Optional[str] = None,
+        doi: Optional[str] = None,
+        page_start: Optional[int] = None,
+        page_end: Optional[int] = None,
     ) -> None:
-        """存储文档块（含向量）"""
+        """存储文档块（含向量与论文元数据）
+
+        签名与 MemoryStore.store_chunk 保持一致，支持论文元数据
+        （title/authors/year/doi/page_start/page_end）的存储，
+        供检索结果标注来源。
+        """
         self._conn.execute(
             """INSERT INTO file_index
-               (file_path, start_line, end_line, content, embedding, file_hash)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (file_path, start_line, end_line, content, embedding, file_hash),
+               (file_path, start_line, end_line, content, embedding, file_hash,
+                title, authors, year, doi, page_start, page_end)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (file_path, start_line, end_line, content, embedding, file_hash,
+             title, authors, year, doi, page_start, page_end),
         )
         self._conn.commit()
 

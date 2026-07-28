@@ -32,7 +32,14 @@ async function fetchConversations() {
 
 function formatTime(ts) {
   if (!ts) return ''
-  const d = new Date(ts + (ts.length === 10 ? 'T00:00:00' : ''))
+  // SQLite CURRENT_TIMESTAMP 返回 UTC 时间字符串（"YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"）
+  // 必须显式标记为 UTC（加 'Z' 后缀），否则 new Date() 按本地时区解析，
+  // 在 UTC+8 时区下会少 8 小时（表现为"8 小时前"）
+  let normalized = String(ts).replace(' ', 'T')
+  if (normalized.length === 10) normalized += 'T00:00:00'
+  // 末尾追加 Z 标记为 UTC 时间（若未带时区标记）
+  if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized)) normalized += 'Z'
+  const d = new Date(normalized)
   if (isNaN(d.getTime())) return ''
   const now = new Date()
   const diff = now - d
@@ -111,7 +118,7 @@ watch(() => props.refreshKey, () => {
             >
               <span class="chat-item-dot"></span>
               <span class="chat-item-text">{{ conv.title || '对话' }}</span>
-              <span class="chat-item-time">{{ formatTime(conv.created_at) }}</span>
+              <span class="chat-item-time">{{ formatTime(conv.updated_at || conv.created_at) }}</span>
             </button>
             <button
               class="chat-item-delete"
