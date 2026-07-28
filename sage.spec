@@ -17,12 +17,31 @@ PyInstaller spec for Sage.
 """
 
 import sys
+import atexit
 from pathlib import Path
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_submodules,
     copy_metadata,
 )
+
+# ── 打包前清空 .env（避免泄露开发环境的密钥）─────────────
+# 打包产物中不包含任何 API Key 等敏感信息。
+# 用户首次启动时会在 %LOCALAPPDATA%/Sage/.env 创建自己的配置，
+# 该路径与程序安装目录隔离，升级重装不会覆盖用户配置。
+_project_root = Path(SPECPATH).resolve() if 'SPECPATH' in dir() else Path(__file__).resolve().parent
+_env_file = _project_root / ".env"
+_env_backup = None
+if _env_file.exists():
+    _env_backup = _env_file.read_text(encoding="utf-8")
+    _env_file.write_text("", encoding="utf-8")
+    print("[sage.spec] 已临时清空 .env（打包完成后自动恢复）")
+    # 注册恢复函数：PyInstaller 执行完 spec 后调用 atexit
+    def _restore_env():
+        if _env_backup is not None:
+            _env_file.write_text(_env_backup, encoding="utf-8")
+            print("[sage.spec] 已恢复 .env 原始内容")
+    atexit.register(_restore_env)
 
 # ── 收集隐式数据 / 元数据 ────────────────────────────────
 # sentence-transformers / huggingface-hub 依赖大量动态元数据

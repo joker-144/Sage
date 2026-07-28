@@ -824,6 +824,7 @@ _DOTENV_KEY_MAP = {
     "LLM_CHAT_MODEL": ("model",),
     "LLM_CHAT_TEMPERATURE": ("temperature",),
     "LLM_CHAT_MAX_TOKENS": ("maxTokens",),
+    "TAVILY_API_KEY": ("tavilyApiKey",),
 }
 
 
@@ -921,6 +922,7 @@ class UserSettingsPayload(BaseModel):
     baseUrl: str | None = None
     temperature: float | None = None
     maxTokens: int | None = None
+    tavilyApiKey: str | None = None
 
 
 @app.post("/api/user-settings")
@@ -1107,6 +1109,14 @@ async def version_check():
         # 速率限制场景：缓存 5 分钟，避免用户疯狂重试触发更多限制
         _version_cache = {"ts": now, "data": result, "current": current, "ttl": 300}
         return result
+
+    # ── 有新版本时：用版本间的 commit 列表覆盖 changelog ──
+    # 调用 GitHub Compare API 获取 v{current}...v{latest} 之间的所有 commit message，
+    # 比手动填写的 Release body 更准确、更及时。获取失败时保留原 Release body。
+    if result["has_update"] and result["latest"] != current:
+        commits_changelog = _fetch_commits_between_versions(current, result["latest"])
+        if commits_changelog:
+            result["changelog"] = commits_changelog
 
     # 成功时写缓存（1 小时）；普通失败（source='none'）不缓存，允许用户立即重试
     if result["source"] != "none":
@@ -1526,6 +1536,91 @@ def _fetch_latest_release_via_ghproxy_api() -> dict | None:
         except Exception:
             continue
     return None
+
+
+def _fetch_commits_between_versions(current: str, latest: str) -> str:
+    """获取两个版本 tag 之间的所有 commit message，拼接为 changelog 文本
+
+    调用 GitHub Compare API: /repos/{owner}/{repo}/compare/{base}...{head}
+    返回两个 tag 之间的完整 commit 列表，每条取第一行（标题）拼接为更新日志。
+
+    镜像策略与 version_check 一致：
+      1. 优先直连 api.github.com
+      2. 失败时通过 gh-proxy.com 等镜像代理
+
+    Args:
+        current: 当前版本号（如 "0.5.7"）
+        latest:  最新版本号（如 "0.5.8"）
+
+    Returns:
+        拼接好的 changelog 文本；获取失败时返回空字符串（降级为 Release body）
+    """
+    import httpx
+
+    # 统一加 v 前缀（GitHub tag 通常为 v0.5.7 格式）
+    base_tag = f"v{current.lstrip('v')}"
+    head_tag = f"v{latest.lstrip('v')}"
+    if base_tag == head_tag:
+        return ""
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/compare/{base_tag}...{head_tag}"
+    headers = {
+        "User-Agent": "Sage-Updater",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # 第 1 步：直连 GitHub API
+    try:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            resp = client.get(api_url, headers=headers)
+            if resp.status_code == 200:
+                return _parse_compare_commits(resp.json())
+    except Exception:
+        pass
+
+    # 第 2 步：国内镜像代理
+    for mirror_prefix in _GH_PROXY_MIRRORS:
+        proxied_url = mirror_prefix + api_url
+        try:
+            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                resp = client.get(proxied_url, headers=headers)
+                if resp.status_code == 200:
+                    return _parse_compare_commits(resp.json())
+        except Exception:
+            continue
+
+    return ""
+
+
+def _parse_compare_commits(compare_data: dict) -> str:
+    """解析 GitHub Compare API 返回的 JSON，提取 commit message 拼接为 changelog
+
+    格式：
+        • commit 标题1
+        • commit 标题2
+        ...
+
+    只取每条 commit message 的第一行（标题），忽略多行 body，
+    保证更新日志简洁可读。对重复的 commit 标题自动去重。
+    """
+    commits = compare_data.get("commits", [])
+    if not commits:
+        return ""
+
+    seen = set()  # 记录已出现的 commit 标题，用于去重
+    lines = []
+    for c in commits:
+        msg = (c.get("commit", {}).get("message") or "").strip()
+        if not msg:
+            continue
+        # 只取第一行（标题），跳过 merge commit 等无意义信息
+        first_line = msg.split("\n", 1)[0].strip()
+        if not first_line or first_line in seen:
+            continue
+        seen.add(first_line)
+        lines.append(f"• {first_line}")
+
+    return "\n".join(lines) if lines else ""
 
 
 def _fetch_latest_release_via_atom() -> dict | None:

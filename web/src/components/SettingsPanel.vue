@@ -47,10 +47,12 @@ const DEFAULT_SETTINGS = {
   baseUrl: 'https://api.deepseek.com/v1',
   temperature: 0.3,
   maxTokens: 8192,
+  tavilyApiKey: '',  // 联网搜索 API Key（可选）
 }
 
 const settings = ref(structuredClone(DEFAULT_SETTINGS))
 const saved = ref(false)
+const activeTab = ref('model')  // 顶部 Tab：model | management | advanced
 
 const activeProvider = computed(() => providers.find((p) => p.id === settings.value.provider))
 
@@ -487,6 +489,27 @@ function closeDownloadModal() {
       <p class="subtitle">配置模型供应商、API Key 与参数</p>
     </header>
 
+    <!-- ── 顶部 Tab 导航 ── -->
+    <nav class="settings-tabs">
+      <button
+        class="tab-btn"
+        :class="{ active: activeTab === 'model' }"
+        @click="activeTab = 'model'"
+      >模型配置</button>
+      <button
+        class="tab-btn"
+        :class="{ active: activeTab === 'management' }"
+        @click="activeTab = 'management'"
+      >模型管理</button>
+      <button
+        class="tab-btn"
+        :class="{ active: activeTab === 'advanced' }"
+        @click="activeTab = 'advanced'"
+      >版本更新</button>
+    </nav>
+
+    <!-- ══ Tab 1: 模型配置（供应商 + 参数 + 联网搜索）══ -->
+    <div v-show="activeTab === 'model'" class="tab-content">
     <!-- ── 模型供应商 ── -->
     <div class="form-section">
       <h2>API 供应商</h2>
@@ -600,6 +623,35 @@ function closeDownloadModal() {
       </div>
     </div>
 
+    <!-- ── 联网搜索（可选）── -->
+    <div class="form-section">
+      <h2>
+        联网搜索
+        <span class="optional-badge">可选</span>
+      </h2>
+      <p class="section-desc">
+        配置 Tavily API Key 后，Agent 在回答问题时可联网搜索最新资料，获取论文之外的实时信息（如最新研究进展、作者主页、会议信息等）。不配置则仅依赖本地知识库和模型内置知识。
+      </p>
+
+      <div class="form-group">
+        <label>Tavily API Key</label>
+        <div class="input-with-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" stroke="currentColor" stroke-width="2"/></svg>
+          <input
+            v-model="settings.tavilyApiKey"
+            type="password"
+            placeholder="tvly-xxxxxxxxxxxx（留空则不启用联网搜索）"
+          />
+        </div>
+        <p class="hint">
+          可选配置。前往 <a href="https://tavily.com" target="_blank" rel="noopener">tavily.com</a> 注册获取，免费额度 1000 次/月。
+        </p>
+      </div>
+    </div>
+    </div><!-- /Tab 1: 模型配置 -->
+
+    <!-- ══ Tab 2: 模型管理 ══ -->
+    <div v-show="activeTab === 'management'" class="tab-content">
     <!-- ── 模型管理 ── -->
     <div class="form-section">
       <h2>
@@ -654,7 +706,10 @@ function closeDownloadModal() {
         </div>
       </div>
     </div>
+    </div><!-- /Tab 2: 模型管理 -->
 
+    <!-- ══ Tab 3: 版本更新 ══ -->
+    <div v-show="activeTab === 'advanced'" class="tab-content">
     <!-- ── 版本更新 ── -->
     <div class="form-section">
       <h2>版本更新</h2>
@@ -703,6 +758,7 @@ function closeDownloadModal() {
         当前运行在浏览器模式，请在桌面端使用一键更新功能以获得最佳体验。
       </p>
     </div>
+    </div><!-- /Tab 3: 版本更新 -->
 
     <!-- ── 下载进度模态框 ── -->
     <Teleport to="body">
@@ -825,9 +881,43 @@ function closeDownloadModal() {
 <style scoped>
 .settings { flex: 1; overflow-y: auto; padding: 30px; max-width: 660px; margin: 0 auto; }
 
-.settings-header { margin-bottom: 30px; }
+.settings-header { margin-bottom: 22px; }
 .settings-header h1 { font-size: 21px; font-weight: 650; color: var(--text-primary); letter-spacing: -0.01em; }
 .subtitle { font-size: 12.5px; color: var(--text-muted); margin-top: 3px; }
+
+/* ── 顶部 Tab 导航 ── */
+.settings-tabs {
+  display: flex; gap: 4px;
+  margin-bottom: 20px; padding: 4px;
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.tab-btn {
+  flex: 1; padding: 9px 12px;
+  background: transparent; border: none; border-radius: var(--radius-md);
+  font-family: var(--font-sans); font-size: 12.5px; font-weight: 500;
+  color: var(--text-muted); cursor: pointer;
+  transition: all 0.18s var(--ease-out-expo);
+}
+.tab-btn:hover { color: var(--text-primary); background: var(--bg-input); }
+.tab-btn.active {
+  background: var(--bg-elevated); color: var(--text-primary);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  font-weight: 600;
+}
+.tab-content { animation: tab-fade-in 0.18s var(--ease-out-expo); }
+@keyframes tab-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── 可选徽章 ── */
+.optional-badge {
+  display: inline-block; margin-left: 6px;
+  padding: 1px 7px; font-size: 10px; font-weight: 500;
+  color: var(--text-muted); background: var(--bg-input);
+  border-radius: 10px; vertical-align: middle;
+}
 
 .form-section {
   background: var(--bg-surface);
