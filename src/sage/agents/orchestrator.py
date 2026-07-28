@@ -143,6 +143,7 @@ class AgentOrchestrator:
             self._workers[role] = AgentLoop(
                 workspace=self.workspace,
                 system_prompt=prompt,
+                writing_mode=True,
             )
         return self._workers[role]
 
@@ -153,7 +154,7 @@ class AgentOrchestrator:
         """
         if self._general_worker is None:
             # 不传 system_prompt，AgentLoop 会使用默认的通用 system prompt
-            self._general_worker = AgentLoop(workspace=self.workspace)
+            self._general_worker = AgentLoop(workspace=self.workspace, writing_mode=True)
         return self._general_worker
 
     def _get_worker_by_role_name(self, role_name: str) -> Optional[AgentLoop]:

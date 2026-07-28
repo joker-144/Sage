@@ -46,7 +46,7 @@ const DEFAULT_SETTINGS = {
   model: 'deepseek-chat',
   baseUrl: 'https://api.deepseek.com/v1',
   temperature: 0.3,
-  maxTokens: 4096,
+  maxTokens: 8192,
 }
 
 const settings = ref(structuredClone(DEFAULT_SETTINGS))

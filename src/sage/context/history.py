@@ -1,4 +1,4 @@
-﻿"""
+"""
 对话历史管理 — 多轮对话存储 + 摘要压缩
 
 当对话历史超过 token 预算阈值时，自动触发 LLM 摘要压缩：
@@ -92,15 +92,16 @@ class ChatHistory:
     async def compress(self, llm_client):
         """触发摘要压缩 — 将较早的对话用 LLM 摘要
 
-        保留最近 6 条消息完整，更早的消息压缩为摘要。
+        保留最近 10 条消息完整，更早的消息压缩为摘要。
+        写作场景需保留更多上下文以确保论文连贯性。
         使用 asyncio.to_thread 避免阻塞事件循环。
         """
-        if len(self._messages) <= 6:
+        if len(self._messages) <= 10:
             return  # 消息太少，无需压缩
 
-        # 分割：较早的消息压缩，最近 6 条保留
-        to_compress = self._messages[:-6]
-        to_keep = self._messages[-6:]
+        # 分割：较早的消息压缩，最近 10 条保留
+        to_compress = self._messages[:-10]
+        to_keep = self._messages[-10:]
 
         # 构建摘要请求
         history_text = "\n\n".join(

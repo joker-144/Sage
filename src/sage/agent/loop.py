@@ -86,10 +86,15 @@ class AgentLoop:
         conversation_id: Optional[str] = None,
         enable_reflection: bool = True,
         enable_observability: bool = True,
+        writing_mode: bool = False,
     ):
         config = get_config()
         self.workspace = workspace or config.workspace
         self.llm = llm or LLMClient()
+        # 写作模式（多智能体协作）需要更长的输出以撰写论文段落/章节
+        # 单 Agent 模式沿用配置默认值（8192），写作模式提升至 16384
+        if writing_mode:
+            self.llm.max_tokens = 16384
         self.tools = tools or ToolEngine(self.workspace)
         self.system_prompt = system_prompt or get_system_prompt()
 

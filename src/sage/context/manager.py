@@ -1,4 +1,4 @@
-﻿"""
+"""
 上下文管理器 — 统一管理对话历史、token 预算、上下文构建
 
 AgentLoop 通过 ContextManager 与历史/工具结果交互，不直接操作消息列表。
@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from sage.config import get_config
 from sage.context.history import ChatHistory, Message
+from sage.context.tokenizer import count_tokens
 
 
 class ContextManager:
@@ -49,10 +50,22 @@ class ContextManager:
         return self.history.build_messages(self.system_prompt)
 
     async def maybe_compress(self, llm_client):
-        """检查并触发摘要压缩（超过 token 阈值时）"""
-        if self.history.needs_compression():
+        """检查并触发摘要压缩（超过 token 阈值时）
+
+        system prompt 纳入 token 预算计算，避免长 system prompt
+        （含技能/记忆注入）导致实际上下文超限却未触发压缩。
+        """
+        if self._total_token_count() > self.history.summary_trigger_tokens:
             await self.history.compress(llm_client)
 
+    def _system_prompt_tokens(self) -> int:
+        """system prompt 的 token 数"""
+        return count_tokens(self.system_prompt, self.history.model) if self.system_prompt else 0
+
+    def _total_token_count(self) -> int:
+        """含 system prompt 的上下文总 token 数"""
+        return self.history.token_count() + self._system_prompt_tokens()
+
     def token_count(self) -> int:
-        """当前上下文的 token 数"""
-        return self.history.token_count()
+        """当前上下文的 token 数（含 system prompt）"""
+        return self._total_token_count()
