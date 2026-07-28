@@ -2,22 +2,25 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
+**当前版本：0.6.1** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+
 ---
 
 ## 目录
 
 - [核心特性](#核心特性)
+- [快速开始](#快速开始)
 - [系统架构](#系统架构)
 - [写作模式](#写作模式)
-- [版本管理](#版本管理)
-- [配置说明](#配置说明)
 - [多智能体角色](#多智能体角色)
 - [技能包（Skill Packages）](#技能包skill-packages)
 - [工具集](#工具集)
 - [工作空间管理](#工作空间管理)
+- [配置说明](#配置说明)
+- [前端与桌面端](#前端与桌面端)
+- [版本管理](#版本管理)
 - [CLI 命令](#cli-命令)
 - [HTTP API](#http-api)
-- [项目结构](#项目结构)
 - [开发与测试](#开发与测试)
 - [许可协议](#许可协议)
 
@@ -32,13 +35,90 @@
 - **本地文献索引**：基于 `sentence-transformers`（all-MiniLM-L6-v2，384 维）构建向量化索引，语义检索已上传文献库，无需依赖外部 API。
 - **多文档解析**：支持 PDF / Word / LaTeX / 扫描版 OCR，自动提取标题、作者、年份、DOI、摘要、关键词等元数据。
 - **外部学术检索**：集成 Google Scholar / arXiv / CrossRef / Semantic Scholar 四大学术数据源，用于补充检索与引用真实性验证。
+- **联网搜索（可选）**：集成 Tavily AI 搜索（`web_search_pro`），当 DuckDuckGo 免费搜索结果质量不高时自动切换，需配置 `TAVILY_API_KEY`（每月 1000 次免费额度）。
 - **多格式引用管理**：支持 APA / MLA / GB-T7714 / Vancouver / Chicago / IEEE 六大引用格式，自动插入与格式化。
 - **降 AI 味改写**：识别并改写 AI 生成文本的典型痕迹，规避 AI 检测，保留原意与引用。
 - **多工作空间管理**：按"时间戳_领域标签"命名（如 `20260721_143022_CS-AI`），每个工作空间独立 SQLite 索引库，互不污染。
 - **反思与自我修正**：工具执行后自动反思，失败自动修正（启发式规则 + 重试上限 + 断路器保护）。
 - **三层记忆系统**：工作记忆（对话上下文）+ 长期记忆（经验教训）+ 语义记忆（向量检索）。
-- **可观测性**：内置指标采集与日志，支持工具调用追踪与失败分析。
-- **Provider 可切换**：通过 OpenAI 兼容协议接入 DeepSeek / Qwen / OpenAI 等服务商，无需修改代码。
+- **Provider 可切换**：通过 OpenAI 兼容协议接入 DeepSeek / Qwen / OpenAI / Anthropic / 智谱 / 月之暗面等，前端设置界面可视化切换，无需修改代码。
+- **桌面端分发**：基于 Electron + NSIS 打包为 Windows 安装包，支持自动检查更新、镜像加速下载、静默安装后自启动。
+
+---
+
+## 快速开始
+
+### 安装
+
+```bash
+# 克隆项目
+git clone <repo-url>
+cd Sage
+
+# 创建并激活虚拟环境
+python -m venv .venv
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
+
+# 安装核心依赖
+pip install -e .
+
+# （可选）安装论文文档解析依赖
+pip install -e ".[paper]"
+
+# （可选）安装开发与测试依赖
+pip install -e ".[dev]"
+```
+
+### 首次配置
+
+```bash
+# 复制配置模板
+cp .env.example .env
+
+# 编辑 .env，至少填入 LLM_CHAT_API_KEY
+# 推荐使用 DeepSeek（性价比高）：https://platform.deepseek.com/api_keys
+```
+
+或使用交互式配置向导：
+
+```bash
+sage init
+```
+
+也可启动服务后在前端设置界面配置（支持多 Provider 切换、API Key 管理、模型列表自动拉取）。
+
+### 启动服务
+
+```bash
+# 启动 API 服务（默认 http://127.0.0.1:8000）
+sage serve
+
+# 或进入交互式对话
+sage chat
+```
+
+### 创建你的第一个论文工作空间
+
+```bash
+# 通过 API 创建工作空间
+curl -X POST http://127.0.0.1:8000/api/sage/workspaces \
+  -H "Content-Type: application/json" \
+  -d '{"domain_tag": "CS-AI", "description": "人工智能方向论文", "index_level": "SCI"}'
+
+# 上传论文
+curl -X POST http://127.0.0.1:8000/api/sage/workspaces/<ws_id>/upload \
+  -F "file=@paper.pdf" \
+  -F "subdir=papers"
+
+# 触发向量化索引（上传后会自动触发，此为手动重建）
+curl -X POST "http://127.0.0.1:8000/api/sage/workspaces/<ws_id>/index?force=true"
+
+# 开始对话写作
+sage chat "帮我基于已上传的文献写一段关于 Transformer 注意力机制的研究背景"
+```
 
 ---
 
@@ -164,231 +244,6 @@ LLM 分析失败时降级为通用助手处理，确保不中断服务。
 
 ---
 
-## 版本管理
-
-Sage 采用**单一来源（single source of truth）**版本号管理：项目根目录的 [`VERSION`](VERSION) 文件是唯一权威，所有其他位置自动从它同步。
-
-### 同步拓扑
-
-```
-              ┌─────────────────────┐
-              │  /VERSION  (0.5.0)  │   ← 唯一权威
-              └──────────┬──────────┘
-                         │
-        ┌────────────────┼────────────────┐
-        │                │                │
-        ▼                ▼                ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│ Python 后端  │  │  前端构建    │  │  Electron    │
-│ sage.__ver__ │  │  Vite        │  │  主进程      │
-│  (回退读取)  │  │  __APP_VER__ │  │  SAGE_VER    │
-└──────────────┘  └──────────────┘  └──────────────┘
-        │                │                │
-        ▼                ▼                ▼
-    pyproject.toml   web/package.json  web/electron/main.cjs
-   (dynamic version)  (prebuild 同步)   (兜底版本)
-```
-
-### 显示位置
-
-| 位置 | 来源 |
-|------|------|
-| 后端 `sage.__version__` | `src/sage/__init__.py` 读取 VERSION 文件 |
-| `pyproject.toml` | `dynamic = ["version"]` 关联到 `sage.__version__` |
-| 前端侧边栏 | `__APP_VERSION__`（Vite `define` 注入） |
-| 前端底部状态栏 | `__APP_VERSION__` |
-| 仪表盘 API 版本 | `/health` 端点返回的 `version` |
-| 设置面板"当前版本" | `/api/version/check` 端点 |
-| Electron 桌面端 | `SAGE_VERSION` 环境变量注入 |
-| CLI `sage version` | 后端 `__version__` |
-
-### 提升版本号
-
-```bash
-# 查看当前版本
-python scripts/bump_version.py show
-
-# Patch 升级（0.5.0 -> 0.5.1）
-python scripts/bump_version.py patch
-
-# Minor 升级（0.5.0 -> 0.6.0）
-python scripts/bump_version.py minor
-
-# Major 升级（0.5.0 -> 1.0.0）
-python scripts/bump_version.py major
-
-# 预发布版本（0.5.0 -> 0.5.0-rc.1）
-python scripts/bump_version.py pre --tag rc
-
-# 直接设置
-python scripts/bump_version.py set 1.2.3
-python scripts/bump_version.py set 1.2.3-beta.1
-```
-
-`bump_version.py` 会自动：
-1. 更新 `VERSION` 文件
-2. 向 `CHANGELOG.md` 追加新版本条目（若存在）
-3. 调用 `sync_version.py` 级联同步到 `web/package.json`、`web/electron/main.cjs` 等位置
-
-### 手动同步（仅在需要时使用）
-
-```bash
-# 自动检测并修复不一致项
-python scripts/sync_version.py
-
-# 仅检查，不修改（CI 用）
-python scripts/sync_version.py --check
-```
-
-### 前端构建时自动同步
-
-`web/package.json` 已配置 prebuild/prepack/predev 钩子：
-
-```json
-{
-  "scripts": {
-    "prebuild": "python ../scripts/sync_version.py",
-    "prepack": "python ../scripts/sync_version.py",
-    "predev": "python ../scripts/sync_version.py"
-  }
-}
-```
-
-`npm run build` / `npm run dev` / `npm pack` 会**自动调用同步脚本**，无需手动干预。
-
-### CI 集成
-
-在 CI 流水线中加入版本一致性检查：
-
-```yaml
-- name: Check version consistency
-  run: python scripts/sync_version.py --check
-```
-
----
-
-## 快速开始
-
-### 环境要求
-
-- Python ≥ 3.11
-- 操作系统：Windows / macOS / Linux
-
-### 安装
-
-```bash
-# 克隆项目
-git clone <repo-url>
-cd Sage
-
-# 创建虚拟环境
-python -m venv .venv
-
-# 激活虚拟环境
-# Windows (PowerShell)
-.venv\Scripts\Activate.ps1
-# macOS / Linux
-source .venv/bin/activate
-
-# 安装核心依赖
-pip install -e .
-
-# （可选）安装论文文档解析依赖
-pip install -e ".[paper]"
-
-# （可选）安装开发与测试依赖
-pip install -e ".[dev]"
-```
-
-### 首次配置
-
-```bash
-# 复制配置模板
-cp .env.example .env
-
-# 编辑 .env，至少填入 LLM_CHAT_API_KEY
-# 推荐使用 DeepSeek（性价比高）：https://platform.deepseek.com/api_keys
-```
-
-或使用交互式配置向导：
-
-```bash
-sage init
-```
-
-### 启动服务
-
-```bash
-# 启动 API 服务（默认 http://127.0.0.1:8000）
-sage serve
-
-# 或进入交互式对话
-sage chat
-```
-
-### 创建你的第一个论文工作空间
-
-```bash
-# 通过 API 创建工作空间
-curl -X POST http://127.0.0.1:8000/api/sage/workspaces \
-  -H "Content-Type: application/json" \
-  -d '{"domain_tag": "CS-AI", "description": "人工智能方向论文", "index_level": "SCI"}'
-
-# 上传论文
-curl -X POST http://127.0.0.1:8000/api/sage/workspaces/<ws_id>/upload \
-  -F "file=@paper.pdf" \
-  -F "subdir=papers"
-
-# 触发向量化索引（上传后会自动触发，此为手动重建）
-curl -X POST "http://127.0.0.1:8000/api/sage/workspaces/<ws_id>/index?force=true"
-
-# 开始对话写作
-sage chat "帮我基于已上传的文献写一段关于 Transformer 注意力机制的研究背景"
-```
-
----
-
-## 配置说明
-
-所有配置通过 `.env` 文件管理（参考 `.env.example`）：
-
-### 对话 LLM 配置
-
-| 环境变量 | 说明 | 默认值 |
-|----------|------|--------|
-| `LLM_CHAT_API_KEY` | LLM 服务商 API Key（必填） | — |
-| `LLM_CHAT_BASE_URL` | API Base URL | `https://api.deepseek.com` |
-| `LLM_CHAT_MODEL` | 模型名称 | `deepseek-chat` |
-| `LLM_CHAT_TEMPERATURE` | 采样温度 | `0.3` |
-| `LLM_CHAT_MAX_TOKENS` | 单次生成最大 token | `8192` |
-| `LLM_CHAT_TIMEOUT` | 请求超时（秒） | `120.0` |
-| `LLM_CHAT_STREAMING` | 是否流式输出 | `true` |
-| `LLM_CHAT_MAX_TOOL_ROUNDS` | 单轮对话最大工具调用次数 | `20` |
-
-### Embedding 配置
-
-| 环境变量 | 说明 | 默认值 |
-|----------|------|--------|
-| `LLM_EMBEDDING_MODEL` | 本地 Embedding 模型 | `sentence-transformers/all-MiniLM-L6-v2` |
-| `HF_ENDPOINT` | HuggingFace 镜像（国内推荐） | `https://hf-mirror.com` |
-
-### 记忆与工作空间
-
-| 环境变量 | 说明 | 默认值 |
-|----------|------|--------|
-| `MEMORY_SQLITE_PATH` | 全局记忆数据库路径 | `data/memory.db` |
-| `DEV_AGENT_WORKSPACE` | 默认工作空间（留空使用当前目录） | `.` |
-| `DEV_AGENT_MAX_CONTEXT_TOKENS` | 上下文窗口 token 上限 | `60000` |
-| `DEV_AGENT_SUMMARY_TRIGGER_TOKENS` | 触发摘要压缩的阈值 | `45000` |
-
-### 可选外部检索
-
-| 环境变量 | 说明 |
-|----------|------|
-| `TAVILY_API_KEY` | Tavily AI 高质量搜索 API Key（每月 1000 次免费），获取地址：https://tavily.com |
-
----
-
 ## 多智能体角色
 
 8 个智能体定义在 [`src/sage/agents/`](src/sage/agents/) 下，每个角色有独立的 `agent.json` 与可选的专属技能。写作模式下还会动态使用通用助手（不绑定角色 prompt）处理无匹配角色的简单任务：
@@ -454,8 +309,8 @@ sage chat "帮我基于已上传的文献写一段关于 Transformer 注意力�
 ### 通用技能与网络（[`tools/skill_ops.py`](src/sage/tools/skill_ops.py), [`tools/web.py`](src/sage/tools/web.py)）
 
 - `list_skills` / `load_skill` / `install_skill` — 技能管理
-- `web_search` — DuckDuckGo 搜索（免费免配置）
-- `web_search_pro` — Tavily AI 高质量搜索（需 API Key）
+- `web_search` — DuckDuckGo 搜索（免费免配置，优先使用）
+- `web_search_pro` — Tavily AI 高质量搜索（当 `web_search` 结果质量不高时使用，需配置 `TAVILY_API_KEY`）
 - `web_fetch` — 抓取指定 URL 网页正文
 
 工具返回值统一为 [`ToolResult`](src/sage/tools/types.py) 数据类，含 `success` / `output` / `data` / `error` / `metadata` 字段。
@@ -464,23 +319,7 @@ sage chat "帮我基于已上传的文献写一段关于 Transformer 注意力�
 
 ## 工作空间管理
 
-Sage 支持多工作空间，按"时间戳_领域标签"命名，每个工作空间独立隔离：
-
-### 命名规则
-
-```
-workspaces/
-├── registry.json                       ← 全局注册表
-├── 20260721_143022_CS-AI/              ← 工作空间 ID
-│   ├── .sage/
-│   │   ├── meta.json                   ← 元数据（创建时间/领域/描述）
-│   │   ├── index_stats.json            ← 索引统计
-│   │   └── index.db                    ← 独立 SQLite 索引库
-│   ├── papers/                         ← 用户上传/导入的论文
-│   └── drafts/                         ← 生成的论文草稿
-└── 20260721_150000_MED-Cardio/
-    └── ...
-```
+Sage 支持多工作空间，按"时间戳_领域标签"命名（如 `20260721_143022_CS-AI`），每个工作空间独立 SQLite 索引库，互不污染。
 
 ### 领域标签规范
 
@@ -497,6 +336,146 @@ workspaces/
 - 每个工作空间使用独立的 SQLite 数据库（`.sage/index.db`）
 - 通过 [`WorkspaceStore`](src/sage/workspace_manager.py) 隔离，**不污染全局 `MemoryStore` 单例**
 - 工作空间切换通过 `switch_to()` 更新 `cfg.workspace`，不修改原有 API 接口
+
+### 向量检索流程
+
+采用两阶段检索：阈值过滤（默认 0.3）→ bi-encoder 召回 Top-K×4 → cross-encoder 重排得到 Top-K，平衡召回率与精度。
+
+---
+
+## 配置说明
+
+所有配置通过 `.env` 文件管理（参考 [`.env.example`](.env.example)）。前端设置面板修改的配置会自动写入 .env 并热重载，无需重启服务。
+
+### 对话 LLM 配置
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `LLM_CHAT_API_KEY` | LLM 服务商 API Key（必填） | — |
+| `LLM_CHAT_BASE_URL` | API Base URL | `https://api.deepseek.com` |
+| `LLM_CHAT_MODEL` | 模型名称 | `deepseek-chat` |
+| `LLM_CHAT_TEMPERATURE` | 采样温度 | `0.3` |
+| `LLM_CHAT_MAX_TOKENS` | 单次生成最大 token | `8192` |
+| `LLM_CHAT_TIMEOUT` | 请求超时（秒） | `120.0` |
+| `LLM_CHAT_STREAMING` | 是否流式输出 | `true` |
+| `LLM_CHAT_MAX_TOOL_ROUNDS` | 单轮对话最大工具调用次数 | `20` |
+
+### Embedding 配置
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `LLM_EMBEDDING_MODEL` | 本地 Embedding 模型 | `sentence-transformers/all-MiniLM-L6-v2` |
+| `HF_ENDPOINT` | HuggingFace 镜像（国内推荐） | `https://hf-mirror.com` |
+
+### 记忆与工作空间
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `MEMORY_SQLITE_PATH` | 全局记忆数据库路径 | `data/memory.db` |
+| `DEV_AGENT_WORKSPACE` | 默认工作空间（留空使用当前目录） | `.` |
+| `DEV_AGENT_MAX_CONTEXT_TOKENS` | 上下文窗口 token 上限 | `60000` |
+| `DEV_AGENT_SUMMARY_TRIGGER_TOKENS` | 触发摘要压缩的阈值 | `45000` |
+
+### 可选外部检索
+
+| 环境变量 | 说明 |
+|----------|------|
+| `TAVILY_API_KEY` | Tavily AI 高质量搜索 API Key（每月 1000 次免费），获取地址：https://tavily.com — 留空则仅使用免费的 DuckDuckGo 搜索 |
+
+---
+
+## 前端与桌面端
+
+Sage 提供基于 **Vue 3 + Vite** 的 Web 前端，可独立运行或由后端静态托管；同时支持通过 **Electron** 打包为 Windows 桌面应用。
+
+### Web 前端
+
+```bash
+cd web
+npm install
+npm run dev      # 开发模式（http://localhost:5173）
+npm run build    # 生产构建到 web/dist/
+```
+
+构建产物会被后端 `sage serve` 自动托管在根路径 `/`。
+
+### 设置界面
+
+前端设置面板采用顶部 Tab 切换布局，分为三个区域：
+
+- **模型配置**：Provider 切换、API Key 管理、Base URL、模型列表自动拉取、采样温度、最大 token，以及可选的 Tavily API Key（联网搜索）
+- **模型管理**：批量刷新所有 Provider 的可用模型列表，快速切换当前使用的模型
+- **版本更新**：检查新版本、查看更新日志、下载并安装新版本
+
+### Electron 桌面端
+
+桌面端通过 `electron-builder` 打包为 Windows NSIS 安装包，主要特性：
+
+- **数据隔离**：用户数据存储在 `%LOCALAPPDATA%/Sage`（可通过 `SAGE_DATA_DIR` 环境变量配置），升级重装不会覆盖用户配置和已安装技能
+- **自动启动**：安装完成后静默启动应用
+- **自动更新**：内置版本检查，支持 GitHub 直连 / GitHub 镜像 / PyPI 多源回退，下载 URL 自动包装为国内镜像加速
+- **安全打包**：`sage.spec` 在 PyInstaller 打包前临时清空 `.env`，避免泄露开发环境密钥，打包后自动恢复
+- **进程管理**：应用关闭时通过 `taskkill /pid {pid} /f /t` 强制终止后端进程，确保端口释放
+
+详细打包流程参见 [`web/electron/`](web/electron/) 与 [`sage.spec`](sage.spec)。
+
+---
+
+## 版本管理
+
+Sage 采用**单一来源（single source of truth）**版本号管理：项目根目录的 [`VERSION`](VERSION) 文件是唯一权威，所有其他位置自动从它同步。
+
+### 同步拓扑
+
+```
+              ┌─────────────────────┐
+              │  /VERSION  (0.6.1)  │   ← 唯一权威
+              └──────────┬──────────┘
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Python 后端  │  │  前端构建    │  │  Electron    │
+│ sage.__ver__ │  │  Vite        │  │  主进程      │
+│  (回退读取)  │  │  __APP_VER__ │  │  SAGE_VER    │
+└──────────────┘  └──────────────┘  └──────────────┘
+        │                │                │
+        ▼                ▼                ▼
+    pyproject.toml   web/package.json  web/electron/main.cjs
+   (dynamic version)  (prebuild 同步)   (兜底版本)
+```
+
+### 提升版本号
+
+```bash
+# 查看当前版本
+python scripts/bump_version.py show
+
+# Patch / Minor / Major 升级
+python scripts/bump_version.py patch    # 0.6.1 -> 0.6.2
+python scripts/bump_version.py minor    # 0.6.1 -> 0.7.0
+python scripts/bump_version.py major    # 0.6.1 -> 1.0.0
+
+# 预发布版本
+python scripts/bump_version.py pre --tag rc
+
+# 直接设置
+python scripts/bump_version.py set 1.2.3
+```
+
+`bump_version.py` 会自动更新 `VERSION` 文件、追加 `CHANGELOG.md` 条目，并调用 `sync_version.py` 级联同步到 `web/package.json`、`web/electron/main.cjs` 等位置。
+
+### 前端构建时自动同步
+
+`web/package.json` 已配置 prebuild/prepack/predev 钩子，`npm run build` / `npm run dev` / `npm pack` 会自动调用同步脚本，无需手动干预。
+
+### CI 一致性检查
+
+```yaml
+- name: Check version consistency
+  run: python scripts/sync_version.py --check
+```
 
 ---
 
@@ -532,7 +511,7 @@ workspaces/
 
 启动 `sage serve` 后，所有 API 默认监听 `http://127.0.0.1:8000`。完整 OpenAPI 文档访问 `/docs`。
 
-### Sage 工作空间 API（11 个）
+### Sage 工作空间 API（12 个）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -546,8 +525,10 @@ workspaces/
 | GET | `/api/sage/workspaces/{ws_id}/index-status` | 查询索引状态 |
 | POST | `/api/sage/workspaces/{ws_id}/switch` | 切换到该工作空间 |
 | GET | `/api/sage/workspaces/{ws_id}/papers` | 列出工作空间中的论文 |
+| GET | `/api/sage/workspaces/{ws_id}/papers/download` | 下载指定论文 |
+| DELETE | `/api/sage/workspaces/{ws_id}/papers?path=xxx` | 删除指定论文（带路径遍历防护） |
 
-### Sage 论文工具 API（7 个）
+### Sage 论文工具 API（6 个）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -570,99 +551,27 @@ workspaces/
 | POST | `/index` | 索引当前工作空间 |
 | GET | `/api/agent/info` | Agent 信息 |
 | GET | `/api/agents` | 列出所有智能体角色 |
+| GET | `/api/workspace` | 当前工作空间信息 |
+| GET | `/api/workspace/tree` | 工作空间文件树 |
+| POST | `/api/workspace` | 创建/写入工作空间文件 |
 | GET | `/api/tools` | 列出所有工具 |
 | GET | `/api/skills` | 列出已安装技能 |
 | GET | `/api/skills/remote-search` | 远程搜索技能 |
 | POST | `/api/skills/install` | 安装远程技能 |
 | GET | `/api/skills/manifest` | 技能清单 |
 | GET | `/api/models` | 可用模型列表 |
-| GET/POST | `/api/user-settings` | 用户设置 |
+| GET/POST | `/api/user-settings` | 用户设置（含 `tavilyApiKey` 可选字段） |
+| POST | `/api/model/preload` | 预加载模型 |
+| GET | `/api/model/download-progress` | 模型下载进度 |
+| GET | `/api/token-stats` | Token 使用统计 |
 | GET | `/api/version/check` | 检查版本更新 |
-| POST | `/api/version/download` | 下载新版本 |
+| POST | `/api/version/download` | 下载新版本（SSE 流式进度） |
 | POST | `/api/version/install` | 安装新版本 |
 | GET | `/memory/stats` | 记忆系统统计 |
 | GET | `/memory/memories` | 列出长期记忆 |
 | POST | `/memory/search` | 语义检索记忆 |
 | GET | `/memory/summaries` | 列出对话摘要 |
 | GET | `/health` | 健康检查 |
-
----
-
-## 项目结构
-
-```
-Sage/
-├── src/sage/                       ← 主源码
-│   ├── __init__.py                 ← 版本与系统说明
-│   ├── api.py                      ← FastAPI 应用（所有 HTTP 接口）
-│   ├── cli.py                      ← Typer CLI 入口
-│   ├── config.py                   ← Pydantic Settings 配置
-│   ├── workspace_manager.py        ← Sage 多工作空间管理
-│   ├── skill_system.py             ← 技能系统本地加载
-│   ├── skill_hub_client.py         ← SkillHub 远程客户端（内置）
-│   │
-│   ├── llm/                        ← LLM 客户端
-│   │   └── client.py               ← OpenAI 兼容客户端（含 function calling）
-│   │
-│   ├── agent/                      ← Agentic Loop 框架
-│   │   ├── loop.py                 ← Agent 主循环
-│   │   └── system_prompt.py        ← 系统提示词模板
-│   │
-│   ├── agents/                     ← 多智能体协同层
-│   │   ├── loader.py               ← 智能体定义加载器
-│   │   ├── orchestrator.py         ← 多 Agent 编排器
-│   │   ├── reflection.py           ← 反思与自我修正引擎
-│   │   ├── supervisor/             ← 主编（含 agent.json）
-│   │   ├── literature/             ← 文献调研员
-│   │   ├── planner/                ← 方法论专家
-│   │   ├── coder/                  ← 撰写员
-│   │   ├── citation/               ← 引用管理员
-│   │   ├── consolidator/           ← 整理汇报员
-│   │   ├── reviewer/               ← 审校核查员
-│   │   ├── debugger/               ← 修订员
-│   │   └── assistant/              ← 通用助手（兼容 dev-agent）
-│   │
-│   ├── memory/                     ← 三层记忆系统
-│   │   ├── store.py                ← SQLite 持久化（MemoryStore 单例）
-│   │   ├── long_term.py            ← 长期记忆（经验教训）
-│   │   ├── semantic.py             ← 语义记忆（向量检索）
-│   │   └── memory_orch.py          ← 记忆编排器
-│   │
-│   ├── context/                    ← 上下文管理
-│   │   ├── index.py                ← ProjectIndex 向量索引
-│   │   ├── history.py              ← 对话历史与压缩
-│   │   ├── manager.py              ← 上下文管理器
-│   │   └── tokenizer.py            ← Token 计数
-│   │
-│   ├── tools/                      ← 工具集成层
-│   │   ├── engine.py               ← 工具引擎（OpenAI schema）
-│   │   ├── types.py                ← ToolResult 等数据类型
-│   │   ├── file_ops.py             ← 通用文件操作
-│   │   ├── paper_ops.py            ← Sage 论文工具
-│   │   ├── skill_ops.py            ← 技能管理工具
-│   │   └── web.py                  ← 网络搜索工具
-│   │
-│   └── core/                       ← 运维与治理
-│       ├── observability.py        ← 可观测性
-│       ├── resilience.py           ← 弹性重试 + 断路器
-│       └── mcp.py                  ← MCP 协议支持
-│
-├── .agent/skills/                  ← 5 个 Sage 专用技能包
-│   ├── paper-processing/
-│   ├── literature-index/
-│   ├── writing-assistant/
-│   ├── external-search/
-│   └── ai-pattern-reducer/
-│
-├── workspaces/                     ← Sage 工作空间根目录（运行时创建）
-├── data/                           ← 全局记忆数据库
-├── logs/                           ← 运行日志
-├── tests/                          ← 测试（开发时使用）
-├── web/                            ← Electron + Vue 前端（可选）
-├── pyproject.toml                  ← 项目元数据与依赖
-├── .env.example                    ← 配置模板
-└── README.md                       ← 本文档
-```
 
 ---
 
@@ -677,36 +586,17 @@ pip install -e ".[dev,paper]"
 ### 运行测试
 
 ```bash
-# 运行全部测试
-pytest tests/ -v
-
-# 运行单个测试文件
-pytest tests/test_workspace_manager.py -v
-
-# 运行指定测试
-pytest tests/test_api.py::TestSageWorkspacesAPI::test_upload_file -v
+pytest tests/ -v                              # 全部测试
+pytest tests/test_workspace_manager.py -v     # 单个测试文件
+pytest tests/test_api.py::TestSageWorkspacesAPI::test_upload_file -v  # 指定测试
 ```
 
-### 测试覆盖范围
-
-测试套件覆盖以下模块（共 218 个测试用例，全部通过）：
-
-| 测试文件 | 覆盖模块 |
-|----------|----------|
-| `test_config.py` | `sage.config` — 配置加载与单例 |
-| `test_memory.py` | `sage.memory.*` — 三层记忆系统 |
-| `test_context_index.py` | `sage.context.index` — 向量索引与 Embedder |
-| `test_tools.py` | `sage.tools.*` — 工具引擎、文件操作、论文工具、技能工具 |
-| `test_skill_system.py` | `sage.skill_system` — 技能加载与元数据 |
-| `test_agents.py` | `sage.agents.*` — 智能体加载、反思引擎、编排器 |
-| `test_workspace_manager.py` | `sage.workspace_manager` — 多工作空间管理 |
-| `test_api.py` | `sage.api` — 所有 HTTP API 端点 |
-| `test_agent_loop.py` | `sage.agent.loop` — Agentic Loop 主循环 |
+测试套件覆盖配置、记忆、上下文索引、工具、技能系统、智能体、工作空间管理、API、Agent Loop 等模块（共 200+ 测试用例）。
 
 ### 测试隔离设计
 
 - 每个测试通过 `tmp_path` + `monkeypatch.chdir` 实现文件系统隔离
-- 通过 `env_setup` 夹具显式设置所有环境变量，避免 `.env` 污染
+- `env_setup` 夹具显式设置所有环境变量，避免 `.env` 污染
 - `reset_singletons` autouse 夹具在每个测试前后重置 `config` 和 `store` 单例
 - 使用 `MockLLMClient` 避免真实 API 调用，加快测试速度
 
@@ -737,3 +627,5 @@ Sage 系统基于以下开源项目构建：
 - [OpenAI Python SDK](https://github.com/openai/openai-python) — LLM 客户端
 - [PyMuPDF](https://pymupdf.readthedocs.io/) — PDF 解析
 - [python-docx](https://python-docx.readthedocs.io/) — Word 解析
+- [Electron](https://www.electronjs.org/) — 桌面端框架
+- [Vue 3](https://vuejs.org/) — 前端框架
