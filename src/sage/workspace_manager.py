@@ -216,13 +216,31 @@ class SageWorkspaceManager:
         return meta
 
     def list_workspaces(self) -> list[dict]:
-        """列出所有工作空间（按创建时间倒序）"""
+        """列出所有工作空间（按创建时间倒序）
+
+        papers_count 动态计算（遍历 papers/ 目录实际文件数），
+        不依赖 registry 中的计数器，避免删除/导入失败导致不同步。
+        """
         reg = self._load_registry()
         workspaces = sorted(
             reg["workspaces"],
             key=lambda x: x.get("created_at", ""),
             reverse=True,
         )
+        # 动态修正每个工作空间的 papers_count
+        for ws in workspaces:
+            ws_id = ws.get("id")
+            if not ws_id:
+                continue
+            papers_dir = self.root / ws_id / "papers"
+            if papers_dir.exists():
+                count = sum(
+                    1 for f in papers_dir.rglob("*")
+                    if f.is_file() and f.suffix.lower() in _PAPER_EXTENSIONS
+                )
+            else:
+                count = 0
+            ws["papers_count"] = count
         return workspaces
 
     def get_workspace(self, ws_id: str) -> dict:

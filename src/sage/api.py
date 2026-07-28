@@ -790,6 +790,79 @@ async def list_models(
     return result
 
 
+@app.get("/api/system/models-status")
+async def system_models_status():
+    """检测本地模型状态（Embedding + OCR）
+
+    返回各模型的安装/下载状态：
+    - embedding: sentence-transformers/all-MiniLM-L6-v2 是否已下载到 HuggingFace 缓存
+    - ocr: rapidocr-onnxruntime 是否安装 + ONNX 模型是否可用
+    - reranker: cross-encoder 是否已下载（可选，不影响核心功能）
+    """
+    status = {
+        "embedding": {"name": "all-MiniLM-L6-v2", "status": "unknown", "detail": ""},
+        "ocr": {"name": "RapidOCR (ONNX)", "status": "unknown", "detail": ""},
+        "reranker": {"name": "cross-encoder/ms-marco-MiniLM-L-6-v2", "status": "unknown", "detail": ""},
+    }
+
+    # 1. Embedding 模型
+    try:
+        from sage.config import get_config
+        cfg = get_config()
+        model_name = cfg.llm_embedding_model
+        status["embedding"]["name"] = model_name
+        from sage.context.index import LocalEmbedder
+        if LocalEmbedder._is_model_cached(model_name):
+            status["embedding"]["status"] = "ready"
+            status["embedding"]["detail"] = "已下载，可正常使用"
+        else:
+            status["embedding"]["status"] = "not_downloaded"
+            status["embedding"]["detail"] = "未下载，首次索引时自动下载（约 80MB）"
+    except ImportError:
+        status["embedding"]["status"] = "missing"
+        status["embedding"]["detail"] = "sentence-transformers 未安装"
+    except Exception as e:
+        status["embedding"]["status"] = "error"
+        status["embedding"]["detail"] = f"检测失败: {e}"
+
+    # 2. OCR 模型 (RapidOCR)
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        # 尝试初始化（会加载 ONNX 模型）
+        RapidOCR()
+        status["ocr"]["status"] = "ready"
+        status["ocr"]["detail"] = "已安装，扫描版 PDF 可自动 OCR"
+    except ImportError:
+        status["ocr"]["status"] = "missing"
+        status["ocr"]["detail"] = "rapidocr-onnxruntime 未安装，扫描版 PDF 无法 OCR"
+    except Exception as e:
+        # 可能是 ONNX Runtime 缺失或模型文件损坏
+        err_msg = str(e)[:120]
+        status["ocr"]["status"] = "error"
+        status["ocr"]["detail"] = f"已安装但加载失败: {err_msg}"
+
+    # 3. Reranker 模型（cross-encoder，可选）
+    try:
+        from sage.config import get_config
+        model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        status["reranker"]["name"] = model_name
+        from huggingface_hub import try_to_load_from_cache
+        if try_to_load_from_cache(model_name, "config.json") is not None:
+            status["reranker"]["status"] = "ready"
+            status["reranker"]["detail"] = "已下载，检索结果自动重排"
+        else:
+            status["reranker"]["status"] = "not_downloaded"
+            status["reranker"]["detail"] = "未下载，首次检索时自动下载（约 80MB）"
+    except ImportError:
+        status["reranker"]["status"] = "missing"
+        status["reranker"]["detail"] = "huggingface_hub 未安装"
+    except Exception as e:
+        status["reranker"]["status"] = "error"
+        status["reranker"]["detail"] = f"检测失败: {e}"
+
+    return {"models": status}
+
+
 # ── 用户配置持久化接口 ──
 
 def _get_data_dir() -> Path:
@@ -2094,6 +2167,50 @@ async def sage_search_literature(req: SageSearchRequest):
         "success": result.success,
         "data": result.data if result.success else None,
         "error": result.error if not result.success else None,
+    }
+
+
+@app.post("/api/sage/search-pool")
+async def sage_search_pool(req: SageSearchRequest):
+    """跨工作空间检索（池模式）
+
+    遍历所有工作空间的索引库，合并检索结果，每条结果标注来源工作空间。
+    用于"全选池模式"下不分工作空间的全量检索。
+
+    返回结果按相关度降序排列，每条结果含 workspace_id 和 workspace_tag 元数据。
+    """
+    from sage.workspace_manager import get_workspace_manager
+    from sage.tools.paper_ops import PaperOps
+
+    manager = get_workspace_manager()
+    all_workspaces = manager.list_workspaces()
+
+    all_results = []
+    for ws in all_workspaces:
+        ws_id = ws.get("id")
+        if not ws_id:
+            continue
+        ws_path = manager.get_workspace_path(ws_id)
+        db_path = ws_path / ".sage" / "index.db"
+        if not db_path.exists():
+            continue
+        try:
+            ops = PaperOps(ws_path)
+            result = await ops.search_literature(query=req.query, top_k=req.top_k)
+            if result.success and result.data:
+                for r in result.data:
+                    r["workspace_id"] = ws_id
+                    r["workspace_tag"] = ws.get("domain_tag", "")
+                    all_results.append(r)
+        except Exception:
+            continue
+
+    all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return {
+        "success": True,
+        "data": all_results[:req.top_k],
+        "total": len(all_results),
+        "pool_mode": True,
     }
 
 

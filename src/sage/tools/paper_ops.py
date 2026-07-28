@@ -25,14 +25,27 @@ class PaperOps:
     def __init__(self, workspace: Path):
         self.workspace = workspace
 
+    def _get_store(self):
+        """获取索引存储：优先使用工作空间独立的 WorkspaceStore
+
+        如果工作空间有 .sage/index.db，使用 WorkspaceStore（工作空间隔离）；
+        否则回退到全局 MemoryStore（向后兼容旧索引数据）。
+        这样切换工作空间后，检索的确实是对应工作空间的索引数据。
+        """
+        ws_db = self.workspace / ".sage" / "index.db"
+        if ws_db.exists():
+            from sage.workspace_manager import WorkspaceStore
+            return WorkspaceStore(db_path=str(ws_db))
+        from sage.memory.store import MemoryStore
+        return MemoryStore()
+
     # ── 文献与索引工具 ──
 
     async def index_papers(self, force: bool = False) -> ToolResult:
         """对工作空间中的论文文档建立向量索引"""
         try:
             from sage.context.index import ProjectIndex
-            from sage.memory.store import MemoryStore
-            store = MemoryStore()
+            store = self._get_store()
             indexer = ProjectIndex(self.workspace, store)
             stats = indexer.index_project(force=force)
             return ToolResult(
@@ -54,8 +67,7 @@ class PaperOps:
         """
         try:
             from sage.context.index import ProjectIndex
-            from sage.memory.store import MemoryStore
-            store = MemoryStore()
+            store = self._get_store()
             indexer = ProjectIndex(self.workspace, store)
             results = indexer.search(query, top_k=top_k, threshold=0.3, rerank=True)
             if not results:

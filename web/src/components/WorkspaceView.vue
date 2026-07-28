@@ -3,7 +3,9 @@ import { ref, computed, onMounted } from 'vue'
 
 const workspaces = ref([])
 const loading = ref(true)
-const selectedWs = ref(null)
+const selectedWs = ref(null)       // 当前查看详情的工作空间（点击卡片进入）
+const activeWsId = ref(null)       // 当前切换激活的工作空间（检索用）
+const poolMode = ref(false)        // 全选池模式（与单选互斥）
 const papers = ref([])
 const papersLoading = ref(false)
 const indexStatus = ref(null)
@@ -27,6 +29,9 @@ const uploading = ref(false)
 // 操作状态
 const actionMsg = ref('')
 const actionType = ref('')
+
+// 删除确认模态框
+const deleteConfirm = ref({ show: false, type: '', wsId: '', paper: null })
 
 function showAction(msg, type = 'success') {
   actionMsg.value = msg
@@ -72,18 +77,56 @@ async function createWorkspace() {
 }
 
 async function deleteWorkspace(wsId) {
-  if (!confirm('确定删除此工作空间？所有论文和索引将被清除，此操作不可恢复。')) return
-  try {
-    const res = await fetch(`/api/sage/workspaces/${wsId}`, { method: 'DELETE' })
-    if (res.ok) {
-      if (selectedWs.value === wsId) selectedWs.value = null
-      showAction('工作空间已删除')
-      await loadWorkspaces()
-    } else {
-      showAction('删除失败', 'error')
+  // 打开自定义确认模态框
+  const ws = workspaces.value.find(w => w.id === wsId)
+  deleteConfirm.value = {
+    show: true,
+    type: 'workspace',
+    wsId,
+    paper: null,
+    title: '删除工作空间',
+    message: `确定删除工作空间「${ws?.domain_tag || wsId}」？`,
+    detail: '所有论文和索引将被清除，此操作不可恢复。',
+  }
+}
+
+async function executeDelete() {
+  const { type, wsId, paper } = deleteConfirm.value
+  deleteConfirm.value.show = false
+  if (type === 'workspace') {
+    try {
+      const res = await fetch(`/api/sage/workspaces/${wsId}`, { method: 'DELETE' })
+      if (res.ok) {
+        if (selectedWs.value === wsId) selectedWs.value = null
+        if (activeWsId.value === wsId) activeWsId.value = null
+        showAction('工作空间已删除')
+        await loadWorkspaces()
+      } else {
+        showAction('删除失败', 'error')
+      }
+    } catch (e) {
+      showAction(`删除失败: ${e.message}`, 'error')
     }
-  } catch (e) {
-    showAction(`删除失败: ${e.message}`, 'error')
+  } else if (type === 'paper' && paper) {
+    try {
+      const res = await fetch(
+        `/api/sage/workspaces/${selectedWs.value}/papers?path=${encodeURIComponent(paper.path)}`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) {
+        let msg = `删除失败 (${res.status})`
+        try {
+          const err = await res.json()
+          msg = `删除失败: ${err.detail || msg}`
+        } catch { /* ignore */ }
+        showAction(msg, 'error')
+        return
+      }
+      showAction(`已删除「${paper.name}」`, 'success')
+      await viewPapers(selectedWs.value)
+    } catch (e) {
+      showAction(`删除失败: ${e.message}`, 'error')
+    }
   }
 }
 
@@ -91,12 +134,26 @@ async function switchWorkspace(wsId) {
   try {
     const res = await fetch(`/api/sage/workspaces/${wsId}/switch`, { method: 'POST' })
     if (res.ok) {
-      showAction('已切换到该工作空间')
+      activeWsId.value = wsId
+      poolMode.value = false  // 互斥：切换单选时清除池模式
+      const ws = workspaces.value.find(w => w.id === wsId)
+      showAction(`已切换到「${ws?.domain_tag || wsId}」工作空间`)
     } else {
       showAction('切换失败', 'error')
     }
   } catch (e) {
     showAction(`切换失败: ${e.message}`, 'error')
+  }
+}
+
+function togglePoolMode() {
+  poolMode.value = !poolMode.value
+  if (poolMode.value) {
+    // 进入池模式时清除单选切换
+    activeWsId.value = null
+    showAction('已启用全选池模式，检索将覆盖所有工作空间')
+  } else {
+    showAction('已退出全选池模式')
   }
 }
 
@@ -282,28 +339,15 @@ async function downloadPaper(paper) {
 
 async function deletePaper(paper) {
   if (!selectedWs.value || !paper?.path) return
-  // 二次确认，避免误删
-  if (!window.confirm(`确定删除「${paper.name}」？\n该操作会同时清除其索引数据，不可恢复。`)) return
-  try {
-    const res = await fetch(
-      `/api/sage/workspaces/${selectedWs.value}/papers?path=${encodeURIComponent(paper.path)}`,
-      { method: 'DELETE' },
-    )
-    if (!res.ok) {
-      let msg = `删除失败 (${res.status})`
-      try {
-        const err = await res.json()
-        msg = `删除失败: ${err.detail || msg}`
-      } catch { /* ignore */ }
-      showAction(msg, 'error')
-      return
-    }
-    showAction(`已删除「${paper.name}」`, 'success')
-    // 刷新论文列表 + 索引状态（papers_count 已变）
-    await loadPapers()
-    await loadIndexStatus()
-  } catch (e) {
-    showAction(`删除失败: ${e.message}`, 'error')
+  // 打开自定义确认模态框
+  deleteConfirm.value = {
+    show: true,
+    type: 'paper',
+    wsId: selectedWs.value,
+    paper,
+    title: '删除论文',
+    message: `确定删除「${paper.name}」？`,
+    detail: '该操作会同时清除其索引数据，不可恢复。',
   }
 }
 
@@ -579,6 +623,37 @@ onMounted(loadWorkspaces)
         </div>
       </Transition>
     </Teleport>
+
+    <!-- 删除确认弹窗（自定义模态框，替代原生 confirm） -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="deleteConfirm.show" class="modal-overlay" @click.self="deleteConfirm.show = false">
+          <div class="modal delete-modal" role="dialog" aria-modal="true">
+            <button class="modal-close" aria-label="关闭" @click="deleteConfirm.show = false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="delete-body">
+              <div class="delete-icon-wrap">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 9v4M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <h3 class="delete-title">{{ deleteConfirm.title }}</h3>
+              <p class="delete-message">{{ deleteConfirm.message }}</p>
+              <p v-if="deleteConfirm.detail" class="delete-detail">{{ deleteConfirm.detail }}</p>
+            </div>
+            <div class="modal-footer delete-footer">
+              <button class="btn-cancel" @click="deleteConfirm.show = false">取消</button>
+              <button class="btn-danger-confirm" @click="executeDelete">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -819,6 +894,63 @@ onMounted(loadWorkspaces)
 }
 .btn-confirm:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-confirm:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* 删除确认弹窗 */
+.delete-modal {
+  position: relative;
+  max-width: 420px;
+  padding: 0;
+  overflow: hidden;
+}
+.delete-modal .modal-close {
+  position: absolute; top: 12px; right: 12px;
+  z-index: 2;
+}
+.delete-body {
+  padding: 28px 24px 20px;
+  display: flex; flex-direction: column; align-items: center;
+  text-align: center; gap: 10px;
+}
+.delete-icon-wrap {
+  width: 52px; height: 52px; border-radius: 50%;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #dc2626;
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 4px;
+  animation: delete-icon-pulse 0.4s var(--ease-out-expo);
+}
+@keyframes delete-icon-pulse {
+  0% { transform: scale(0.7); opacity: 0; }
+  60% { transform: scale(1.08); opacity: 1; }
+  100% { transform: scale(1); }
+}
+.delete-title {
+  font-size: 16px; font-weight: 650; color: var(--text-primary);
+  margin: 0; letter-spacing: -0.01em;
+}
+.delete-message {
+  font-size: 13px; color: var(--text-secondary);
+  margin: 0; line-height: 1.6;
+}
+.delete-detail {
+  font-size: 11.5px; color: var(--text-faint);
+  margin: 4px 0 0; line-height: 1.5;
+}
+.delete-footer {
+  justify-content: center; gap: 12px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--border-light);
+}
+.btn-danger-confirm {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; color: white;
+  background: #dc2626; border: none; border-radius: var(--radius-sm);
+  padding: 7px 18px; cursor: pointer;
+  transition: all 0.18s var(--ease-out-expo);
+}
+.btn-danger-confirm:hover { background: #b91c1c; }
+.btn-danger-confirm:active { transform: scale(0.97); }
 
 .modal-enter-active, .modal-leave-active { transition: opacity 0.2s var(--ease-out-expo); }
 .modal-enter-from, .modal-leave-to { opacity: 0; }
