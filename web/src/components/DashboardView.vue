@@ -1,5 +1,9 @@
-﻿<script setup>
-import { ref, onMounted } from 'vue'
+<script setup>
+import { ref, onMounted, watch } from 'vue'
+
+const props = defineProps({
+  activeView: { type: String, default: '' },
+})
 
 const stats = ref({
   todayConversations: 0,
@@ -56,6 +60,11 @@ async function loadStats() {
 
 onMounted(loadStats)
 
+// 切换到仪表盘视图时自动刷新数据
+watch(() => props.activeView, (v) => {
+  if (v === 'dashboard') loadStats()
+})
+
 const quickActions = [
   { icon: 'LW', label: '文献综述', prompt: '请基于工作空间的论文文献库，撰写关于以下研究主题的文献综述：' },
   { icon: 'OT', label: '生成大纲', prompt: '请为以下研究课题生成符合学术规范的论文大纲：' },
@@ -109,7 +118,7 @@ const quickActions = [
         </div>
         <div class="stat-info">
           <div class="stat-value">{{ stats.activeAgents }}</div>
-          <div class="stat-label">活跃 Agent</div>
+          <div class="stat-label">活跃上下文</div>
         </div>
       </div>
     </div>

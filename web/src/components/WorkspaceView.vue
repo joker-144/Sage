@@ -1,18 +1,22 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useIndexNotify } from '../composables/useIndexNotify'
+import { usePoolMode } from '../composables/usePoolMode'
+
+const { startIndex, activeWsId: indexingWsId, status: indexTaskStatus } = useIndexNotify()
+const { poolMode, togglePoolMode, syncPoolMode } = usePoolMode()
 
 const workspaces = ref([])
 const loading = ref(true)
 const selectedWs = ref(null)       // 当前查看详情的工作空间（点击卡片进入）
 const activeWsId = ref(null)       // 当前切换激活的工作空间（检索用）
-const poolMode = ref(false)        // 全选池模式（与单选互斥）
 const papers = ref([])
 const papersLoading = ref(false)
 const indexStatus = ref(null)
 
 // 创建工作空间
 const showCreate = ref(false)
-const newWs = ref({ domain_tag: '', description: '', index_level: 'SCI' })
+const newWs = ref({ domain_tag: '', description: '', index_level: 'standard' })
 
 // 文件夹选择器
 const showPicker = ref(false)
@@ -64,12 +68,20 @@ async function createWorkspace() {
     })
     if (res.ok) {
       showCreate.value = false
-      newWs.value = { domain_tag: '', description: '', index_level: 'SCI' }
+      newWs.value = { domain_tag: '', description: '', index_level: 'standard' }
       showAction('工作空间创建成功')
       await loadWorkspaces()
     } else {
-      const err = await res.json()
-      showAction(`创建失败: ${err.detail || '未知错误'}`, 'error')
+      // 防御性解析错误响应（响应体可能为空）
+      let detail = '未知错误'
+      try {
+        const text = await res.text()
+        if (text) {
+          const err = JSON.parse(text)
+          detail = err.detail || detail
+        }
+      } catch { /* ignore */ }
+      showAction(`创建失败: ${detail}`, 'error')
     }
   } catch (e) {
     showAction(`创建失败: ${e.message}`, 'error')
@@ -135,7 +147,10 @@ async function switchWorkspace(wsId) {
     const res = await fetch(`/api/sage/workspaces/${wsId}/switch`, { method: 'POST' })
     if (res.ok) {
       activeWsId.value = wsId
-      poolMode.value = false  // 互斥：切换单选时清除池模式
+      // 互斥：切换单选时退出池模式
+      if (poolMode.value) {
+        await togglePoolMode(false)
+      }
       const ws = workspaces.value.find(w => w.id === wsId)
       showAction(`已切换到「${ws?.domain_tag || wsId}」工作空间`)
     } else {
@@ -146,9 +161,9 @@ async function switchWorkspace(wsId) {
   }
 }
 
-function togglePoolMode() {
-  poolMode.value = !poolMode.value
-  if (poolMode.value) {
+async function handleTogglePoolMode() {
+  const next = await togglePoolMode()
+  if (next) {
     // 进入池模式时清除单选切换
     activeWsId.value = null
     showAction('已启用全选池模式，检索将覆盖所有工作空间')
@@ -231,14 +246,32 @@ async function confirmImport() {
     })
     if (res.ok) {
       const data = await res.json()
-      showAction(`导入完成: ${data.imported || 0} 个文件，已自动索引`)
+      showAction(`导入完成: ${data.imported || 0} 个文件，正在后台建立索引`)
       showPicker.value = false
       selectedFolder.value = null
       await viewPapers(selectedWs.value)
       await loadWorkspaces()
+      // 触发异步索引（强制重建，因为文件夹导入通常需要全量索引）
+      const wsInfo = workspaces.value.find(w => w.id === selectedWs.value)
+      startIndex({
+        wsId: selectedWs.value,
+        wsName: wsInfo?.domain_tag || selectedWs.value,
+        force: true,
+        onDone: async () => {
+          await viewPapers(selectedWs.value)
+          await loadWorkspaces()
+        },
+      })
     } else {
-      const err = await res.json()
-      showAction(`导入失败: ${err.detail || '未知错误'}`, 'error')
+      let detail = '未知错误'
+      try {
+        const text = await res.text()
+        if (text) {
+          const err = JSON.parse(text)
+          detail = err.detail || detail
+        }
+      } catch { /* ignore */ }
+      showAction(`导入失败: ${detail}`, 'error')
     }
   } catch (e) {
     showAction(`导入失败: ${e.message}`, 'error')
@@ -269,16 +302,40 @@ async function handleUpload(event) {
         body: formData,
       })
       if (!res.ok) {
-        const err = await res.json()
-        showAction(`上传 ${file.name} 失败: ${err.detail || '未知错误'}`, 'error')
+        // 防御性解析：响应体可能为空（连接断开/超时/500 等），不能直接 .json()
+        let msg = `上传失败 (${res.status})`
+        try {
+          const text = await res.text()
+          if (text) {
+            try {
+              const err = JSON.parse(text)
+              msg = `上传失败: ${err.detail || msg}`
+            } catch {
+              msg = `上传失败: ${text.slice(0, 120)}`
+            }
+          }
+        } catch { /* ignore — 保留默认 msg */ }
+        showAction(`上传 ${file.name} ${msg}`, 'error')
         uploading.value = false
         event.target.value = ''
         return
       }
     }
-    showAction(`已上传 ${files.length} 个文件，已自动索引`)
+    showAction(`已上传 ${files.length} 个文件，正在后台建立索引`)
     await viewPapers(selectedWs.value)
     await loadWorkspaces()
+    // 触发异步索引（右上角通知卡片显示进度）
+    const wsInfo = workspaces.value.find(w => w.id === selectedWs.value)
+    startIndex({
+      wsId: selectedWs.value,
+      wsName: wsInfo?.domain_tag || selectedWs.value,
+      force: false,
+      onDone: async () => {
+        // 索引完成后刷新状态
+        await viewPapers(selectedWs.value)
+        await loadWorkspaces()
+      },
+    })
   } catch (e) {
     showAction(`上传失败: ${e.message}`, 'error')
   } finally {
@@ -352,8 +409,25 @@ async function deletePaper(paper) {
 }
 
 function getLevelColor(level) {
-  const colors = { SCI: '#8b5cf6', SSCI: '#0ea5e9', CSSCI: '#f59e0b', EI: '#10b981' }
-  return colors[level] || 'var(--text-faint)'
+  // 标准索引=蓝色 / 高精度索引=紫色 / 旧值兼容归一化
+  const normalized = (level || '').toLowerCase()
+  const colors = {
+    standard: '#0ea5e9',  // 天蓝
+    premium: '#8b5cf6',   // 紫色
+  }
+  // 旧版本 SCI/SSCI/CSSCI/EI 归一化为 standard 颜色
+  if (['sci', 'ssci', 'cssci', 'ei'].includes(normalized)) return colors.standard
+  return colors[normalized] || 'var(--text-faint)'
+}
+
+// 索引级别中文标签（徽章显示用）
+function getLevelLabel(level) {
+  const normalized = (level || '').toLowerCase()
+  if (normalized === 'premium') return '高精度'
+  if (normalized === 'standard') return '标准'
+  // 旧版本值兼容显示
+  if (['sci', 'ssci', 'cssci', 'ei'].includes(normalized)) return '标准'
+  return level || '标准'
 }
 
 const selectedWsInfo = computed(() => {
@@ -361,7 +435,10 @@ const selectedWsInfo = computed(() => {
   return workspaces.value.find(w => w.id === selectedWs.value)
 })
 
-onMounted(loadWorkspaces)
+onMounted(() => {
+  loadWorkspaces()
+  syncPoolMode()
+})
 </script>
 
 <template>
@@ -382,6 +459,16 @@ onMounted(loadWorkspaces)
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M19 12H5M12 19l-7-7 7-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
             返回列表
           </button>
+          <button
+            v-if="!selectedWs && workspaces.length > 0"
+            class="action-btn"
+            :class="poolMode ? 'btn-pool-active' : 'btn-secondary'"
+            :title="poolMode ? '当前为全选池模式，点击退出' : '启用后检索覆盖所有工作空间'"
+            @click="handleTogglePoolMode"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M3 7l9-4 9 4-9 4-9-4z M3 12l9 4 9-4 M3 17l9 4 9-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            {{ poolMode ? '已启用池模式' : '全选池模式' }}
+          </button>
           <button v-if="!selectedWs" class="action-btn btn-primary" @click="showCreate = true">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
             创建工作空间
@@ -396,6 +483,12 @@ onMounted(loadWorkspaces)
 
     <!-- 工作空间列表 -->
     <template v-if="!selectedWs">
+      <!-- 池模式激活提示 -->
+      <div v-if="poolMode" class="pool-banner">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M3 7l9-4 9 4-9 4-9-4z M3 12l9 4 9-4 M3 17l9 4 9-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>全选池模式已启用 — 对话检索将覆盖全部 {{ workspaces.length }} 个工作空间</span>
+      </div>
+
       <div v-if="loading" class="loading-state">加载中...</div>
 
       <div v-else-if="workspaces.length === 0" class="empty-state">
@@ -413,16 +506,18 @@ onMounted(loadWorkspaces)
           v-for="ws in workspaces"
           :key="ws.id"
           class="ws-card"
+          :class="{ 'ws-card-active': ws.id === activeWsId }"
           tabindex="0"
           @click="viewPapers(ws.id)"
           @keydown.enter="viewPapers(ws.id)"
         >
+          <span v-if="ws.id === activeWsId" class="ws-active-badge">当前</span>
           <div class="ws-card-header">
             <div class="ws-domain-tag" :style="{ borderColor: getLevelColor(ws.index_level) }">
               {{ ws.domain_tag }}
             </div>
             <div class="ws-level-badge" :style="{ color: getLevelColor(ws.index_level) }">
-              {{ ws.index_level }}
+              {{ getLevelLabel(ws.index_level) }}
             </div>
           </div>
 
@@ -470,8 +565,17 @@ onMounted(loadWorkspaces)
 
         <!-- 索引状态 -->
         <div v-if="indexStatus" class="index-status">
-          <span class="status-dot" :class="{ indexed: indexStatus.indexed }"></span>
-          <span v-if="indexStatus.indexed">{{ `已索引 (${indexStatus.chunks || 0} 个文档块)` }}</span>
+          <span
+            class="status-dot"
+            :class="{
+              indexed: indexStatus.indexed && !(indexTaskStatus === 'running' && indexingWsId === selectedWs),
+              running: indexTaskStatus === 'running' && indexingWsId === selectedWs,
+            }"
+          ></span>
+          <span v-if="indexTaskStatus === 'running' && indexingWsId === selectedWs">
+            索引中 ({{ indexStatus.progress || 0 }}/{{ indexStatus.total || 0 }})
+          </span>
+          <span v-else-if="indexStatus.indexed">{{ `已索引 (${indexStatus.stats?.chunks || 0} 个文档块)` }}</span>
           <span v-else-if="indexStatus.stats?.error" class="status-error" :title="indexStatus.stats.error">
             {{ `索引失败: ${indexStatus.stats.error.slice(0, 60)}${indexStatus.stats.error.length > 60 ? '...' : ''}` }}
           </span>
@@ -554,13 +658,19 @@ onMounted(loadWorkspaces)
                 <label>索引级别</label>
                 <div class="level-selector">
                   <button
-                    v-for="level in ['SCI', 'SSCI', 'CSSCI', 'EI']"
-                    :key="level"
+                    v-for="lvl in [
+                      { value: 'standard', label: '标准索引', desc: '速度快 · 召回 5 · 不重排' },
+                      { value: 'premium', label: '高精度索引', desc: '精度高 · 召回 10 · 重排' },
+                    ]"
+                    :key="lvl.value"
                     class="level-btn"
-                    :class="{ active: newWs.index_level === level }"
-                    :style="newWs.index_level === level ? { borderColor: getLevelColor(level), color: getLevelColor(level) } : {}"
-                    @click="newWs.index_level = level"
-                  >{{ level }}</button>
+                    :class="{ active: newWs.index_level === lvl.value }"
+                    :style="newWs.index_level === lvl.value ? { borderColor: getLevelColor(lvl.value), color: getLevelColor(lvl.value) } : {}"
+                    @click="newWs.index_level = lvl.value"
+                  >
+                    <span class="level-btn-label">{{ lvl.label }}</span>
+                    <span class="level-btn-desc">{{ lvl.desc }}</span>
+                  </button>
                 </div>
               </div>
             </div>
@@ -679,6 +789,20 @@ onMounted(loadWorkspaces)
 .btn-secondary { color: var(--text-secondary); background: var(--bg-surface); border: 1px solid var(--border); }
 .btn-secondary:hover { border-color: var(--accent-border); color: var(--text-primary); }
 .btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-pool-active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+}
+.btn-pool-active:hover { background: var(--accent); color: white; border-color: var(--accent); }
+
+.pool-banner {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--accent-soft); border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm); padding: 9px 14px;
+  font-size: 12px; color: var(--accent); margin-bottom: 16px;
+}
+.pool-banner svg { flex-shrink: 0; }
 
 .alert {
   background: var(--accent-soft); border: 1px solid var(--accent-border);
@@ -698,14 +822,35 @@ onMounted(loadWorkspaces)
 .ws-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
 
 .ws-card {
+  position: relative;
   background: var(--bg-surface); border: 1px solid var(--border);
   border-radius: var(--radius-lg); padding: 16px;
-  transition: transform 0.18s var(--ease-out-expo), box-shadow 0.18s var(--ease-out-expo), border-color 0.18s var(--ease-out-expo);
+  transition: transform 0.18s var(--ease-out-expo), box-shadow 0.18s var(--ease-out-expo), border-color 0.18s var(--ease-out-expo), background 0.18s var(--ease-out-expo);
   display: flex; flex-direction: column; gap: 12px; cursor: pointer;
 }
 .ws-card:hover, .ws-card:focus {
   transform: translateY(-2px); border-color: var(--accent-border);
   box-shadow: var(--shadow-md); outline: none;
+}
+/* 当前激活的工作空间卡片 — 边框高亮 + 轻微背景填充 */
+.ws-card-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: var(--shadow-glow);
+}
+.ws-card-active:hover, .ws-card-active:focus {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: var(--shadow-glow), var(--shadow-md);
+}
+/* 右上角"当前"角标 */
+.ws-active-badge {
+  position: absolute; top: -1px; right: -1px;
+  background: var(--accent); color: #fff;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 0 var(--radius-lg) 0 var(--radius-sm);
+  z-index: 1; pointer-events: none;
 }
 
 .ws-card-header { display: flex; align-items: center; justify-content: space-between; }
@@ -740,6 +885,14 @@ onMounted(loadWorkspaces)
 .index-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
 .status-dot.indexed { background: var(--success); }
+.status-dot.running {
+  background: var(--accent);
+  animation: dot-pulse 1.2s ease-in-out infinite;
+}
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(1.4); }
+}
 .status-error { color: #dc2626; cursor: help; }
 
 /* 论文列表 */
@@ -835,15 +988,17 @@ onMounted(loadWorkspaces)
 .form-textarea { resize: vertical; min-height: 36px; }
 .form-hint { font-size: 10px; color: var(--text-faint); }
 
-.level-selector { display: flex; gap: 6px; }
+.level-selector { display: flex; gap: 8px; }
 .level-btn {
-  flex: 1; font-size: 12px; font-weight: 600;
-  padding: 7px 0; border-radius: var(--radius-sm);
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 9px 6px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--bg-input);
   color: var(--text-muted); cursor: pointer;
   transition: all 0.18s var(--ease-out-expo);
 }
 .level-btn:hover { border-color: var(--border-strong); }
+.level-btn-label { font-size: 12px; font-weight: 600; }
+.level-btn-desc { font-size: 9.5px; font-weight: 400; color: var(--text-faint); }
 
 /* 文件夹选择器 */
 .picker-modal { max-width: 580px; max-height: 80vh; }

@@ -88,6 +88,91 @@ _MAX_AGENTS = 50  # 缓存上限，防止内存无限增长
 _agents: dict[str, "AgentLoop"] = {}
 
 
+async def _pool_search_literature(query: str, top_k: int | None = None):
+    """跨工作空间文献检索（池模式包装函数）
+
+    遍历所有工作空间的索引库，合并检索结果并按相关度排序。
+    每条结果标注来源工作空间，返回格式与 PaperOps.search_literature 一致。
+    """
+    from sage.workspace_manager import get_workspace_manager
+    from sage.tools.paper_ops import PaperOps
+    from sage.tools.types import ToolResult
+
+    manager = get_workspace_manager()
+    all_workspaces = manager.list_workspaces()
+    all_results = []
+    for ws in all_workspaces:
+        ws_id = ws.get("id")
+        if not ws_id:
+            continue
+        ws_path = manager.get_workspace_path(ws_id)
+        db_path = ws_path / ".sage" / "index.db"
+        if not db_path.exists():
+            continue
+        try:
+            ops = PaperOps(ws_path)
+            result = await ops.search_literature(query=query, top_k=top_k)
+            if result.success and result.data:
+                ws_tag = ws.get("domain_tag", ws_id)
+                for r in result.data:
+                    r["workspace_id"] = ws_id
+                    r["workspace_tag"] = ws_tag
+                    all_results.append(r)
+        except Exception:
+            continue
+
+    if not all_results:
+        return ToolResult(
+            success=True,
+            output="未找到相关文献。池模式已遍历所有工作空间，可能尚未建立索引或相关度不足。",
+            data=[],
+        )
+
+    all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    limit = top_k or 10
+    all_results = all_results[:limit]
+
+    formatted = []
+    for i, r in enumerate(all_results, 1):
+        source_parts = []
+        if r.get("title"):
+            source_parts.append(f"标题: {r['title']}")
+        if r.get("authors"):
+            source_parts.append(f"作者: {r['authors']}")
+        if r.get("year"):
+            source_parts.append(f"年份: {r['year']}")
+        if r.get("doi"):
+            source_parts.append(f"DOI: {r['doi']}")
+        source_parts.append(f"工作空间: {r.get('workspace_tag', '')}")
+        source_line = " | ".join(source_parts)
+        formatted.append(
+            f"### 结果 {i}（相关度: {r.get('score', 0):.3f}）\n"
+            f"**来源**: {source_line}\n"
+            f"**文件**: {r.get('file', '')}\n"
+        )
+
+    return ToolResult(
+        success=True,
+        output="\n".join(formatted),
+        data=all_results,
+    )
+
+
+def _apply_pool_mode(agent, pool_mode: bool):
+    """根据池模式状态切换 agent 的 search_literature 工具注册
+
+    pool_mode=True 时替换为跨工作空间检索；False 时恢复为单工作空间检索。
+    """
+    from sage.tools.engine import SEARCH_LITERATURE_SCHEMA
+    from sage.tools.paper_ops import PaperOps
+
+    if pool_mode:
+        agent.tools.register("search_literature", _pool_search_literature, SEARCH_LITERATURE_SCHEMA)
+    else:
+        paper_ops = PaperOps(agent.workspace)
+        agent.tools.register("search_literature", paper_ops.search_literature, SEARCH_LITERATURE_SCHEMA)
+
+
 def _get_or_create_agent(conversation_id: str | None = None):
     """获取或创建 Agent（按 conversation_id 复用，保持多轮对话上下文）
 
@@ -99,7 +184,7 @@ def _get_or_create_agent(conversation_id: str | None = None):
     if conversation_id and conversation_id in _agents:
         return _agents[conversation_id], conversation_id
 
-    agent = create_agent(workspace=Path.cwd(), conversation_id=conversation_id)
+    agent = create_agent(workspace=_current_workspace(), conversation_id=conversation_id)
 
     # 如果是已有对话（非新对话），从 DB 恢复历史消息到上下文
     if conversation_id:
@@ -162,6 +247,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = Field(None, description="对话 ID（首次对话不传，后续传入以保持上下文）")
     settings: dict | None = Field(None, description="前端设置覆盖（已弃用，配置从 .env 读取）")
     mode: str = Field("single", description="运行模式: single=单Agent, writing=写作模式(智能选择流程)")
+    pool_mode: bool = Field(False, description="全选池模式：True 时检索覆盖所有工作空间")
 
 
 class HealthResponse(BaseModel):
@@ -254,6 +340,9 @@ async def chat_stream(req: ChatRequest):
         )
 
     agent, conv_id = _get_or_create_agent(req.conversation_id)
+    # 根据请求的池模式标记切换 search_literature 工具注册
+    # （每次请求都同步，确保缓存 agent 的工具注册与当前池模式状态一致）
+    _apply_pool_mode(agent, req.pool_mode)
 
     async def event_stream():
         event_queue: asyncio.Queue = asyncio.Queue()
@@ -324,7 +413,7 @@ async def _collaborate_stream(req: ChatRequest):
     """写作模式 SSE 流（智能选择流程：简单任务单Agent，复杂任务多智能体）"""
     from sage.agents.orchestrator import create_orchestrator
 
-    orchestrator = create_orchestrator()
+    orchestrator = create_orchestrator(workspace=_current_workspace())
     conv_id = req.conversation_id or str(uuid.uuid4())
 
     try:
@@ -861,6 +950,293 @@ async def system_models_status():
         status["reranker"]["detail"] = f"检测失败: {e}"
 
     return {"models": status}
+
+
+class DownloadModelRequest(BaseModel):
+    model_type: str = Field("reranker", description="要下载的模型类型: embedding/ocr/reranker")
+    retry_mode: str = Field("resume", description="重试模式: resume=断点续传(默认), restart=清理缓存后重新下载")
+
+
+def _clear_hf_model_cache(model_name: str) -> tuple[bool, str]:
+    """清理指定模型的 HuggingFace 缓存目录。
+
+    用于"重新下载"场景：当缓存可能损坏时，先清掉再从头下载。
+    Returns:
+        (success, message)
+    """
+    import shutil
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        cache_dir = Path(HF_HUB_CACHE) if HF_HUB_CACHE else Path.home() / ".cache" / "huggingface" / "hub"
+    except Exception:
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+
+    repo_cache = cache_dir / f"models--{model_name.replace('/', '--')}"
+    if not repo_cache.exists():
+        return True, "缓存目录不存在，无需清理"
+    try:
+        shutil.rmtree(repo_cache)
+        return True, f"已清理缓存: {repo_cache.name}"
+    except Exception as e:
+        return False, f"清理缓存失败: {e}"
+
+
+# HF 模型配置：model_type → (model_name, display_name)
+_HF_MODELS = {
+    "reranker": ("cross-encoder/ms-marco-MiniLM-L-6-v2", "Reranker 重排模型"),
+    "embedding": ("sentence-transformers/all-MiniLM-L6-v2", "Embedding 向量模型"),
+}
+
+
+def _stream_download_hf_model(model_type: str, retry_mode: str = "resume"):
+    """流式下载 HuggingFace 模型（embedding/reranker），生成 SSE 进度事件。
+
+    使用 huggingface_hub + 国内镜像（hf-mirror.com），独立于模型加载逻辑，
+    不修改原有加载流程。下载完成后模型进入 HF 缓存，后续加载直接命中缓存。
+
+    Args:
+        model_type: "embedding" 或 "reranker"
+        retry_mode: "resume"=断点续传(默认); "restart"=先清缓存再重新下载
+    """
+    import os as _os
+    # 优先使用已设置的 HF_ENDPOINT，否则走国内镜像（与 CrossEncoderReranker 保持一致）
+    if not _os.environ.get("HF_ENDPOINT"):
+        _os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    _os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+    _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+
+    model_name, display_name = _HF_MODELS.get(model_type, (None, None))
+    if not model_name:
+        yield f"data: {json.dumps({'status': 'error', 'percent': 0, 'message': f'不支持的模型类型: {model_type}'}, ensure_ascii=False)}\n\n"
+        return
+
+    def emit(status: str, percent: int = 0, message: str = ""):
+        return f"data: {json.dumps({'status': status, 'percent': percent, 'message': message}, ensure_ascii=False)}\n\n"
+
+    # 重新下载模式：先清理缓存
+    if retry_mode == "restart":
+        yield emit("info", 0, "正在清理旧缓存...")
+        ok, msg = _clear_hf_model_cache(model_name)
+        if not ok:
+            yield emit("error", 0, f"无法清理缓存: {msg}")
+            return
+        yield emit("info", 0, f"缓存已清理，开始重新下载")
+
+    yield emit("info", 0, "正在获取文件列表...")
+
+    try:
+        from huggingface_hub import list_repo_files, hf_hub_download, hf_hub_url
+        import httpx
+        import tempfile
+        import shutil
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        all_files = list_repo_files(model_name)
+    except Exception as e:
+        yield emit("error", 0, f"获取文件列表失败: {e}")
+        return
+
+    # 排除不必要的大文件（与 LocalEmbedder._download_model_streaming 策略一致）
+    skip_extensions = {".bin", ".h5", ".msgpack", ".pt", ".pth", ".ckpt", ".onnx"}
+    download_files = [f for f in all_files if Path(f).suffix.lower() not in skip_extensions]
+    if not download_files:
+        yield emit("error", 0, "未找到可下载的模型文件")
+        return
+
+    # 估算总大小
+    total_bytes = 0
+    file_sizes: dict[str, int] = {}
+    base_url = _os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").rstrip("/")
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            for fname in download_files:
+                try:
+                    url = f"{base_url}/{model_name}/resolve/main/{fname}"
+                    head_resp = client.head(url)
+                    if head_resp.status_code == 200:
+                        size = int(head_resp.headers.get("content-length", 0))
+                        file_sizes[fname] = size
+                        total_bytes += size
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if total_bytes == 0:
+        total_bytes = 90 * 1024 * 1024  # 约 90MB
+    total_mb = total_bytes / (1024 * 1024)
+    yield emit("info", 0, f"开始下载（共 {total_mb:.0f}MB）...")
+
+    # 缓存目录
+    try:
+        cache_dir = Path(HF_HUB_CACHE) if HF_HUB_CACHE else Path.home() / ".cache" / "huggingface" / "hub"
+    except Exception:
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    repo_cache = cache_dir / f"models--{model_name.replace('/', '--')}" / "snapshots"
+    repo_cache.mkdir(parents=True, exist_ok=True)
+
+    downloaded_bytes = 0
+    for fname in download_files:
+        fsize = file_sizes.get(fname, 0)
+        is_large = fsize > 1 * 1024 * 1024
+        try:
+            if is_large:
+                url = f"{base_url}/{model_name}/resolve/main/{fname}"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(fname).suffix) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    with httpx.Client(timeout=120, follow_redirects=True) as client:
+                        with client.stream("GET", url) as resp:
+                            resp.raise_for_status()
+                            with open(tmp_path, "wb") as f:
+                                for chunk in resp.iter_bytes(1024 * 1024):
+                                    f.write(chunk)
+                                    downloaded_bytes += len(chunk)
+                                    if total_bytes > 0:
+                                        pct = min(int(downloaded_bytes * 100 / total_bytes), 95)
+                                        dl_mb = downloaded_bytes / (1024 * 1024)
+                                        yield emit("progress", pct, f"下载中 {dl_mb:.1f}/{total_mb:.1f}MB ({pct}%)")
+                    dest = repo_cache / fname
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(tmp_path, str(dest))
+                except Exception:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    # 回退到 hf_hub_download
+                    yield emit("info", min(int(downloaded_bytes * 100 / total_bytes), 95), f"切换下载方式: {Path(fname).name}")
+                    hf_hub_download(model_name, fname, resume_download=True)
+                    if fsize > 0:
+                        downloaded_bytes += fsize
+            else:
+                hf_hub_download(model_name, fname, resume_download=True)
+                if fsize > 0:
+                    downloaded_bytes += fsize
+        except Exception as e:
+            # 单个文件失败不中断，继续下一个
+            yield emit("info", min(int(downloaded_bytes * 100 / max(total_bytes, 1)), 95), f"文件 {fname} 跳过: {e}")
+
+    yield emit("progress", 100, "下载完成，验证中...")
+    # 最终校验：config.json 是否可从缓存读取
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        if try_to_load_from_cache(model_name, "config.json") is not None:
+            yield emit("done", 100, f"{display_name}下载完成")
+        else:
+            yield emit("done", 100, "下载已完成，但缓存校验未通过，可能需要重启应用")
+    except Exception:
+        yield emit("done", 100, f"{display_name}下载完成")
+
+
+def _stream_install_pip_package(package_name: str, display_name: str, retry_mode: str = "resume"):
+    """通过 pip 安装 Python 包（如 rapidocr-onnxruntime），生成 SSE 进度事件。
+
+    使用当前 Python 解释器的 pip，以 --progress-stream 方式输出进度。
+    安装完成后包立即可用，无需重启应用。
+
+    Args:
+        package_name: pip 包名（如 "rapidocr-onnxruntime"）
+        display_name: 显示名称（如 "OCR 文字识别"）
+        retry_mode: "resume"=直接安装(默认); "restart"=先卸载再安装
+    """
+    import subprocess
+    import sys as _sys
+
+    def emit(status: str, percent: int = 0, message: str = ""):
+        return f"data: {json.dumps({'status': status, 'percent': percent, 'message': message}, ensure_ascii=False)}\n\n"
+
+    # 重新安装模式：先卸载
+    if retry_mode == "restart":
+        yield emit("info", 0, f"正在卸载旧版本 {package_name}...")
+        try:
+            subprocess.run(
+                [_sys.executable, "-m", "pip", "uninstall", "-y", package_name],
+                capture_output=True, timeout=60,
+            )
+            yield emit("info", 0, "卸载完成，开始重新安装")
+        except Exception as e:
+            yield emit("info", 0, f"卸载跳过: {e}")
+
+    yield emit("info", 0, f"正在安装 {display_name} ({package_name})...")
+
+    try:
+        proc = subprocess.Popen(
+            [_sys.executable, "-m", "pip", "install", package_name, "--progress-bar=on"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        # pip 没有精确的进度百分比，用行读取模拟进度
+        lines_processed = 0
+        for line in proc.stdout:
+            lines_processed += 1
+            line = line.strip()
+            if line:
+                # 模拟进度：前 90% 逐步增长，留 10% 给完成
+                pct = min(90, lines_processed * 3)
+                yield emit("progress", pct, line[:120])
+
+        proc.wait()
+        if proc.returncode == 0:
+            yield emit("progress", 95, "安装完成，验证中...")
+            # 验证安装：pip 包名 → import 名映射
+            _IMPORT_NAMES = {
+                "rapidocr-onnxruntime": "rapidocr_onnxruntime",
+            }
+            import_name = _IMPORT_NAMES.get(package_name, package_name.replace('-', '_'))
+            try:
+                result = subprocess.run(
+                    [_sys.executable, "-c", f"import {import_name}; print('OK')"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    yield emit("done", 100, f"{display_name}安装完成")
+                else:
+                    yield emit("done", 100, f"{display_name}安装完成，但验证未通过，可能需要重启应用")
+            except Exception:
+                yield emit("done", 100, f"{display_name}安装完成")
+        else:
+            yield emit("error", 0, f"安装失败 (exit code {proc.returncode})，请检查网络或手动执行 pip install {package_name}")
+    except Exception as e:
+        yield emit("error", 0, f"安装异常: {e}")
+
+
+@app.post("/api/system/download-model")
+async def download_model(req: DownloadModelRequest):
+    """触发本地模型下载（SSE 流式返回进度）
+
+    支持 embedding/ocr/reranker 三种本地模型：
+    - embedding: HuggingFace 模型（sentence-transformers/all-MiniLM-L6-v2）
+    - reranker: HuggingFace 模型（cross-encoder/ms-marco-MiniLM-L-6-v2）
+    - ocr: pip 包（rapidocr-onnxruntime）
+
+    retry_mode:
+      - "resume" (默认): 断点续传/直接安装
+      - "restart": 先清理缓存/卸载再重新下载安装
+    """
+    if req.model_type in ("embedding", "reranker"):
+        return StreamingResponse(
+            _stream_download_hf_model(model_type=req.model_type, retry_mode=req.retry_mode),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    elif req.model_type == "ocr":
+        return StreamingResponse(
+            _stream_install_pip_package("rapidocr-onnxruntime", "OCR 文字识别", retry_mode=req.retry_mode),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── 用户配置持久化接口 ──
@@ -1841,7 +2217,7 @@ class SageWorkspaceCreateRequest(BaseModel):
     """创建 Sage 工作空间请求"""
     domain_tag: str = Field(..., description="领域标签（如 CS-AI, MED-Cardio, SSCI-PSY）")
     description: str = Field(default="", description="工作空间描述")
-    index_level: str = Field(default="SCI", description="索引级别 SCI/SSCI/CSSCI/EI")
+    index_level: str = Field(default="standard", description="索引级别 standard(标准索引)/premium(高精度索引)")
 
 
 class SageFolderImportRequest(BaseModel):
@@ -1988,6 +2364,86 @@ async def sage_get_index_status(ws_id: str):
         return {"success": True, **status}
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/sage/workspaces/{ws_id}/async-index")
+async def sage_async_index(ws_id: str, force: bool = False):
+    """异步触发工作空间向量化索引
+
+    立即返回任务状态，索引在后台执行。
+    前端可通过 GET /api/sage/workspaces/{ws_id}/index-task-status 轮询状态，
+    或通过 GET /api/sage/workspaces/{ws_id}/index-events 订阅 SSE 进度事件。
+
+    Args:
+        force: 是否强制重建索引（查询参数）
+    """
+    from sage.workspace_manager import get_index_task_manager
+
+    try:
+        mgr = get_index_task_manager()
+        result = await mgr.start_index(ws_id, force=force)
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/sage/workspaces/{ws_id}/index-task-status")
+async def sage_get_index_task_status(ws_id: str):
+    """获取异步索引任务的实时状态（用于前端轮询）"""
+    from sage.workspace_manager import get_index_task_manager
+
+    mgr = get_index_task_manager()
+    status = mgr.get_status(ws_id)
+    return {"success": True, **status}
+
+
+@app.get("/api/sage/workspaces/{ws_id}/index-events")
+async def sage_index_events(ws_id: str):
+    """SSE 订阅异步索引进度事件
+
+    事件类型:
+      - event: start    索引开始
+      - event: progress 单个文件索引完成
+      - event: done     全部索引完成
+      - event: error    索引失败
+    """
+    from sage.workspace_manager import get_index_task_manager
+
+    mgr = get_index_task_manager()
+    queue = await mgr.subscribe(ws_id)
+
+    async def event_stream():
+        try:
+            # 先推送当前状态（便于客户端连接后立即获取进度）
+            current = mgr.get_status(ws_id)
+            if current["status"] in ("running", "pending"):
+                yield f"event: progress\ndata: {json.dumps({'progress': current['progress'], 'total': current['total'], 'current_file': current['current_file'], 'message': current['message']}, ensure_ascii=False)}\n\n"
+            elif current["status"] == "done":
+                yield f"event: done\ndata: {json.dumps({'stats': current['stats'], 'message': current['message']}, ensure_ascii=False)}\n\n"
+            elif current["status"] == "error":
+                yield f"event: error\ndata: {json.dumps({'error': current['error'], 'message': current['message']}, ensure_ascii=False)}\n\n"
+
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    event_type = event.get("type", "progress")
+                    yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if event_type in ("done", "error"):
+                        break
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            await mgr.unsubscribe(ws_id, queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/sage/workspaces/{ws_id}/switch")
@@ -2224,6 +2680,28 @@ async def sage_extract_references(req: SageExtractRefsRequest):
         "data": result.data if result.success else None,
         "error": result.error if not result.success else None,
     }
+
+
+class PoolModeRequest(BaseModel):
+    pool_mode: bool = Field(..., description="是否启用全选池模式")
+
+
+@app.get("/api/sage/pool-mode")
+async def sage_get_pool_mode():
+    """获取当前全选池模式状态"""
+    from sage.workspace_manager import get_pool_mode
+    return {"pool_mode": get_pool_mode()}
+
+
+@app.post("/api/sage/pool-mode")
+async def sage_set_pool_mode(req: PoolModeRequest):
+    """设置全选池模式状态
+
+    启用后，智能体对话中的 search_literature 工具将跨所有工作空间检索。
+    """
+    from sage.workspace_manager import set_pool_mode
+    new_value = set_pool_mode(req.pool_mode)
+    return {"pool_mode": new_value, "success": True}
 
 
 @app.post("/api/sage/format-references")

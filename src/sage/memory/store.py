@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_name TEXT,
     tool_args TEXT,
     tokens INTEGER DEFAULT 0,
+    reasoning TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
 );
@@ -155,6 +156,8 @@ class MemoryStore:
         self._initialized = True
         # 迁移：检测旧向量维度，不匹配时自动清空（智谱 1024维 → 本地 384维）
         self._migrate_embedding_dim()
+        # 迁移：为旧数据库的 messages 表补充 reasoning 列（持久化模型思考内容）
+        self._migrate_messages_reasoning()
 
     def _migrate_embedding_dim(self):
         """检测并清理维度不匹配的旧向量数据
@@ -216,6 +219,21 @@ class MemoryStore:
         except Exception:
             pass
 
+    def _migrate_messages_reasoning(self):
+        """为旧数据库的 messages 表补充 reasoning 列
+
+        v0.6.1 新增：持久化模型思考内容（reasoning_content）。
+        旧数据库 messages 表无 reasoning 列，此处通过 ALTER TABLE 自动补列，
+        保证已有用户数据平滑升级，不丢失历史对话。
+        """
+        try:
+            cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+            if "reasoning" not in cols:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN reasoning TEXT")
+                self._conn.commit()
+        except Exception:
+            pass
+
     @property
     def conn(self) -> sqlite3.Connection:
         return self._conn
@@ -251,14 +269,20 @@ class MemoryStore:
         tool_name: str = "",
         tool_args: str = "",
         tokens: int = 0,
+        reasoning: str = "",
     ) -> int:
-        """添加消息，返回消息 id"""
+        """添加消息，返回消息 id
+
+        Args:
+            reasoning: 模型思考内容（reasoning_content，推理模型才有），
+                       仅 role='assistant' 时有意义，用于完整持久化 agent 回复。
+        """
         cur = self._conn.execute(
             """INSERT INTO messages
-               (conversation_id, role, content, tool_call_id, tool_name, tool_args, tokens)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (conversation_id, role, content, tool_call_id, tool_name, tool_args, tokens, reasoning)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (conversation_id, role, content, tool_call_id or None,
-             tool_name or None, tool_args or None, tokens),
+             tool_name or None, tool_args or None, tokens, reasoning or None),
         )
         # 同步更新对话的 updated_at，让侧栏按最近活跃度排序
         self._conn.execute(

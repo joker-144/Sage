@@ -43,6 +43,33 @@ if _env_file.exists():
             print("[sage.spec] 已恢复 .env 原始内容")
     atexit.register(_restore_env)
 
+# ── 打包前清除开发数据（记忆统计/仪表盘/工作空间元数据）─────
+# 避免开发环境的对话历史、token 统计、会话摘要、工作空间元数据被打入产物。
+# 打包后自动恢复，开发数据不丢失；用户首次启动时在自己的数据目录重建空库。
+_dev_memory_db = _project_root / "data" / "memory.db"
+_memory_db_backup = None
+if _dev_memory_db.exists():
+    _memory_db_backup = _dev_memory_db.read_bytes()
+    _dev_memory_db.unlink()
+    print("[sage.spec] 已临时移除开发数据 memory.db（打包后自动恢复）")
+
+_workspaces_registry = _project_root / "workspaces" / "registry.json"
+_registry_backup = None
+if _workspaces_registry.exists():
+    _registry_backup = _workspaces_registry.read_text(encoding="utf-8")
+    _workspaces_registry.write_text('{\n  "workspaces": [],\n  "version": "1.0"\n}', encoding="utf-8")
+    print("[sage.spec] 已临时清空 workspaces/registry.json（打包后自动恢复）")
+
+def _restore_dev_data():
+    if _memory_db_backup is not None and not _dev_memory_db.exists():
+        _dev_memory_db.parent.mkdir(parents=True, exist_ok=True)
+        _dev_memory_db.write_bytes(_memory_db_backup)
+        print("[sage.spec] 已恢复开发数据 memory.db")
+    if _registry_backup is not None:
+        _workspaces_registry.write_text(_registry_backup, encoding="utf-8")
+        print("[sage.spec] 已恢复 workspaces/registry.json")
+atexit.register(_restore_dev_data)
+
 # ── 收集隐式数据 / 元数据 ────────────────────────────────
 # sentence-transformers / huggingface-hub 依赖大量动态元数据
 datas = []

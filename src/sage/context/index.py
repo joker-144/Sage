@@ -404,12 +404,62 @@ class CrossEncoderReranker:
             return chunks[:top_k]
 
 
+# ── 索引级别配置 ──
+# 两种索引级别：标准索引 / 高精度索引
+# 区别在于分块粒度、召回 Top-K、是否启用 cross-encoder 重排
+# 向量维度相同（都用 all-MiniLM-L6-v2，384 维），不涉及模型切换
+INDEX_LEVEL_STANDARD = "standard"  # 标准索引
+INDEX_LEVEL_PREMIUM = "premium"    # 高精度索引
+
+# 各级别参数表
+_INDEX_LEVEL_PARAMS = {
+    INDEX_LEVEL_STANDARD: {
+        "max_chunk_lines": 80,   # 分块行数上限（~800 字符）
+        "default_top_k": 5,      # 召回 Top-K
+        "default_rerank": False, # 不启用 cross-encoder 重排（速度快）
+    },
+    INDEX_LEVEL_PREMIUM: {
+        "max_chunk_lines": 40,   # 分块行数上限（~400 字符，更细粒度）
+        "default_top_k": 10,     # 召回 Top-K 更大
+        "default_rerank": True,  # 启用 cross-encoder 重排（精度高）
+    },
+}
+
+# 旧版本索引级别（SCI/SSCI/CSSCI/EI）归一化映射，确保已有工作空间兼容
+_LEGACY_LEVEL_MAP = {
+    "SCI": INDEX_LEVEL_STANDARD,
+    "SSCI": INDEX_LEVEL_STANDARD,
+    "CSSCI": INDEX_LEVEL_STANDARD,
+    "EI": INDEX_LEVEL_STANDARD,
+}
+
+
+def _normalize_index_level(level: str | None) -> str:
+    """归一化索引级别，兼容旧版本值。
+
+    旧版本使用 SCI/SSCI/CSSCI/EI（功能相同），统一归一化为 standard。
+    新版本使用 standard / premium。
+    未知值默认归一化为 standard（保守降级）。
+    """
+    if not level:
+        return INDEX_LEVEL_STANDARD
+    level = str(level).strip().lower()
+    if level == INDEX_LEVEL_PREMIUM:
+        return INDEX_LEVEL_PREMIUM
+    # 旧值或 standard 都归一化为 standard
+    return INDEX_LEVEL_STANDARD
+
+
 # ── 项目索引 ──
 
 class ProjectIndex:
     """论文文档索引 — 文件分块 + Embedding + 向量检索
 
     Sage 系统中用于索引工作空间内的论文文档，支持文本格式和二进制格式。
+
+    索引级别（从工作空间 .sage/meta.json 读取）:
+      - standard: 标准索引（分块 80 行 / 召回 5 / 不重排）
+      - premium:  高精度索引（分块 40 行 / 召回 10 / cross-encoder 重排）
     """
 
     # 支持索引的文本文件扩展名（含代码文件，向后兼容）
@@ -440,8 +490,6 @@ class ProjectIndex:
 
     # 单文件最大块数（防止超大文件拖慢索引）
     MAX_CHUNKS_PER_FILE = 50
-    # 单块最大行数
-    MAX_CHUNK_LINES = 80
 
     def __init__(self, workspace: Path, store: Optional[MemoryStore] = None):
         self.workspace = workspace.resolve()
@@ -449,6 +497,29 @@ class ProjectIndex:
         self._embedder = None  # 延迟初始化（首次使用时创建）
         self._reranker = None  # Cross-Encoder 重排器（延迟初始化）
         self._embeddings_cache: list[dict] | None = None  # 向量缓存（索引后失效）
+        # 从工作空间元数据读取索引级别（standard / premium）
+        self.index_level = self._read_index_level()
+
+    def _read_index_level(self) -> str:
+        """从工作空间 .sage/meta.json 读取索引级别
+
+        读取失败或文件不存在时默认返回 standard。
+        旧版本值（SCI/SSCI/CSSCI/EI）自动归一化为 standard。
+        """
+        try:
+            import json as _json
+            meta_path = self.workspace / ".sage" / "meta.json"
+            if meta_path.exists():
+                meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+                return _normalize_index_level(meta.get("index_level"))
+        except Exception:
+            pass
+        return INDEX_LEVEL_STANDARD
+
+    @property
+    def max_chunk_lines(self) -> int:
+        """当前索引级别的分块行数上限（动态，根据 index_level）"""
+        return _INDEX_LEVEL_PARAMS[self.index_level]["max_chunk_lines"]
 
     @property
     def embedder(self) -> LocalEmbedder:
@@ -817,7 +888,7 @@ class ProjectIndex:
         for i, line in enumerate(lines):
             # 达到行数上限或遇到新的语义边界（非首行）
             is_boundary = i > 0 and boundary_re.match(line)
-            is_full = (i - current_start) >= self.MAX_CHUNK_LINES
+            is_full = (i - current_start) >= self.max_chunk_lines
 
             if (is_boundary or is_full) and i > current_start:
                 chunk_content = "\n".join(lines[current_start:i])
@@ -850,7 +921,7 @@ class ProjectIndex:
         策略:
           1. 识别 Markdown/LaTeX 标题行（#, \\section, \\subsection）作为段落边界
           2. 空行作为段落分隔符
-          3. 兼顾 MAX_CHUNK_LINES 上限
+          3. 兼顾 max_chunk_lines 上限（按索引级别动态调整）
         """
         # 标题边界正则（Markdown # / LaTeX \section / 数字编号）
         heading_re = re.compile(
@@ -867,7 +938,7 @@ class ProjectIndex:
         for i, line in enumerate(lines):
             is_heading = i > 0 and heading_re.match(line)
             is_blank = i > 0 and not line.strip() and current_lines > 10
-            is_full = current_lines >= self.MAX_CHUNK_LINES
+            is_full = current_lines >= self.max_chunk_lines
 
             if (is_heading or is_full) and i > current_start:
                 chunk_content = "\n".join(lines[current_start:i])
@@ -904,9 +975,9 @@ class ProjectIndex:
     def search(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: Optional[int] = None,
         threshold: float = 0.3,
-        rerank: bool = True,
+        rerank: Optional[bool] = None,
     ) -> list[CodeChunk]:
         """语义搜索代码库
 
@@ -915,13 +986,21 @@ class ProjectIndex:
 
         Args:
             query: 自然语言查询
-            top_k: 最终返回结果数量
+            top_k: 最终返回结果数量。None 时按索引级别自动选择
+                   （standard=5, premium=10）；显式传值时尊重调用方
             threshold: bi-encoder 相似度阈值，低于此值的结果不进入重排（默认 0.3）
-            rerank: 是否启用 cross-encoder 重排（默认启用）
+            rerank: 是否启用 cross-encoder 重排。None 时按索引级别自动选择
+                    （standard=False, premium=True）；显式传值时尊重调用方
 
         Returns:
             最相关的代码块列表（按相似度降序，含论文元数据）
         """
+        # 根据索引级别填充默认值（显式传值时尊重调用方）
+        if top_k is None:
+            top_k = _INDEX_LEVEL_PARAMS[self.index_level]["default_top_k"]
+        if rerank is None:
+            rerank = _INDEX_LEVEL_PARAMS[self.index_level]["default_rerank"]
+
         # 1. 将 query 转为 embedding
         query_vec = self.embedder.encode([query])[0]
 

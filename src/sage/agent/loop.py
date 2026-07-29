@@ -98,6 +98,15 @@ class AgentLoop:
         self.tools = tools or ToolEngine(self.workspace)
         self.system_prompt = system_prompt or get_system_prompt()
 
+        # 注入当前工作空间路径，让 Agent 明确知道文件操作的实际位置
+        self.system_prompt += (
+            f"\n\n## 当前工作空间\n"
+            f"路径: {self.workspace}\n"
+            f"所有文件操作（read_file/write_file/list_dir 等）均基于此路径。\n"
+            f"**输出约束**：回复用户时，禁止输出工作空间的底层目录结构（如 .sage/、drafts/、papers/ 等目录列表）。"
+            f"用户只需知道论文分析结果，不需要知道文件系统结构。"
+        )
+
         # 注入已安装技能信息
         try:
             from sage.skill_system import SkillLoader
@@ -114,15 +123,10 @@ class AgentLoop:
         except Exception:
             self._memory_orch = None
 
-        # 记忆上下文（含跨会话长期记忆 + 语义记忆）注入到 system prompt
-        # 注意：此时还没有用户输入，只注入长期记忆（默认最重要的历史）
-        if self._memory_orch:
-            try:
-                mem_text = self._memory_orch.get_memory_context()
-                if mem_text:
-                    self.system_prompt += mem_text
-            except Exception:
-                pass
+        # 对话隔离：新对话不预加载跨会话长期记忆摘要到 system prompt，
+        # 避免旧对话内容污染新对话（LLM 引用/复述历史摘要）。
+        # 语义记忆仍会在 run() 中基于当前问题精准召回相关历史片段。
+        # 恢复历史对话时通过 _restore_agent_context 还原该对话自身的工作记忆。
 
         self.context = context or ContextManager(
             workspace=self.workspace,
@@ -178,10 +182,12 @@ class AgentLoop:
         self.context.add_user_message(user_input)
         self._persist_message("user", user_input)
 
-        # v0.6.0 语义记忆注入：基于当前用户问题召回相关历史记忆
-        if self._memory_orch:
+        # v0.6.0 语义记忆注入：基于当前用户问题召回相关历史片段
+        # 注意：只注入语义记忆（精准召回），不注入跨会话长期记忆摘要，
+        # 避免旧对话全量摘要污染新对话（对话隔离）。
+        if self._memory_orch and self._memory_orch.semantic:
             try:
-                sem_text = self._memory_orch.get_memory_context(current_query=user_input)
+                sem_text = self._memory_orch.semantic.format_for_prompt(user_input, top_k=3)
                 if sem_text:
                     # 将语义记忆追加到 system prompt 中，重新构建上下文
                     self.context.system_prompt = self.system_prompt + sem_text
@@ -260,7 +266,13 @@ class AgentLoop:
                     for call in response.tool_calls
                 ]
                 self.context.add_assistant_message(response.content, tool_calls_openai)
-                self._persist_message("assistant", response.content, tool_calls_openai)
+                # 完整持久化：含 reasoning 思考内容 + 该轮 token 用量
+                _round_total = round_usage.get("prompt_tokens", 0) + round_usage.get("completion_tokens", 0)
+                self._persist_message(
+                    "assistant", response.content, tool_calls_openai,
+                    reasoning=response.reasoning_content or "",
+                    tokens=_round_total,
+                )
 
                 # 该轮 token 用量（同一轮多个工具调用共享）
                 round_tokens = {
@@ -332,7 +344,13 @@ class AgentLoop:
             else:
                 # 6. LLM 返回最终文本回复，循环结束
                 self.context.add_assistant_message(response.content)
-                self._persist_message("assistant", response.content)
+                # 完整持久化：含 reasoning 思考内容 + 该轮 token 用量
+                _final_total = round_usage.get("prompt_tokens", 0) + round_usage.get("completion_tokens", 0)
+                self._persist_message(
+                    "assistant", response.content,
+                    reasoning=response.reasoning_content or "",
+                    tokens=_final_total,
+                )
                 yield LoopEvent(type="text", content=response.content)
                 yield LoopEvent(type="done")
 
@@ -558,8 +576,15 @@ class AgentLoop:
         tool_calls: list[dict] = None,
         tool_call_id: str = "",
         tool_name: str = "",
+        reasoning: str = "",
+        tokens: int = 0,
     ):
-        """持久化消息到 SQLite（失败不影响主流程）"""
+        """持久化消息到 SQLite（失败不影响主流程）
+
+        Args:
+            reasoning: 模型思考内容（reasoning_content），完整持久化 agent 回复
+            tokens: 该消息对应的 token 用量（prompt+completion 总和）
+        """
         try:
             store = get_store()
             tool_args = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else ""
@@ -570,6 +595,8 @@ class AgentLoop:
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 tool_args=tool_args,
+                tokens=tokens,
+                reasoning=reasoning,
             )
             # 用首条用户消息自动设置对话标题
             if role == "user":

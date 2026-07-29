@@ -1,4 +1,4 @@
-﻿"""
+"""
 工具引擎 — 注册、schema 生成、执行调度（Sage 论文写作系统）
 
 每个工具定义为标准 OpenAI function calling schema，
@@ -12,7 +12,7 @@ Sage 系统工具分为:
   - 文献索引（Sage）: index_papers/search_literature/extract_references/insert_citation/format_references/check_plagiarism
   - 文档处理（Sage）: parse_pdf/parse_docx/parse_latex/extract_metadata/ocr_document
   - 写作辅助（Sage）: generate_outline/write_paragraph/polish_academic/check_logic/reduce_ai_pattern
-  - 外部检索（Sage）: search_scholar/search_arxiv/search_crossref/search_semantic_scholar
+  - 外部检索（Sage）: search_scholar/search_arxiv/search_crossref/search_semantic_scholar/search_cnki
   - 技能与网络（通用）: list_skills/load_skill/install_skill/search_remote_skills/web_search/web_search_pro/web_fetch
 """
 from __future__ import annotations
@@ -82,6 +82,7 @@ class ToolEngine:
         self.register("search_arxiv", paper_ops.search_arxiv, SEARCH_ARXIV_SCHEMA)
         self.register("search_crossref", paper_ops.search_crossref, SEARCH_CROSSREF_SCHEMA)
         self.register("search_semantic_scholar", paper_ops.search_semantic_scholar, SEARCH_SEMANTIC_SCHOLAR_SCHEMA)
+        self.register("search_cnki", paper_ops.search_cnki, SEARCH_CNKI_SCHEMA)
 
         # 技能管理（通用）
         skill_ops = SkillOps(self.workspace)
@@ -138,7 +139,7 @@ READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "读取指定文件的内容。支持通过行号范围读取部分内容。",
+        "description": "读取指定文本文件的内容（支持 .txt, .md, .tex, .bib, .json, .csv 等）。不支持二进制文件（如 .pdf, .docx, .png 等），读取 PDF 请使用 parse_pdf 工具。支持通过行号范围读取部分内容。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -315,7 +316,7 @@ PARSE_PDF_SCHEMA = {
     "type": "function",
     "function": {
         "name": "parse_pdf",
-        "description": "解析 PDF 文件提取文本内容。需要安装 PyMuPDF (pip install pymupdf)。",
+        "description": "解析 PDF 文件提取文本内容（扫描版 PDF 自动 OCR）。读取 PDF 文件时必须使用此工具，不要使用 read_file。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -528,6 +529,26 @@ SEARCH_SEMANTIC_SCHOLAR_SCHEMA = {
                 "max_results": {"type": "integer", "description": "最大返回结果数", "default": 5},
             },
             "required": ["query"],
+        },
+    },
+}
+
+SEARCH_CNKI_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "search_cnki",
+        "description": (
+            "搜索中文学术数据库认证论文元数据（期刊名、作者、年份、卷期、页码、DOI、摘要、关键词）。"
+            "搜索顺序: 维普 → 万方 → CrossRef。"
+            "适用于验证论文出处，特别是纠正 PDF 提取中常见的期刊名/栏目名混淆问题。"
+            "当用户询问论文发表期刊、出处等信息时调用此工具。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "论文标题（完整标题或关键部分）"},
+            },
+            "required": ["title"],
         },
     },
 }

@@ -4,12 +4,16 @@ __pycache__/
 *.pyo
 .env
 data/
-workspace/
+workspaces/
+!workspaces/.gitkeep
 *.egg-info/
 dist/
 build/
 !web/build/
 .trae
+
+# 调试临时文件
+body.json
 
 # Node.js
 node_modules/

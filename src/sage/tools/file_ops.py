@@ -1,4 +1,4 @@
-﻿"""
+"""
 文件操作工具 — read_file, write_file, edit_file (diff), list_dir
 
 所有路径自动限制在 workspace 内，防止目录穿越。

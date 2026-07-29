@@ -63,14 +63,40 @@ function typeNext() {
 // 监听 content 变化——增量打字
 import { watch } from 'vue'
 watch(() => props.message.content, (newVal, oldVal) => {
-  if (!newVal) { typedContent.value = ''; typeIndex.value = 0; typeBuffer.value = ''; return }
-  const oldLen = oldVal ? oldVal.length : 0
-  if (newVal.length > oldLen) {
-    const delta = newVal.slice(oldLen)
+  if (!newVal) { typedContent.value = ''; typeIndex.value = 0; typeBuffer.value = ''; isTyping.value = false; return }
+  if (!oldVal) {
+    // 初始化（历史恢复或新对话第一条）
+    if (newVal.length > 50) {
+      // 历史恢复：跳过打字机，直接显示完整内容
+      typeBuffer.value = ''
+      typeIndex.value = newVal.length
+      typedContent.value = newVal
+      isTyping.value = false
+    } else {
+      // 新对话流式：正常打字机
+      typeBuffer.value = newVal
+      typeIndex.value = 0
+      typedContent.value = ''
+      if (!isTyping.value) startTyping()
+    }
+    return
+  }
+  // 检测是否是切换对话（newVal 不以 oldVal 开头 → 完全替换而非增量追加）
+  if (!newVal.startsWith(oldVal)) {
+    // 切换对话：直接替换，不走走打字机
+    typeBuffer.value = ''
+    typeIndex.value = newVal.length
+    typedContent.value = newVal
+    isTyping.value = false
+    return
+  }
+  // 正常流式增量追加
+  if (newVal.length > oldVal.length) {
+    const delta = newVal.slice(oldVal.length)
     typeBuffer.value += delta
     if (!isTyping.value) startTyping()
   }
-})
+}, { immediate: true })
 
 const renderedContent = computed(() => {
   const text = typedContent.value

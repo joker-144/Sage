@@ -156,14 +156,16 @@ class SageWorkspaceManager:
         self,
         domain_tag: str,
         description: str = "",
-        index_level: str = "SCI",
+        index_level: str = "standard",
     ) -> dict:
         """创建新的 Sage 工作空间
 
         Args:
             domain_tag: 领域标签（如 CS-AI, MED-Cardio, SSCI-PSY）
             description: 工作空间描述（可选）
-            index_level: 索引级别 SCI/SSCI/CSSCI/EI
+            index_level: 索引级别 standard(标准索引)/premium(高精度索引)
+                - standard: 分块 80 行 / 召回 Top-K=5 / 不重排（速度快）
+                - premium:  分块 40 行 / 召回 Top-K=10 / cross-encoder 重排（精度高）
 
         Returns:
             工作空间信息字典
@@ -330,8 +332,8 @@ class SageWorkspaceManager:
         self._update_registry_entry(ws_id, papers_count=len(imported))
         self._update_meta(ws_id, papers_count=len(imported))
 
-        # 自动触发向量化索引
-        index_result = self.trigger_indexing(ws_id, force=True)
+        # 不再同步触发索引 — 由前端调用 /async-index 接口异步建立索引
+        index_result = None
 
         return {
             "workspace_id": ws_id,
@@ -377,10 +379,9 @@ class SageWorkspaceManager:
             self._update_registry_entry(ws_id, papers_count=new_count)
             self._update_meta(ws_id, papers_count=new_count)
 
-            # 自动触发向量化（单文件上传后增量索引）
-            index_result = self.trigger_indexing(ws_id, force=False)
-        else:
-            index_result = None
+            # 不再同步触发索引 — 由前端调用 /async-index 接口异步建立索引
+            # 避免大文件或首次加载 embedding 模型时阻塞上传请求导致 Failed to fetch
+        index_result = None
 
         return {
             "workspace_id": ws_id,
@@ -611,6 +612,23 @@ def get_workspace_manager() -> SageWorkspaceManager:
     return _manager
 
 
+# ── 全选池模式全局标志 ──
+# pool_mode 为 True 时，智能体检索覆盖所有工作空间（跨空间搜索）
+_pool_mode: bool = False
+
+
+def get_pool_mode() -> bool:
+    """获取当前池模式状态"""
+    return _pool_mode
+
+
+def set_pool_mode(value: bool) -> bool:
+    """设置池模式状态，返回设置后的值"""
+    global _pool_mode
+    _pool_mode = bool(value)
+    return _pool_mode
+
+
 # ── 工作空间独立索引存储 ──
 
 # WorkspaceStore 使用的 file_index 表结构（与 MemoryStore 保持一致）
@@ -757,3 +775,285 @@ class WorkspaceStore:
     def close(self) -> None:
         """关闭数据库连接"""
         self._conn.close()
+
+
+# ── 全局异步索引任务管理器 ──
+
+import asyncio
+import uuid as _uuid
+
+
+class IndexTaskManager:
+    """全局异步索引任务管理器
+
+    在后台线程中执行工作空间的向量化索引，支持：
+      - 异步非阻塞：上传完成后立即返回，索引在后台进行
+      - 多文件并发：分块 + embedding 阶段并行（写入仍串行，避免 SQLite 锁冲突）
+      - 进度推送：通过 asyncio.Queue 向 SSE 客户端实时推送进度
+      - 状态查询：前端可轮询 /api/sage/workspaces/{ws_id}/index-status
+
+    每个工作空间同一时刻只允许一个索引任务，重复触发会返回当前任务状态。
+    """
+
+    def __init__(self):
+        # ws_id -> task info
+        self._tasks: dict[str, dict] = {}
+        # ws_id -> asyncio.Queue（SSE 订阅者）
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        self._lock = asyncio.Lock()
+
+    def get_status(self, ws_id: str) -> dict:
+        """获取工作空间索引任务状态"""
+        task = self._tasks.get(ws_id)
+        if not task:
+            return {"workspace_id": ws_id, "status": "idle"}
+        return {
+            "workspace_id": ws_id,
+            "status": task["status"],  # pending / running / done / error
+            "progress": task.get("progress", 0),
+            "total": task.get("total", 0),
+            "current_file": task.get("current_file", ""),
+            "message": task.get("message", ""),
+            "stats": task.get("stats"),
+            "started_at": task.get("started_at"),
+            "finished_at": task.get("finished_at"),
+            "error": task.get("error"),
+        }
+
+    async def subscribe(self, ws_id: str) -> asyncio.Queue:
+        """订阅工作空间索引进度事件"""
+        queue: asyncio.Queue = asyncio.Queue()
+        async with self._lock:
+            if ws_id not in self._subscribers:
+                self._subscribers[ws_id] = []
+            self._subscribers[ws_id].append(queue)
+        return queue
+
+    async def unsubscribe(self, ws_id: str, queue: asyncio.Queue):
+        """取消订阅"""
+        async with self._lock:
+            if ws_id in self._subscribers:
+                self._subscribers[ws_id] = [
+                    q for q in self._subscribers[ws_id] if q is not queue
+                ]
+
+    async def _emit(self, ws_id: str, event: dict):
+        """向所有订阅者推送事件"""
+        async with self._lock:
+            subscribers = list(self._subscribers.get(ws_id, []))
+        for q in subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    async def start_index(
+        self,
+        ws_id: str,
+        force: bool = False,
+    ) -> dict:
+        """启动异步索引任务
+
+        如果该工作空间已有任务在运行，返回当前状态（不重复启动）。
+        """
+        async with self._lock:
+            existing = self._tasks.get(ws_id)
+            if existing and existing["status"] in ("pending", "running"):
+                return {
+                    "workspace_id": ws_id,
+                    "status": "already_running",
+                    "progress": existing.get("progress", 0),
+                    "total": existing.get("total", 0),
+                    "current_file": existing.get("current_file", ""),
+                }
+
+            task_id = str(_uuid.uuid4())
+            self._tasks[ws_id] = {
+                "task_id": task_id,
+                "status": "pending",
+                "progress": 0,
+                "total": 0,
+                "current_file": "",
+                "message": "准备索引...",
+                "stats": None,
+                "started_at": datetime.now().isoformat(),
+                "finished_at": None,
+                "error": None,
+                "force": force,
+            }
+
+        # 在后台线程中执行索引（不阻塞事件循环）
+        loop = asyncio.get_event_loop()
+        asyncio.ensure_future(self._run_index(ws_id, force, loop))
+        return {"workspace_id": ws_id, "status": "started", "task_id": task_id}
+
+    async def _run_index(self, ws_id: str, force: bool, loop: asyncio.AbstractEventLoop):
+        """索引任务主逻辑（在事件循环中运行，CPU 密集部分丢到线程池）"""
+        from sage.context.index import ProjectIndex
+
+        task = self._tasks[ws_id]
+        task["status"] = "running"
+
+        try:
+            mgr = get_workspace_manager()
+            ws_path = mgr.get_workspace_path(ws_id)
+            sage_dir = ws_path / ".sage"
+            sage_dir.mkdir(parents=True, exist_ok=True)
+            db_path = sage_dir / "index.db"
+            store = WorkspaceStore(db_path=str(db_path))
+            index = ProjectIndex(workspace=ws_path, store=store)
+
+            # 先收集待索引文件列表（用于进度计算）
+            file_list = list(index._walk_source_files())
+            task["total"] = len(file_list)
+            await self._emit(ws_id, {
+                "type": "start",
+                "total": len(file_list),
+                "message": f"开始索引 {len(file_list)} 个文件",
+            })
+
+            stats = {"files": 0, "chunks": 0, "skipped": 0}
+            index._embeddings_cache = None  # 清除向量缓存
+
+            import hashlib
+            from concurrent.futures import ThreadPoolExecutor
+
+            # 用线程池并行做 CPU 密集的 embedding 计算
+            # SQLite 写入仍串行（同一连接不能跨线程）
+            max_workers = min(4, (os.cpu_count() or 2) - 1)
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+
+            def process_one(file_path):
+                """处理单个文件：读取 → 分块 → 提取元数据 → 生成 embedding"""
+                try:
+                    content = index._read_file_content(file_path)
+                except (UnicodeDecodeError, PermissionError, OSError):
+                    return None
+                if not content or not content.strip():
+                    return None
+                rel_path = str(file_path.relative_to(index.workspace)).replace("\\", "/")
+                file_hash = hashlib.md5(content.encode()).hexdigest()
+                if not force and index.store.get_file_hash(rel_path) == file_hash:
+                    return ("skipped", rel_path, file_hash, None, None)
+                chunks = index._chunk_file(content, rel_path)
+                if not chunks:
+                    return None
+                metadata = index._extract_paper_metadata(content, file_path)
+                if file_path.suffix.lower() == ".pdf":
+                    page_map = index._build_pdf_page_map(file_path)
+                    for chunk in chunks:
+                        ps, pe = index._lines_to_pages(chunk.start_line, chunk.end_line, page_map)
+                        chunk.page_start = ps
+                        chunk.page_end = pe
+                for chunk in chunks:
+                    chunk.title = metadata.get("title")
+                    chunk.authors = metadata.get("authors")
+                    chunk.year = metadata.get("year")
+                    chunk.doi = metadata.get("doi")
+                chunk_texts = [c.content for c in chunks]
+                embeddings = index.embedder.encode(chunk_texts)
+                return ("indexed", rel_path, file_hash, chunks, embeddings)
+
+            # 提交所有文件到线程池
+            futures = {executor.submit(process_one, fp): fp for fp in file_list}
+            done_count = 0
+            for future in futures:
+                # 顺序收集结果（保证 SQLite 写入串行）
+                result = await loop.run_in_executor(None, lambda f=future: f.result())
+                fp = futures[future]
+                done_count += 1
+                task["progress"] = done_count
+                task["current_file"] = str(fp.name)
+
+                if result is None:
+                    continue
+                kind, rel_path, file_hash, chunks, embeddings = result
+                if kind == "skipped":
+                    stats["skipped"] += 1
+                    await self._emit(ws_id, {
+                        "type": "progress",
+                        "progress": done_count,
+                        "total": len(file_list),
+                        "current_file": str(fp.name),
+                        "message": f"跳过未修改: {fp.name}",
+                    })
+                    continue
+
+                # 清理旧索引并写入（串行）
+                index.store.delete_file_chunks(rel_path)
+                for chunk, emb in zip(chunks, embeddings):
+                    index.store.store_chunk(
+                        file_path=rel_path,
+                        start_line=chunk.start_line,
+                        end_line=chunk.end_line,
+                        content=chunk.content,
+                        embedding=emb.tobytes(),
+                        file_hash=file_hash,
+                        title=chunk.title,
+                        authors=chunk.authors,
+                        year=chunk.year,
+                        doi=chunk.doi,
+                        page_start=chunk.page_start,
+                        page_end=chunk.page_end,
+                    )
+                    stats["chunks"] += 1
+                stats["files"] += 1
+
+                await self._emit(ws_id, {
+                    "type": "progress",
+                    "progress": done_count,
+                    "total": len(file_list),
+                    "current_file": str(fp.name),
+                    "message": f"已索引: {fp.name}（+{len(chunks)} 块）",
+                })
+
+            executor.shutdown(wait=False)
+
+            # 索引完成，更新元数据
+            index_failed = ("error" in stats and stats.get("chunks", 0) == 0)
+            index_stats = {
+                "workspace_id": ws_id,
+                "indexed": not index_failed,
+                "indexed_at": datetime.now().isoformat(),
+                "force": force,
+                "stats": stats,
+                "db_path": str(db_path),
+            }
+            (sage_dir / "index_stats.json").write_text(
+                json.dumps(index_stats, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            mgr._update_registry_entry(ws_id, indexed=not index_failed, index_stats=index_stats)
+            mgr._update_meta(ws_id, indexed=not index_failed, index_stats=index_stats)
+
+            task["status"] = "done"
+            task["stats"] = stats
+            task["finished_at"] = datetime.now().isoformat()
+            task["message"] = f"索引完成：{stats['files']} 个文件，{stats['chunks']} 个块"
+            await self._emit(ws_id, {
+                "type": "done",
+                "stats": stats,
+                "message": task["message"],
+            })
+
+        except Exception as e:
+            task["status"] = "error"
+            task["error"] = str(e)
+            task["finished_at"] = datetime.now().isoformat()
+            task["message"] = f"索引失败: {e}"
+            await self._emit(ws_id, {
+                "type": "error",
+                "error": str(e),
+                "message": task["message"],
+            })
+
+
+# 全局单例
+_index_task_manager: Optional[IndexTaskManager] = None
+
+
+def get_index_task_manager() -> IndexTaskManager:
+    global _index_task_manager
+    if _index_task_manager is None:
+        _index_task_manager = IndexTaskManager()
+    return _index_task_manager

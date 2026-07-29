@@ -261,9 +261,9 @@ function shortLabel(modelId) {
 }
 .model-chip-chevron.open { transform: rotate(180deg); }
 
-/* ── 下拉面板 ── */
+/* ── 下拉面板（向上展开，避免被底部视口截断）── */
 .model-picker {
-  position: absolute; top: calc(100% + 6px); left: 48px;
+  position: absolute; bottom: calc(100% + 6px); left: 48px;
   width: 290px; max-height: 380px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -328,12 +328,12 @@ function shortLabel(modelId) {
 }
 .picker-settings-link:hover { background: var(--bg-hover); color: var(--text-secondary); }
 
-/* ── 下拉动画 ── */
+/* ── 下拉动画（向上展开）── */
 .picker-fade-enter-active { transition: all 0.15s var(--ease-out-expo); }
 .picker-fade-leave-active { transition: all 0.1s ease-in; }
 .picker-fade-enter-from,
 .picker-fade-leave-to {
-  opacity: 0; transform: translateY(-4px);
+  opacity: 0; transform: translateY(4px);
 }
 
 /* ── textarea ── */

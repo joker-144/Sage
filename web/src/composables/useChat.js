@@ -1,7 +1,11 @@
 import { ref, nextTick } from 'vue'
+import { usePoolMode } from './usePoolMode'
 
 const SSE_TIMEOUT_MS = 60000   // 60 秒无响应超时（配合后端 10s 心跳保活）
 const CONV_ID_KEY = 'sage-conversation-id'
+
+// 池模式状态（单例，与 WorkspaceView 共享）
+const { poolMode } = usePoolMode()
 
 function loadConvId() {
   try { return localStorage.getItem(CONV_ID_KEY) } catch { return null }
@@ -33,10 +37,24 @@ export function useChat() {
     messages.value = []
     conversationId.value = null
     saveConvId(null)
+    // 新建对话时同样重置模块级引用 + 中断残留 SSE
+    currentAssistant = null
+    if (abortController) {
+      abortController.abort()
+      abortController = null
+    }
   }
 
   async function loadConversation(convId) {
-    if (!convId || isProcessing.value) return
+    if (!convId) return
+    // 即使当前对话仍在处理中，也允许切换：先中断残留 SSE 流
+    if (isProcessing.value) {
+      if (abortController) {
+        abortController.abort()
+        abortController = null
+      }
+      isProcessing.value = false
+    }
     try {
       const res = await fetch(`/conversations/${convId}/messages?limit=200`)
       if (!res.ok) return
@@ -44,12 +62,13 @@ export function useChat() {
       conversationId.value = convId
       saveConvId(convId)
       // 策略：将所有相同 user/assistant 轮的工具调用合并到同一条消息中
+      // 注意：使用独立局部变量 buildingAssistant，避免与模块级 currentAssistant 重名混淆
       const loaded = []
-      let currentAssistant = null  // 当前正在构建的 assistant 消息
+      let buildingAssistant = null  // 当前正在构建的 assistant 消息（局部）
 
       for (const msg of (data.messages || [])) {
         if (msg.role === 'user') {
-          currentAssistant = null
+          buildingAssistant = null
           loaded.push({ role: 'user', content: msg.content, tools: [] })
         } else if (msg.role === 'assistant') {
           // 检查 tool_args 中是否包含 tool_calls（OpenAI 格式）
@@ -58,9 +77,14 @@ export function useChat() {
 
           if (msg.tool_name || hasToolCalls) {
             // 工具调用消息 — 合并到当前 assistant
-            if (!currentAssistant) {
-              currentAssistant = { role: 'assistant', content: '', tools: [], reasoning: '' }
-              loaded.push(currentAssistant)
+            // 该轮 LLM 调用的 token 用量（DB 存在 assistant 消息上）
+            const roundTokens = msg.tokens > 0 ? { total: msg.tokens } : {}
+            if (!buildingAssistant) {
+              buildingAssistant = { role: 'assistant', content: '', tools: [], reasoning: msg.reasoning || '', _roundTokens: roundTokens }
+              loaded.push(buildingAssistant)
+            } else if (msg.reasoning && !buildingAssistant.reasoning) {
+              // 补充该轮的思考内容（首次设置）
+              buildingAssistant.reasoning = msg.reasoning
             }
             if (hasToolCalls) {
               // 从 tool_args 中提取工具调用信息
@@ -69,49 +93,53 @@ export function useChat() {
                 const tName = fn.name || msg.tool_name || ''
                 const tArgs = fn.arguments ? safeParseJson(fn.arguments) : {}
                 const agent = makeAgentFlag(tName, tArgs)
-                currentAssistant.tools.push({
+                buildingAssistant.tools.push({
                   name: tName,
                   args: tArgs,
                   content: '',
                   result: '',
                   expanded: false,
                   done: false,
-                  tokens: {},
+                  tokens: roundTokens,
                   isAgent: agent.isAgent,
                   agentName: agent.agentName,
                 })
               }
             } else if (msg.tool_name) {
               const agent = makeAgentFlag(msg.tool_name, {})
-              currentAssistant.tools.push({
+              buildingAssistant.tools.push({
                 name: msg.tool_name,
                 args: {},
                 content: '',
                 result: msg.content || '',
                 expanded: false,
                 done: true,
-                tokens: {},
+                tokens: roundTokens,
                 isAgent: agent.isAgent,
                 agentName: agent.agentName,
               })
             }
           } else {
             // 纯文本 assistant 消息（工具调用后的最终回复）
-            if (currentAssistant) {
-              currentAssistant.content = msg.content || ''
-              currentAssistant = null
+            if (buildingAssistant) {
+              buildingAssistant.content = msg.content || ''
+              // 最终回复轮的思考内容（追加，保留工具调用轮的思考）
+              if (msg.reasoning) {
+                buildingAssistant.reasoning = (buildingAssistant.reasoning || '') + (buildingAssistant.reasoning ? '\n' : '') + msg.reasoning
+              }
+              buildingAssistant = null
             } else {
-              loaded.push({ role: 'assistant', content: msg.content || '', tools: [], reasoning: '' })
+              loaded.push({ role: 'assistant', content: msg.content || '', tools: [], reasoning: msg.reasoning || '' })
             }
           }
         } else if (msg.role === 'tool') {
           // 工具执行结果 — 更新当前 assistant 中对应工具的结果
-          if (!currentAssistant) {
-            currentAssistant = { role: 'assistant', content: '', tools: [], reasoning: '' }
-            loaded.push(currentAssistant)
+          if (!buildingAssistant) {
+            buildingAssistant = { role: 'assistant', content: '', tools: [], reasoning: '' }
+            loaded.push(buildingAssistant)
           }
           // 查找通过 tool_args 创建的占位符工具（name 匹配且 done=false）
-          const tool = currentAssistant.tools.find(
+          const tool = buildingAssistant.tools.find(
             t => t.name === (msg.tool_name || '') && !t.done
           )
           if (tool) {
@@ -119,7 +147,7 @@ export function useChat() {
             tool.done = true
           } else {
             const agent = makeAgentFlag(msg.tool_name || '', {})
-            currentAssistant.tools.push({
+            buildingAssistant.tools.push({
               name: msg.tool_name || '',
               args: {},
               content: '',
@@ -135,6 +163,14 @@ export function useChat() {
       }
 
       messages.value = loaded.length > 0 ? loaded : []
+      // 切换对话时必须重置模块级 currentAssistant 引用，
+      // 防止上一对话的 assistant 引用残留导致后续事件追加到错误对话。
+      currentAssistant = null
+      // 中断上一对话可能残留的 SSE 连接，避免跨对话事件串扰
+      if (abortController) {
+        abortController.abort()
+        abortController = null
+      }
       scrollToBottom()
     } catch {
       // 静默失败
@@ -214,10 +250,13 @@ export function useChat() {
     try {
       await streamChat(text)
     } catch (err) {
-      if (err.name === 'AbortError') {
-        currentAssistant.content += `\n\n（已取消）`
-      } else {
-        currentAssistant.content += `\n\n**错误:** ${err.message}`
+      // 切换对话时 currentAssistant 可能已被重置为 null，需做 null 检查
+      if (currentAssistant) {
+        if (err.name === 'AbortError') {
+          currentAssistant.content += `\n\n（已取消）`
+        } else {
+          currentAssistant.content += `\n\n**错误:** ${err.message}`
+        }
       }
     } finally {
       abortController = null
@@ -257,6 +296,10 @@ export function useChat() {
       }
       if (writingMode.value) {
         body.mode = 'writing'
+      }
+      // 池模式标记：后端据此将 search_literature 路由到跨工作空间检索
+      if (poolMode.value) {
+        body.pool_mode = true
       }
 
       // SSE 超时兜底：3 分钟无任何数据则中止

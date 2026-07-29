@@ -13,6 +13,8 @@ import WorkspaceView from './components/WorkspaceView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import StatsModal from './components/StatsModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import DownloadNotification from './components/DownloadNotification.vue'
+import IndexNotification from './components/IndexNotification.vue'
 
 const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
@@ -118,7 +120,7 @@ onMounted(() => { reset() })
           </div>
         </div>
 
-        <DashboardView v-show="activeView === 'dashboard'" />
+        <DashboardView v-show="activeView === 'dashboard'" :active-view="activeView" />
         <AgentsView v-show="activeView === 'agents'" />
         <SkillsView v-show="activeView === 'skills'" />
         <WorkspaceView v-show="activeView === 'workspace'" />
@@ -136,6 +138,11 @@ onMounted(() => { reset() })
       @confirm="doDelete"
       @cancel="confirmDelete = { show: false, convId: null }"
     />
+
+    <!-- 全局下载通知（右上角） -->
+    <DownloadNotification />
+    <!-- 全局索引通知（右上角） -->
+    <IndexNotification />
   </div>
 </template>
 

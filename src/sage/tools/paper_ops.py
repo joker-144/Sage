@@ -59,17 +59,20 @@ class PaperOps:
         except Exception as e:
             return ToolResult(success=False, error=f"索引失败: {e}")
 
-    async def search_literature(self, query: str, top_k: int = 5) -> ToolResult:
+    async def search_literature(self, query: str, top_k: Optional[int] = None) -> ToolResult:
         """语义检索已索引的文献库
 
         二阶段检索：bi-encoder 召回（阈值 0.3 过滤）+ cross-encoder 重排。
         返回结果包含完整来源信息（标题/作者/年份/DOI/页码），供智能体标注引用。
+
+        top_k 为 None 时按工作空间索引级别自动选择（standard=5, premium=10）。
         """
         try:
             from sage.context.index import ProjectIndex
             store = self._get_store()
             indexer = ProjectIndex(self.workspace, store)
-            results = indexer.search(query, top_k=top_k, threshold=0.3, rerank=True)
+            # rerank 由索引级别决定（standard=False, premium=True），不强制开启
+            results = indexer.search(query, top_k=top_k, threshold=0.3)
             if not results:
                 return ToolResult(
                     success=True,
@@ -218,7 +221,12 @@ class PaperOps:
     # ── 文档处理工具 ──
 
     async def parse_pdf(self, file_path: str) -> ToolResult:
-        """解析 PDF 文件提取文本内容"""
+        """解析 PDF 文件提取文本内容
+
+        解析后自动查询维普/万方/CrossRef 认证元数据：
+        - 补充缺失的元数据字段（期刊名、卷期、页码等）
+        - 校验已有字段（如纠正期刊名/栏目名混淆）
+        """
         try:
             full_path = self.workspace / file_path
             if not full_path.exists():
@@ -229,10 +237,53 @@ class PaperOps:
             text = indexer._extract_pdf_text(full_path)
             if not text:
                 return ToolResult(success=False, error="PDF 解析失败（可能未安装 PyMuPDF）")
+
+            # 提取本地元数据
+            local_metadata = self._extract_paper_metadata(text)
+            title = self._clean_title(local_metadata.get("title", ""))
+
+            # 自动查询外部源认证元数据（最佳努力，不阻塞 PDF 解析结果）
+            verified_metadata = None
+            source = ""
+            discrepancies = []
+            if title:
+                try:
+                    verified_metadata, source = await asyncio.wait_for(
+                        self._verify_metadata_online(title), timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass
+
+            # 合并元数据
+            merged_metadata, discrepancies = self._merge_metadata(
+                local_metadata, verified_metadata
+            )
+
+            # 构建输出
+            output_parts = [f"PDF 解析完成, 共 {len(text)} 字符"]
+
+            if verified_metadata:
+                output_parts.append(self._format_verified_metadata(verified_metadata, source))
+
+            if discrepancies:
+                output_parts.append("## 差异校正")
+                output_parts.extend(discrepancies)
+
+            output_parts.append(f"\n## 内容预览\n{text[:2000]}")
+
             return ToolResult(
                 success=True,
-                output=f"PDF 解析完成, 共 {len(text)} 字符:\n{text[:3000]}",
-                data={"char_count": len(text), "preview": text[:1000]},
+                output="\n".join(output_parts),
+                data={
+                    "char_count": len(text),
+                    "preview": text[:1000],
+                    "metadata": merged_metadata,
+                    "verified": verified_metadata is not None,
+                    "source": source,
+                    "discrepancies": discrepancies,
+                },
             )
         except Exception as e:
             return ToolResult(success=False, error=f"PDF 解析失败: {e}")
@@ -586,6 +637,323 @@ class PaperOps:
             return result
         except Exception as e:
             return ToolResult(success=False, error=f"Semantic Scholar 检索失败: {e}")
+
+    # ── 中文论文元数据认证工具 ──
+
+    async def search_cnki(self, title: str) -> ToolResult:
+        """搜索中文学术数据库认证论文元数据
+
+        搜索顺序: 维普 → 万方 → CrossRef
+        用于验证论文的期刊名、作者、年份、卷期、页码、DOI 等元数据，
+        特别适用于纠正 PDF 提取中常见的期刊名/栏目名混淆问题。
+        """
+        clean_title = self._clean_title(title)
+        if not clean_title:
+            return ToolResult(success=False, error="标题为空，无法搜索")
+
+        metadata, source = await self._verify_metadata_online(clean_title)
+        if metadata:
+            return ToolResult(
+                success=True,
+                output=self._format_verified_metadata(metadata, source),
+                data={**metadata, "source": source},
+            )
+        return ToolResult(
+            success=False,
+            error=f"未能从维普/万方/CrossRef 找到与 '{clean_title}' 匹配的论文",
+        )
+
+    async def _verify_metadata_online(self, title: str) -> tuple[Optional[dict], str]:
+        """在线认证论文元数据（维普 → 万方 → CrossRef）
+
+        Returns: (metadata, source) 或 (None, "")
+        """
+        if not title:
+            return None, ""
+
+        # 1. 维普
+        try:
+            result = await asyncio.wait_for(self._search_cqvip(title), timeout=15.0)
+            if result:
+                return result, "维普"
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+
+        # 2. 万方
+        try:
+            result = await asyncio.wait_for(self._search_wanfang(title), timeout=15.0)
+            if result:
+                return result, "万方"
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+
+        # 3. CrossRef
+        try:
+            result = await asyncio.wait_for(self._search_crossref_by_title(title), timeout=15.0)
+            if result:
+                return result, "CrossRef"
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+
+        return None, ""
+
+    async def _search_cqvip(self, title: str) -> Optional[dict]:
+        """通过 DuckDuckGo site 搜索维普获取论文元数据"""
+        return await self._search_chinese_db(title, "cqvip.com", "维普")
+
+    async def _search_wanfang(self, title: str) -> Optional[dict]:
+        """通过 DuckDuckGo site 搜索万方获取论文元数据"""
+        return await self._search_chinese_db(title, "wanfangdata.com.cn", "万方")
+
+    async def _search_chinese_db(self, title: str, site: str, db_name: str) -> Optional[dict]:
+        """通过 DuckDuckGo 搜索指定学术数据库获取论文元数据
+
+        Args:
+            title: 论文标题
+            site: 学术数据库域名（如 cqvip.com）
+            db_name: 数据库名称（用于标记来源）
+        """
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return None
+
+        try:
+            loop = asyncio.get_running_loop()
+            # 先用 site 限定搜索，再用标题+数据库名搜索
+            query = f"site:{site} {title}"
+            results = await loop.run_in_executor(
+                None, lambda: DDGS().text(query, max_results=5)
+            )
+            # site 搜索无结果时回退到标题+数据库名
+            if not results:
+                query = f'"{title}" {db_name}'
+                results = await loop.run_in_executor(
+                    None, lambda: DDGS().text(query, max_results=5)
+                )
+        except Exception:
+            return None
+
+        if not results:
+            return None
+
+        # 从搜索结果中解析元数据
+        for r in results:
+            text = f"{r.get('title', '')} {r.get('body', '')}"
+            metadata = self._parse_journal_metadata_from_text(text)
+            if metadata and metadata.get("journal"):
+                return metadata
+
+        return None
+
+    async def _search_crossref_by_title(self, title: str) -> Optional[dict]:
+        """通过标题搜索 CrossRef API 获取论文元数据"""
+        try:
+            import httpx
+            import urllib.parse
+
+            encoded_title = urllib.parse.quote(title)
+            url = f"https://api.crossref.org/works?query.bibliographic={encoded_title}&rows=1"
+
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    url,
+                    headers={"User-Agent": "Sage/1.0 (mailto:sage@example.com)"},
+                )
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+
+            items = data.get("message", {}).get("items", [])
+            if not items:
+                return None
+
+            item = items[0]
+            metadata = {}
+
+            # 期刊名
+            container_titles = item.get("container-title", [])
+            if container_titles:
+                metadata["journal"] = container_titles[0]
+
+            # 标题
+            titles = item.get("title", [])
+            if titles:
+                metadata["title"] = titles[0]
+
+            # 作者
+            authors = item.get("author", [])
+            if authors:
+                author_names = []
+                for a in authors:
+                    given = a.get("given", "")
+                    family = a.get("family", "")
+                    name = f"{family}{given}".strip() if family or given else ""
+                    if name:
+                        author_names.append(name)
+                if author_names:
+                    metadata["authors"] = ", ".join(author_names)
+
+            # 年份
+            date_parts = item.get("published", {}).get("date-parts", [[]])
+            if date_parts and date_parts[0]:
+                metadata["year"] = str(date_parts[0][0])
+
+            # 卷期页
+            if item.get("volume"):
+                metadata["volume"] = item["volume"]
+            if item.get("issue"):
+                metadata["issue"] = item["issue"]
+            if item.get("page"):
+                metadata["pages"] = item["page"]
+
+            # DOI
+            if item.get("DOI"):
+                metadata["doi"] = item["DOI"]
+
+            # 摘要（CrossRef 摘要可能含 XML 标签）
+            if item.get("abstract"):
+                abstract = re.sub(r"<[^>]+>", "", item["abstract"])
+                metadata["abstract"] = abstract[:500]
+
+            # 关键词
+            subjects = item.get("subject", [])
+            if subjects:
+                metadata["keywords"] = ", ".join(subjects)
+
+            # 必须有期刊名才算认证成功
+            return metadata if metadata.get("journal") else None
+        except Exception:
+            return None
+
+    def _parse_journal_metadata_from_text(self, text: str) -> Optional[dict]:
+        """从搜索结果文本中解析期刊元数据
+
+        中文期刊搜索结果的常见格式：
+        - 期刊名: 《乡村科技》 或 期刊：乡村科技
+        - 年份: 2023年 或 2023
+        - 期号: 第X期
+        - 页码: X-Y
+        """
+        metadata = {}
+
+        # 期刊名: 优先匹配 《》中的内容
+        journal_match = re.search(r"《([^》]+)》", text)
+        if journal_match:
+            candidate = journal_match.group(1).strip()
+            # 排除标题被误识别为期刊名的情况
+            if len(candidate) <= 30 and not candidate.startswith("基于"):
+                metadata["journal"] = candidate
+
+        # 年份
+        year_match = re.search(r"\b(19|20)\d{2}\b", text)
+        if year_match:
+            metadata["year"] = year_match.group(0)
+
+        # 期号
+        issue_match = re.search(r"第\s*(\d+)\s*期", text)
+        if issue_match:
+            metadata["issue"] = issue_match.group(1)
+
+        # 卷号
+        vol_match = re.search(r"第\s*(\d+)\s*卷", text)
+        if vol_match:
+            metadata["volume"] = vol_match.group(1)
+
+        # 页码
+        page_match = re.search(r"页?\s*(\d+)\s*[-–]\s*(\d+)", text)
+        if page_match:
+            metadata["pages"] = f"{page_match.group(1)}-{page_match.group(2)}"
+
+        # DOI
+        doi_match = re.search(r"10\.\d{4,}/[^\s)】]+", text)
+        if doi_match:
+            metadata["doi"] = doi_match.group(0)
+
+        # 作者（尝试匹配 作者: 或 作者： 后面的内容）
+        author_match = re.search(r"作者[:：]\s*([^\n,，|]{2,50})", text)
+        if author_match:
+            metadata["authors"] = author_match.group(1).strip()
+
+        return metadata if metadata.get("journal") else None
+
+    def _clean_title(self, title: str) -> str:
+        """清理从 PDF 提取的标题"""
+        if not title:
+            return ""
+        # 移除多余空白和换行
+        title = re.sub(r"\s+", " ", title).strip()
+        # 移除文件扩展名
+        title = re.sub(r"\.(pdf|PDF)$", "", title)
+        # 移除可能的编号前缀
+        title = re.sub(r"^[\d\W]+", "", title).strip()
+        # 限制长度
+        if len(title) > 100:
+            title = title[:100]
+        return title
+
+    def _format_verified_metadata(self, metadata: dict, source: str) -> str:
+        """格式化认证后的元数据为可读文本"""
+        lines = [f"## 论文元数据认证（来源: {source}）"]
+
+        field_names = {
+            "title": "标题",
+            "journal": "期刊名",
+            "authors": "作者",
+            "year": "年份",
+            "volume": "卷号",
+            "issue": "期号",
+            "pages": "页码",
+            "doi": "DOI",
+            "abstract": "摘要",
+            "keywords": "关键词",
+        }
+
+        for key, label in field_names.items():
+            val = metadata.get(key)
+            if val:
+                lines.append(f"**{label}**: {val}")
+
+        return "\n".join(lines)
+
+    def _merge_metadata(
+        self, local: dict, verified: Optional[dict]
+    ) -> tuple[dict, list[str]]:
+        """合并本地提取和外部认证的元数据
+
+        策略: 优先使用外部认证结果（特别是期刊名），补充本地提取的字段。
+        同时生成差异报告，标注本地与外部不一致的字段。
+
+        Returns: (合并后的元数据, 差异报告列表)
+        """
+        if not verified:
+            return local, []
+
+        result = {}
+        discrepancies = []
+        all_keys = set(local.keys()) | set(verified.keys())
+
+        for key in all_keys:
+            local_val = local.get(key)
+            verified_val = verified.get(key)
+
+            if verified_val:
+                result[key] = verified_val
+                # 检查差异（仅在本地和外部都有值且不一致时报告）
+                if local_val and str(local_val).strip() != str(verified_val).strip():
+                    discrepancies.append(
+                        f"  {key}: 本地='{local_val}' → 认证='{verified_val}'"
+                    )
+            else:
+                result[key] = local_val
+
+        return result, discrepancies
 
     # ── 辅助方法 ──
 

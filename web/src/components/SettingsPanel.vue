@@ -1,5 +1,17 @@
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue'
+import { useDownloadNotify } from '../composables/useDownloadNotify'
+
+// 注意：从 composable 取出的 phase 重命名为 modelDlPhase，避免与版本更新模态框的 downloadPhase 冲突
+const { startDownload, phase: modelDlPhase, currentModelType } = useDownloadNotify()
+
+// 判断指定模型是否正在下载中
+function isModelDownloading(key) {
+  return modelDlPhase.value === 'downloading' && currentModelType.value === key
+}
+
+// 旧名称保留兼容（模板中可能引用）
+const isRerankerDownloading = computed(() => isModelDownloading('reranker'))
 
 // ── 供应商定义 ──
 const providers = [
@@ -134,6 +146,81 @@ watch([() => settings.value.apiKeys[settings.value.provider], () => settings.val
 const allProviderModels = ref({})
 const showModelManager = ref(false)
 const refreshingAll = ref(false)
+
+// ── 本地模型状态（Embedding/OCR/Reranker，需额外下载）──
+const localModels = ref(null)
+const localModelsLoading = ref(false)
+
+async function loadLocalModels() {
+  localModelsLoading.value = true
+  try {
+    const resp = await fetch('/api/system/models-status')
+    if (resp.ok) {
+      const data = await resp.json()
+      localModels.value = data.models || null
+    }
+  } catch { /* ignore */ }
+  finally { localModelsLoading.value = false }
+}
+
+function modelStatusText(status) {
+  const map = { ready: '已就绪', not_downloaded: '未下载', missing: '未安装', error: '异常', unknown: '未知' }
+  return map[status] || status
+}
+
+// 下载指定本地模型（embedding/ocr/reranker）
+// 约束：不修改原有模型加载逻辑，仅触发下载/安装
+const _MODEL_LABELS = {
+  embedding: 'Embedding 向量模型',
+  ocr: 'OCR 文字识别',
+  reranker: 'Reranker 重排模型',
+}
+function downloadLocalModel(key) {
+  if (!key) return
+  startDownload({
+    modelType: key,
+    title: _MODEL_LABELS[key] || key,
+    onDone: () => {
+      // 下载完成后刷新本地模型状态
+      loadLocalModels()
+    },
+  })
+}
+
+// 清除指定供应商的配置（API Key + localStorage 模型缓存）
+// 约束：仅清该供应商的数据，不影响其他供应商和 Base URL 默认值
+function clearProviderConfig(providerId) {
+  // 1. 清除 API Key
+  if (settings.value.apiKeys && settings.value.apiKeys[providerId]) {
+    delete settings.value.apiKeys[providerId]
+  }
+  // 2. 清除 localStorage 中的该供应商模型缓存
+  try {
+    const cache = JSON.parse(localStorage.getItem('sage-models-cache') || '{}')
+    if (cache[providerId]) {
+      delete cache[providerId]
+      localStorage.setItem('sage-models-cache', JSON.stringify(cache))
+    }
+  } catch { /* ignore */ }
+  // 3. 同步更新 allProviderModels（模型管理 Tab 显示）
+  if (allProviderModels.value[providerId]) {
+    delete allProviderModels.value[providerId]
+  }
+  // 4. 若清除的是当前选中的供应商，清空当前模型选择避免无效状态
+  if (settings.value.provider === providerId) {
+    settings.value.model = ''
+    providerModels.value = []
+    modelsError.value = ''
+  }
+  // 5. 持久化到 localStorage 和服务端
+  saveSettings()
+  // 6. 标记已保存提示
+  saved.value = true
+  setTimeout(() => saved.value = false, 2000)
+}
+
+// 是否存在已配置 API Key 的供应商（保留用于潜在的判断逻辑）
+// 注意：清除按钮现在放在模型管理 Tab 的供应商分组卡片右侧
 
 function loadAllProviderModels() {
   try {
@@ -281,6 +368,9 @@ onMounted(() => {
       fetchModels(settings.value.provider, settings.value.apiKeys[settings.value.provider], settings.value.baseUrl)
       loadAllProviderModels()
     }
+
+  // 加载本地模型状态（Embedding/OCR/Reranker）
+  loadLocalModels()
 })
 
 function saveSettings() {
@@ -683,6 +773,18 @@ function closeDownloadModal() {
               {{ settings.apiKeys[p.id] ? '已配置' : '未配置' }}
             </span>
             <span v-if="settings.provider === p.id" class="pmg-active-badge">当前</span>
+            <!-- 已配置的供应商显示清除按钮 -->
+            <button
+              v-if="settings.apiKeys[p.id]"
+              class="pmg-clear-btn"
+              title="清除该供应商的 API Key 和模型缓存"
+              @click.stop="clearProviderConfig(p.id)"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              清除
+            </button>
           </div>
 
           <div
@@ -702,6 +804,58 @@ function closeDownloadModal() {
           </div>
           <div v-else class="pmg-empty">
             {{ settings.apiKeys[p.id] ? '暂无模型缓存，请点击上方刷新' : '配置 API Key 后可拉取模型' }}
+          </div>
+        </div>
+      </div>
+
+      <!-- 本地模型状态（需额外下载：Embedding/OCR/Reranker）-->
+      <div class="local-models-section">
+        <div class="lms-header">
+          <h3>本地模型状态</h3>
+          <button class="btn-secondary btn-sm" @click="loadLocalModels" :disabled="localModelsLoading">
+            {{ localModelsLoading ? '检测中...' : '重新检测' }}
+          </button>
+        </div>
+        <p class="section-desc">以下模型在首次使用时自动下载，状态正常时无需干预。</p>
+
+        <div v-if="localModelsLoading && !localModels" class="lms-loading">检测中...</div>
+        <div v-else-if="localModels" class="lms-list">
+          <div
+            v-for="(m, key) in localModels"
+            :key="key"
+            class="lms-item"
+            :class="`status-${m.status}`"
+          >
+            <div class="lms-item-info">
+              <div class="lms-item-name">{{ ({embedding:'Embedding 向量模型', ocr:'OCR 文字识别', reranker:'Reranker 重排模型'})[key] || key }}</div>
+              <div class="lms-item-detail">{{ m.detail || m.name }}</div>
+            </div>
+            <div class="lms-item-actions">
+              <!-- 未下载/未安装时显示下载按钮；下载中显示"下载中..."禁用按钮 -->
+              <button
+                v-if="(m.status === 'not_downloaded' || m.status === 'missing') && !isModelDownloading(key)"
+                class="lms-download-btn"
+                :title="`下载 ${_MODEL_LABELS[key] || key}`"
+                @click="downloadLocalModel(key)"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                {{ m.status === 'missing' ? '安装' : '下载' }}
+              </button>
+              <button
+                v-else-if="isModelDownloading(key)"
+                class="lms-download-btn downloading"
+                disabled
+                title="正在下载中，查看右上角通知卡片"
+              >
+                <svg class="btn-spinner" width="13" height="13" viewBox="0 0 24 24" fill="none">
+                  <path d="M21 12a9 9 0 11-6.219-8.56" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                </svg>
+                下载中...
+              </button>
+              <span class="lms-status-badge" :class="`status-${m.status}`">{{ modelStatusText(m.status) }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -1059,6 +1213,23 @@ select:focus { outline: none; border-color: var(--accent-border); box-shadow: 0 
   font-size: 9px; padding: 1px 7px; border-radius: 8px;
   background: var(--accent-soft); color: var(--accent); font-weight: 600;
 }
+.pmg-clear-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-left: auto;
+  padding: 3px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 10.5px; font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-out-expo);
+}
+.pmg-clear-btn:hover {
+  border-color: var(--error); color: var(--error);
+  background: var(--error-soft);
+}
 
 .pmg-models { display: flex; flex-wrap: wrap; gap: 5px; }
 .pmg-model-chip {
@@ -1078,6 +1249,69 @@ select:focus { outline: none; border-color: var(--accent-border); box-shadow: 0 
   color: var(--accent); font-weight: 600;
 }
 .pmg-empty { font-size: 11px; color: var(--text-faint); padding: 6px 0; }
+
+/* ── 本地模型状态卡片 ── */
+.local-models-section {
+  margin-top: 20px; padding: 14px 16px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.lms-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.lms-header h3 { font-size: 12.5px; font-weight: 600; color: var(--text-secondary); margin: 0; }
+.lms-loading { padding: 16px; text-align: center; font-size: 12px; color: var(--text-faint); }
+.lms-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.lms-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 12px; background: var(--bg-surface);
+  border: 1px solid var(--border-light); border-radius: var(--radius-sm);
+  border-left: 3px solid var(--text-faint);
+}
+.lms-item.status-ready { border-left-color: #10b981; }
+.lms-item.status-not_downloaded { border-left-color: #f59e0b; }
+.lms-item.status-missing, .lms-item.status-error { border-left-color: #dc2626; }
+.lms-item-info { flex: 1; min-width: 0; }
+.lms-item-name { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.lms-item-detail { font-size: 10.5px; color: var(--text-faint); margin-top: 2px; line-height: 1.4; }
+
+.lms-item-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.lms-download-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: var(--font-sans);
+  font-size: 11px; font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-out-expo);
+}
+.lms-download-btn:hover {
+  background: var(--accent); color: white; border-color: var(--accent);
+}
+.lms-download-btn.downloading {
+  cursor: not-allowed; opacity: 0.7;
+  background: var(--bg-input); color: var(--text-muted);
+  border-color: var(--border);
+}
+.lms-download-btn.downloading:hover {
+  background: var(--bg-input); color: var(--text-muted); border-color: var(--border);
+}
+.btn-spinner {
+  animation: btn-spin 0.9s linear infinite;
+}
+@keyframes btn-spin {
+  to { transform: rotate(360deg); }
+}
+.lms-status-badge {
+  font-size: 10px; font-weight: 600; padding: 3px 9px;
+  border-radius: 10px; flex-shrink: 0; white-space: nowrap;
+}
+.lms-status-badge.status-ready { background: #dcfce7; color: #16a34a; }
+.lms-status-badge.status-not_downloaded { background: #fef3c7; color: #d97706; }
+.lms-status-badge.status-missing, .lms-status-badge.status-error { background: #fef2f2; color: #dc2626; }
+.lms-status-badge.status-unknown { background: var(--bg-hover); color: var(--text-muted); }
 
 /* ── 版本更新 ── */
 .version-info { margin-bottom: 14px; }
