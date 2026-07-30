@@ -2,7 +2,7 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
-**当前版本：0.6.4** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+**当前版本：0.6.5** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
 
 ---
 
@@ -413,7 +413,7 @@ npm run build    # 生产构建到 web/dist/
 桌面端通过 `electron-builder` 打包为 Windows NSIS 安装包，主要特性：
 
 - **数据隔离**：用户数据存储在 `%LOCALAPPDATA%/Sage`（可通过 `SAGE_DATA_DIR` 环境变量配置），升级重装不会覆盖用户配置和已安装技能
-- **卸载清理**：卸载时弹窗询问是否同时删除本地数据（默认勾选），覆盖范围包括 `%LOCALAPPDATA%/Sage`（配置、对话记录、技能）和 `%APPDATA%/sage/workspaces/`（工作空间、论文 PDF、索引数据库）
+- **卸载清理**：卸载时弹窗询问是否同时删除本地数据（默认勾选），覆盖范围包括 `%LOCALAPPDATA%/Sage`（后端配置、对话记录、技能）、`%APPDATA%/Sage`（工作空间、论文 PDF、索引数据库）和 `%APPDATA%/sage-paper`（Electron 渲染进程 localStorage，含模型配置缓存）
 - **自动启动**：安装完成后静默启动应用
 - **自动更新**：内置版本检查，支持 GitHub 直连 / GitHub 镜像 / PyPI 多源回退，下载 URL 自动包装为国内镜像加速
 - **安全打包**：`sage.spec` 在 PyInstaller 打包前临时清空 `.env` 并移除开发环境的 `memory.db` / `registry.json`，避免泄露开发数据，打包后自动恢复

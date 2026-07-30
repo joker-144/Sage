@@ -16,8 +16,10 @@ FunctionEnd
 
 ; ── 卸载时询问是否删除本地用户数据 ──────────────────────
 ; 默认选"是"（MB_YESNO 默认按钮为 YES）
-; 删除范围：%LOCALAPPDATA%/Sage（.env 配置、memory.db 对话记录、settings.json、技能）
-;          %APPDATA%/sage/workspaces/（工作空间、论文 PDF、索引数据库）
+; 删除范围：
+;   %LOCALAPPDATA%/Sage        — 后端数据（.env 配置、memory.db 对话记录、技能）
+;   %APPDATA%/Sage             — 后端工作空间（registry.json、论文 PDF、索引数据库）
+;   %APPDATA%/sage-paper       — Electron 渲染进程数据（localStorage 含模型配置、对话 ID 等）
 !macro customUnInstall
   Push $0
   MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除本地数据？$\n$\n将删除：对话记录、模型配置、工作空间论文、索引数据库等全部用户数据。" IDYES delete_user_data IDNO skip_delete_user_data
@@ -25,7 +27,8 @@ FunctionEnd
     ReadEnvStr $0 "LOCALAPPDATA"
     RMDir /r "$0\Sage"
     ReadEnvStr $0 "APPDATA"
-    RMDir /r "$0\sage"
+    RMDir /r "$0\Sage"
+    RMDir /r "$0\sage-paper"
     Goto done_delete_user_data
   skip_delete_user_data:
   done_delete_user_data:
