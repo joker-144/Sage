@@ -2,7 +2,7 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
-**当前版本：0.6.1** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+**当前版本：0.6.4** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
 
 ---
 
@@ -33,8 +33,8 @@
 - **思考内容输出**：自动捕获推理模型（如 DeepSeek-R1）的思考链（reasoning_content），以独立卡片展示，默认折叠，支持点击展开查看完整推理过程。
 - **token 消耗透明**：工具调用、智能体调用、技能调用卡片后方实时显示该轮消耗的 token 总数，便于成本监控。
 - **本地文献索引**：基于 `sentence-transformers`（all-MiniLM-L6-v2，384 维）构建向量化索引，语义检索已上传文献库，无需依赖外部 API。
-- **多文档解析**：支持 PDF / Word / LaTeX / 扫描版 OCR，自动提取标题、作者、年份、DOI、摘要、关键词等元数据。
-- **外部学术检索**：集成 Google Scholar / arXiv / CrossRef / Semantic Scholar 四大学术数据源，用于补充检索与引用真实性验证。
+- **多文档解析**：支持 PDF / Word / LaTeX / 扫描版 OCR，自动提取标题、作者、年份、DOI、摘要、关键词等元数据，并通过外部源（维普/万方/CrossRef）认证纠正期刊名等关键字段。
+- **外部学术检索**：集成 Google Scholar / arXiv / CrossRef / Semantic Scholar 四大学术数据源，用于补充检索与引用真实性验证；额外集成 `search_cnki` 工具，通过维普/万方 web 检索 + CrossRef API 回退认证论文元数据（如纠正 PDF 提取中常见的期刊名/栏目名混淆问题）。
 - **联网搜索（可选）**：集成 Tavily AI 搜索（`web_search_pro`），当 DuckDuckGo 免费搜索结果质量不高时自动切换，需配置 `TAVILY_API_KEY`（每月 1000 次免费额度）。
 - **多格式引用管理**：支持 APA / MLA / GB-T7714 / Vancouver / Chicago / IEEE 六大引用格式，自动插入与格式化。
 - **降 AI 味改写**：识别并改写 AI 生成文本的典型痕迹，规避 AI 检测，保留原意与引用。
@@ -273,7 +273,7 @@ LLM 分析失败时降级为通用助手处理，确保不中断服务。
 | **paper-processing** | PDF/Word/LaTeX/扫描版文档解析、元数据提取、OCR | `parse_pdf`, `parse_docx`, `parse_latex`, `extract_metadata`, `ocr_document` |
 | **literature-index** | 文献向量索引、语义检索、引用管理、查重检测 | `index_papers`, `search_literature`, `extract_references`, `insert_citation`, `format_references`, `check_plagiarism` |
 | **writing-assistant** | 大纲生成、段落撰写、学术润色、逻辑检查 | `generate_outline`, `write_paragraph`, `polish_academic`, `check_logic` |
-| **external-search** | Google Scholar / arXiv / CrossRef / Semantic Scholar 外部学术检索 | `search_scholar`, `search_arxiv`, `search_crossref`, `search_semantic_scholar` |
+| **external-search** | Google Scholar / arXiv / CrossRef / Semantic Scholar 外部学术检索，含 CNKI 元数据认证 | `search_scholar`, `search_arxiv`, `search_crossref`, `search_semantic_scholar`, `search_cnki` |
 | **ai-pattern-reducer** | 降 AI 味改写，规避 AI 检测 | `reduce_ai_pattern` |
 
 技能加载通过 [`sage.skill_system.SkillLoader`](src/sage/skill_system.py) 实现，远程技能搜索/下载通过内置的 [`sage.skill_hub_client.SkillHubClient`](src/sage/skill_hub_client.py)（不依赖外部 CLI）。
@@ -299,12 +299,13 @@ LLM 分析失败时降级为通用助手处理，确保不中断服务。
 - `insert_citation` — 在指定位置插入引用
 - `format_references` — 按目标期刊格式化参考文献
 - `check_plagiarism` — 查重检测
-- `parse_pdf` / `parse_docx` / `parse_latex` — 文档解析
+- `parse_pdf` / `parse_docx` / `parse_latex` — 文档解析（`parse_pdf` 自动通过维普/万方/CrossRef 认证元数据）
 - `extract_metadata` — 提取论文元数据
 - `ocr_document` — OCR 识别
 - `generate_outline` / `write_paragraph` / `polish_academic` / `check_logic` — 写作辅助
 - `reduce_ai_pattern` — 降 AI 味改写
 - `search_scholar` / `search_arxiv` / `search_crossref` / `search_semantic_scholar` — 外部学术检索
+- `search_cnki` — 通过维普/万方 web 检索 + CrossRef API 回退认证论文元数据（期刊名、栏目、ISSN 等）
 
 ### 通用技能与网络（[`tools/skill_ops.py`](src/sage/tools/skill_ops.py), [`tools/web.py`](src/sage/tools/web.py)）
 
@@ -412,9 +413,11 @@ npm run build    # 生产构建到 web/dist/
 桌面端通过 `electron-builder` 打包为 Windows NSIS 安装包，主要特性：
 
 - **数据隔离**：用户数据存储在 `%LOCALAPPDATA%/Sage`（可通过 `SAGE_DATA_DIR` 环境变量配置），升级重装不会覆盖用户配置和已安装技能
+- **卸载清理**：卸载时弹窗询问是否同时删除本地数据（默认勾选），覆盖范围包括 `%LOCALAPPDATA%/Sage`（配置、对话记录、技能）和 `%APPDATA%/sage/workspaces/`（工作空间、论文 PDF、索引数据库）
 - **自动启动**：安装完成后静默启动应用
 - **自动更新**：内置版本检查，支持 GitHub 直连 / GitHub 镜像 / PyPI 多源回退，下载 URL 自动包装为国内镜像加速
-- **安全打包**：`sage.spec` 在 PyInstaller 打包前临时清空 `.env`，避免泄露开发环境密钥，打包后自动恢复
+- **安全打包**：`sage.spec` 在 PyInstaller 打包前临时清空 `.env` 并移除开发环境的 `memory.db` / `registry.json`，避免泄露开发数据，打包后自动恢复
+- **OCR 完整打包**：`sage.spec` 通过 `collect_data_files` + `collect_dynamic_libs` 收集 `rapidocr_onnxruntime` 的 `config.yaml`、`.onnx` 模型文件和 `onnxruntime` 原生库，确保打包后 OCR 功能可用
 - **进程管理**：应用关闭时通过 `taskkill /pid {pid} /f /t` 强制终止后端进程，确保端口释放
 
 详细打包流程参见 [`web/electron/`](web/electron/) 与 [`sage.spec`](sage.spec)。
