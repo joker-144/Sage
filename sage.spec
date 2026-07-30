@@ -21,6 +21,7 @@ import atexit
 from pathlib import Path
 from PyInstaller.utils.hooks import (
     collect_data_files,
+    collect_dynamic_libs,
     collect_submodules,
     copy_metadata,
 )
@@ -86,6 +87,12 @@ datas += copy_metadata("tiktoken")
 datas += collect_data_files("rich")
 datas += collect_data_files("typer")
 
+# ── OCR 引擎数据文件（rapidocr_onnxruntime + onnxruntime）──
+# config.yaml 和 models/*.onnx 是运行时必需的，PyInstaller 静态分析无法发现
+datas += collect_data_files("rapidocr_onnxruntime")
+datas += collect_data_files("onnxruntime")
+binaries = collect_dynamic_libs("onnxruntime")
+
 # ── 前端构建产物（web/dist）──────────────────────────────
 # 打包后 sage.exe 通过 _MEIPASS/web/dist/ 提供前端界面
 _web_dist = Path("web/dist")
@@ -137,6 +144,9 @@ hiddenimports += collect_submodules("torch")
 hiddenimports += collect_submodules("scipy")
 hiddenimports += collect_submodules("sklearn")
 hiddenimports += collect_submodules("tokenizers")
+# OCR 引擎子模块（rapidocr_onnxruntime 动态导入各子包）
+hiddenimports += collect_submodules("rapidocr_onnxruntime")
+hiddenimports += collect_submodules("onnxruntime")
 hiddenimports += [
     "openai",
     "httpx",
@@ -185,7 +195,7 @@ block_cipher = None
 a = Analysis(
     ["src/sage/cli.py"],
     pathex=[str(Path(".").resolve())],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

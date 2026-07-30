@@ -13,3 +13,21 @@ Function .onVerifyInstDir
   Pop $1
   Pop $0
 FunctionEnd
+
+; ── 卸载时询问是否删除本地用户数据 ──────────────────────
+; 默认选"是"（MB_YESNO 默认按钮为 YES）
+; 删除范围：%LOCALAPPDATA%/Sage（.env 配置、memory.db 对话记录、settings.json、技能）
+;          %APPDATA%/sage/workspaces/（工作空间、论文 PDF、索引数据库）
+!macro customUnInstall
+  Push $0
+  MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除本地数据？$\n$\n将删除：对话记录、模型配置、工作空间论文、索引数据库等全部用户数据。" IDYES delete_user_data IDNO skip_delete_user_data
+  delete_user_data:
+    ReadEnvStr $0 "LOCALAPPDATA"
+    RMDir /r "$0\Sage"
+    ReadEnvStr $0 "APPDATA"
+    RMDir /r "$0\sage"
+    Goto done_delete_user_data
+  skip_delete_user_data:
+  done_delete_user_data:
+  Pop $0
+!macroend
