@@ -242,6 +242,9 @@ class MemoryStore:
 
     def create_conversation(self, conv_id: str, title: str = "") -> None:
         """创建新对话"""
+        # 防御：禁止空 ID 写入，避免产生 id='' 的脏数据导致后续删除/加载失败
+        if not conv_id or not conv_id.strip():
+            raise ValueError("conversation_id 不能为空")
         self._conn.execute(
             "INSERT OR IGNORE INTO conversations (id, title, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
             (conv_id, title),
@@ -277,6 +280,9 @@ class MemoryStore:
             reasoning: 模型思考内容（reasoning_content，推理模型才有），
                        仅 role='assistant' 时有意义，用于完整持久化 agent 回复。
         """
+        # 防御：禁止空 conversation_id，避免产生关联不到对话的孤儿消息
+        if not conversation_id or not conversation_id.strip():
+            raise ValueError("conversation_id 不能为空")
         cur = self._conn.execute(
             """INSERT INTO messages
                (conversation_id, role, content, tool_call_id, tool_name, tool_args, tokens, reasoning)
@@ -465,17 +471,6 @@ class MemoryStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # ── 经验教训 ──
-
-    def add_lesson(self, content: str, tags: str = "", embedding: bytes = b"") -> int:
-        """添加经验教训"""
-        cur = self._conn.execute(
-            "INSERT INTO lessons (content, tags, embedding) VALUES (?, ?, ?)",
-            (content, tags, embedding),
-        )
-        self._conn.commit()
-        return cur.lastrowid
-
     # ── Token 用量 ──
 
     def record_token_usage(
@@ -538,7 +533,10 @@ class MemoryStore:
         summary_count = self._conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0]
         mem_emb_count = self._conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
         chunk_count = self._conn.execute("SELECT COUNT(*) FROM file_index").fetchone()[0]
-        lesson_count = self._conn.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]
+        # 经验教训：从 memory_embeddings 表统计（lesson 类型），原 lessons 表已废弃
+        lesson_count = self._conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE memory_type = 'lesson'"
+        ).fetchone()[0]
         return {
             "conversations": conv_count,
             "messages": msg_count,

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch, nextTick } from 'vue'
 
 const props = defineProps({
   statusText: { type: String, default: '就绪' },
@@ -8,12 +8,63 @@ const props = defineProps({
   sidebarExpanded: { type: Boolean, default: true },
   currentConversationId: { type: String, default: null },
   refreshKey: { type: Number, default: 0 },
+  activeAgentRoles: { type: Set, default: () => new Set() },
 })
 const emit = defineEmits(['new-chat', 'stats', 'navigate', 'load-conversation', 'delete-conversation'])
+
+// 滑动指示器：跟随激活按钮位移
+const activityTopRef = ref(null)
+const indicatorOffsetY = ref(0)
+
+// Activity Bar 顶部 6 个视图按钮的顺序（与模板一致）
+const VIEW_ORDER = ['chat', 'dashboard', 'agents', 'skills', 'workspace', 'settings']
+
+function updateIndicator() {
+  const container = activityTopRef.value
+  if (!container) return
+  const idx = VIEW_ORDER.indexOf(props.activeView)
+  if (idx < 0) return
+  const btn = container.children[idx]
+  if (!btn) return
+  // 指示器竖条居中对齐到按钮：按钮相对容器顶部的偏移 + 按钮高度/2 - 竖条高度/2
+  // 竖条高度 18px（见 CSS），按钮高度 32px，居中即 offsetTop + (32-18)/2 = offsetTop + 7
+  indicatorOffsetY.value = btn.offsetTop + (btn.offsetHeight - 18) / 2
+}
+
+onMounted(() => {
+  nextTick(updateIndicator)
+})
+watch(() => props.activeView, () => nextTick(updateIndicator))
 
 const conversations = ref([])
 const APP_VERSION = __APP_VERSION__
 const loadingConversations = ref(false)
+
+// 智能体列表（从后端加载已注册的 agent）
+const agents = ref([])
+
+async function fetchAgents() {
+  try {
+    const res = await fetch('/api/agents')
+    if (res.ok) {
+      const data = await res.json()
+      agents.value = data.agents || []
+    }
+  } catch {
+    // 静默失败，保留空列表
+  }
+}
+
+// agent role → 显示名（取括号前的中文名）
+function agentDisplayName(agent) {
+  const name = agent.name || agent.role || '?'
+  return name.replace(/[（(].*$/, '').trim()
+}
+
+// 判断 agent 是否正在调用（圆圈高亮）
+function isAgentActive(role) {
+  return props.activeAgentRoles && props.activeAgentRoles.has(role)
+}
 
 async function fetchConversations() {
   loadingConversations.value = true
@@ -51,6 +102,7 @@ function formatTime(ts) {
 
 onMounted(() => {
   fetchConversations()
+  fetchAgents()
 })
 
 // 切回对话视图时刷新列表（新对话/消息后自动更新）
@@ -67,7 +119,8 @@ watch(() => props.refreshKey, () => {
 <template>
   <div class="sidebar-layout">
     <nav class="activity-bar">
-      <div class="activity-top">
+      <span class="activity-indicator" :style="{ transform: 'translateY(' + indicatorOffsetY + 'px)' }"></span>
+      <div class="activity-top" ref="activityTopRef">
         <button class="activity-btn" :class="{ active: activeView === 'chat' }" title="对话" @click="emit('navigate', 'chat')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
         </button>
@@ -133,9 +186,15 @@ watch(() => props.refreshKey, () => {
 
       <div class="sidebar-section">
         <div class="section-label">Agent</div>
-        <div class="agent-item active">
-          <span class="agent-dot"></span>
-          <span>论文写作智能体</span>
+        <div
+          v-for="agent in agents"
+          :key="agent.role"
+          class="agent-item"
+          :class="{ active: isAgentActive(agent.role) }"
+          :title="agent.description || agent.name"
+        >
+          <span class="agent-dot" :class="{ glowing: isAgentActive(agent.role) }"></span>
+          <span>{{ agentDisplayName(agent) }}</span>
         </div>
       </div>
 
@@ -160,9 +219,19 @@ watch(() => props.refreshKey, () => {
   border-right: 1px solid var(--border-light);
   display: flex; flex-direction: column; justify-content: space-between;
   padding: 5px 0;
+  position: relative;
 }
 .activity-top, .activity-bottom {
   display: flex; flex-direction: column; align-items: center; gap: 0;
+}
+/* 滑动指示器：独立竖条，跟随激活按钮位移 */
+.activity-indicator {
+  position: absolute; left: 0; top: 0;
+  width: 2px; height: 18px;
+  background: var(--accent); border-radius: 0 2px 2px 0;
+  transition: transform 0.34s var(--ease-spring);
+  z-index: 1; pointer-events: none;
+  /* translateY 由 JS 计算，对齐到激活按钮垂直中心 */
 }
 .activity-btn {
   width: 32px; height: 32px; border: none; border-radius: 6px;
@@ -173,10 +242,6 @@ watch(() => props.refreshKey, () => {
 }
 .activity-btn:hover { color: var(--text-secondary); background: var(--bg-hover); }
 .activity-btn.active { color: var(--accent); background: var(--accent-soft); }
-.activity-btn.active::before {
-  content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
-  width: 2px; height: 18px; background: var(--accent); border-radius: 0 2px 2px 0;
-}
 
 /* ── Expanded Sidebar: 188px ── */
 .expanded-sidebar {
@@ -200,7 +265,7 @@ watch(() => props.refreshKey, () => {
   color: white; font-family: var(--font-sans); font-size: 11.5px; font-weight: 600;
   cursor: pointer; transition: all 0.18s var(--ease-out-expo); width: 100%;
 }
-.new-chat-btn:hover { background: var(--accent-hover); }
+.new-chat-btn:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(13, 148, 136, 0.22); }
 
 .chat-list-empty {
   font-size: 11px; color: var(--text-faint); padding: 10px 6px; text-align: center;
@@ -248,13 +313,28 @@ watch(() => props.refreshKey, () => {
 
 .agent-item {
   display: flex; align-items: center; gap: 7px;
-  padding: 6px 10px; border-radius: var(--radius-sm);
-  font-size: 12px; color: var(--text-secondary); cursor: pointer;
-  transition: background 0.15s var(--ease-out-expo);
+  padding: 5px 8px; border-radius: var(--radius-sm);
+  font-size: 11.5px; color: var(--text-secondary);
+  cursor: default; transition: all 0.18s var(--ease-out-expo);
 }
 .agent-item:hover { background: var(--bg-hover); }
-.agent-item.active { background: var(--accent-soft); color: var(--accent); }
-.agent-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.agent-item.active { color: var(--accent); }
+/* 圆圈：默认灰色，调用中高亮 accent + 发光脉冲 */
+.agent-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+  transition: background 0.2s var(--ease-out-expo), box-shadow 0.2s var(--ease-out-expo);
+}
+.agent-dot.glowing {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent), 0 0 2px var(--accent);
+  animation: agent-pulse 1.2s ease-in-out infinite;
+}
+@keyframes agent-pulse {
+  0%, 100% { box-shadow: 0 0 4px var(--accent), 0 0 1px var(--accent); }
+  50%      { box-shadow: 0 0 8px var(--accent), 0 0 3px var(--accent); }
+}
 
 .sidebar-footer {
   margin-top: auto; padding-top: 8px;

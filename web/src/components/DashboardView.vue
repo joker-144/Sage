@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
+import { useCountUp } from '../composables/useCountUp'
 
 const props = defineProps({
   activeView: { type: String, default: '' },
@@ -11,7 +12,7 @@ const stats = ref({
   todayToolCalls: 0,
   totalTokens: 0,
   activeAgents: 0,
-  apiVersion: '0.6.5',
+  apiVersion: '1.0.0',
 })
 
 const tokenStats = ref({
@@ -24,6 +25,18 @@ const tokenStats = ref({
   today_tokens: 0,
   today_calls: 0,
 })
+
+// 数字滚动显示值（加载完成后从 0 平滑动画到目标值）
+const todayConvDisp = useCountUp(() => stats.value.todayConversations)
+const todayMsgDisp = useCountUp(() => stats.value.todayMessages)
+const todayToolDisp = useCountUp(() => stats.value.todayToolCalls)
+const activeAgentsDisp = useCountUp(() => stats.value.activeAgents)
+const todayTokensDisp = useCountUp(() => tokenStats.value.today_tokens)
+const totalTokensDisp = useCountUp(() => tokenStats.value.total_tokens)
+const todayPromptDisp = useCountUp(() => tokenStats.value.today_prompt)
+const todayCompletionDisp = useCountUp(() => tokenStats.value.today_completion)
+const totalPromptDisp = useCountUp(() => tokenStats.value.total_prompt)
+const totalCompletionDisp = useCountUp(() => tokenStats.value.total_completion)
 
 const loading = ref(true)
 
@@ -42,7 +55,7 @@ async function loadStats() {
     ])
     if (healthRes.status === 'fulfilled') {
       const h = await healthRes.value.json()
-      stats.value.apiVersion = h.version || '0.6.5'
+      stats.value.apiVersion = h.version || '1.0.0'
     }
     if (memRes.status === 'fulfilled') {
       const m = await memRes.value.json()
@@ -71,6 +84,13 @@ const quickActions = [
   { icon: 'WR', label: '撰写段落', prompt: '请撰写论文以下章节的段落，结合文献库引用支撑文献：' },
   { icon: 'PL', label: '学术润色', prompt: '请对以下论文段落进行学术化润色，消除口语化表达：' },
 ]
+
+// 卡片聚光效果：鼠标移动时更新 CSS 变量，驱动径向渐变光晕
+function handleCardGlow(e) {
+  const rect = e.currentTarget.getBoundingClientRect()
+  e.currentTarget.style.setProperty('--mx', `${e.clientX - rect.left}px`)
+  e.currentTarget.style.setProperty('--my', `${e.clientY - rect.top}px`)
+}
 </script>
 
 <template>
@@ -81,44 +101,54 @@ const quickActions = [
     </header>
 
     <!-- 统计卡片 -->
-    <div class="stats-grid">
-      <div class="stat-card">
+    <div class="stats-grid" v-if="!loading">
+      <div class="stat-card" @mousemove="handleCardGlow">
         <div class="stat-icon-wrap" style="background: rgba(13, 148, 136, 0.10); color: var(--accent);">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
         </div>
         <div class="stat-info">
-          <div class="stat-value">{{ stats.todayConversations }}</div>
+          <div class="stat-value">{{ todayConvDisp }}</div>
           <div class="stat-label">今日对话数</div>
         </div>
       </div>
 
-      <div class="stat-card">
+      <div class="stat-card" @mousemove="handleCardGlow">
         <div class="stat-icon-wrap" style="background: rgba(16, 185, 129, 0.10); color: var(--success);">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><polyline points="14 2 14 8 20 8" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><line x1="16" y1="13" x2="8" y2="13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="16" y1="17" x2="8" y2="17" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         </div>
         <div class="stat-info">
-          <div class="stat-value">{{ stats.todayMessages }}</div>
+          <div class="stat-value">{{ todayMsgDisp }}</div>
           <div class="stat-label">消息数量</div>
         </div>
       </div>
 
-      <div class="stat-card">
+      <div class="stat-card" @mousemove="handleCardGlow">
         <div class="stat-icon-wrap" style="background: rgba(245, 158, 11, 0.10); color: var(--warning);">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><polyline points="16 18 22 12 16 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><polyline points="8 6 2 12 8 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </div>
         <div class="stat-info">
-          <div class="stat-value">{{ stats.todayToolCalls }}</div>
+          <div class="stat-value">{{ todayToolDisp }}</div>
           <div class="stat-label">工具调用</div>
         </div>
       </div>
 
-      <div class="stat-card">
+      <div class="stat-card" @mousemove="handleCardGlow">
         <div class="stat-icon-wrap" style="background: rgba(139, 92, 246, 0.10); color: #8b5cf6;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/><path d="M12 6v6l4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         </div>
         <div class="stat-info">
-          <div class="stat-value">{{ stats.activeAgents }}</div>
+          <div class="stat-value">{{ activeAgentsDisp }}</div>
           <div class="stat-label">活跃上下文</div>
+        </div>
+      </div>
+    </div>
+    <!-- 统计卡片骨架屏（加载中） -->
+    <div class="stats-grid" v-else>
+      <div class="stat-card" v-for="i in 4" :key="i">
+        <div class="skeleton" style="width:40px;height:40px;border-radius:8px;flex-shrink:0"></div>
+        <div class="stat-info">
+          <div class="skeleton" style="width:64px;height:24px"></div>
+          <div class="skeleton" style="width:52px;height:12px;margin-top:6px"></div>
         </div>
       </div>
     </div>
@@ -126,34 +156,42 @@ const quickActions = [
     <!-- Token 用量统计 -->
     <div class="section">
       <h2>Token 用量统计</h2>
-      <div class="token-grid">
-        <div class="token-card highlight">
+      <div class="token-grid" v-if="!loading">
+        <div class="token-card highlight" @mousemove="handleCardGlow">
           <div class="token-label">今日 Token</div>
-          <div class="token-value">{{ fmt(tokenStats.today_tokens) }}</div>
+          <div class="token-value">{{ fmt(todayTokensDisp) }}</div>
           <div class="token-sub">{{ tokenStats.today_calls }} 次调用</div>
         </div>
-        <div class="token-card">
+        <div class="token-card" @mousemove="handleCardGlow">
           <div class="token-label">累计 Token</div>
-          <div class="token-value">{{ fmt(tokenStats.total_tokens) }}</div>
+          <div class="token-value">{{ fmt(totalTokensDisp) }}</div>
           <div class="token-sub">{{ tokenStats.total_calls }} 次调用</div>
         </div>
-        <div class="token-card">
+        <div class="token-card" @mousemove="handleCardGlow">
           <div class="token-label">今日输入 / 输出</div>
           <div class="token-value-split">
-            <span class="in">{{ fmt(tokenStats.today_prompt) }}</span>
+            <span class="in">{{ fmt(todayPromptDisp) }}</span>
             <span class="sep">/</span>
-            <span class="out">{{ fmt(tokenStats.today_completion) }}</span>
+            <span class="out">{{ fmt(todayCompletionDisp) }}</span>
           </div>
           <div class="token-sub">prompt / completion</div>
         </div>
-        <div class="token-card">
+        <div class="token-card" @mousemove="handleCardGlow">
           <div class="token-label">累计输入 / 输出</div>
           <div class="token-value-split">
-            <span class="in">{{ fmt(tokenStats.total_prompt) }}</span>
+            <span class="in">{{ fmt(totalPromptDisp) }}</span>
             <span class="sep">/</span>
-            <span class="out">{{ fmt(tokenStats.total_completion) }}</span>
+            <span class="out">{{ fmt(totalCompletionDisp) }}</span>
           </div>
           <div class="token-sub">prompt / completion</div>
+        </div>
+      </div>
+      <!-- Token 骨架屏（加载中） -->
+      <div class="token-grid" v-else>
+        <div class="token-card" v-for="i in 4" :key="i">
+          <div class="skeleton" style="width:72px;height:12px"></div>
+          <div class="skeleton" style="width:96px;height:22px;margin-top:8px"></div>
+          <div class="skeleton" style="width:60px;height:12px;margin-top:8px"></div>
         </div>
       </div>
     </div>
@@ -162,7 +200,7 @@ const quickActions = [
     <div class="section">
       <h2>快捷操作</h2>
       <div class="quick-grid">
-        <div v-for="act in quickActions" :key="act.label" class="quick-card">
+        <div v-for="act in quickActions" :key="act.label" class="quick-card" @mousemove="handleCardGlow">
           <div class="quick-icon">{{ act.icon }}</div>
           <div class="quick-label">{{ act.label }}</div>
           <div class="quick-prompt">{{ act.prompt }}</div>
@@ -193,6 +231,7 @@ const quickActions = [
 .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 30px; }
 
 .stat-card {
+  position: relative; overflow: hidden;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -204,6 +243,14 @@ const quickActions = [
 .stat-card:nth-child(2) { animation-delay: 0.04s; }
 .stat-card:nth-child(3) { animation-delay: 0.08s; }
 .stat-card:nth-child(4) { animation-delay: 0.12s; }
+.stat-card::before {
+  content: ''; position: absolute; inset: 0; z-index: 0;
+  background: radial-gradient(260px circle at var(--mx, -200px) var(--my, -200px), var(--accent-glow), transparent 65%);
+  opacity: 0; transition: opacity 0.25s var(--ease-out-expo);
+  pointer-events: none;
+}
+.stat-card:hover::before { opacity: 1; }
+.stat-card > * { position: relative; z-index: 1; }
 .stat-card:hover {
   border-color: var(--border-strong);
   transform: translateY(-1px);
@@ -224,12 +271,21 @@ const quickActions = [
 /* Token 统计 */
 .token-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .token-card {
+  position: relative; overflow: hidden;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 14px 16px;
   transition: all 0.2s var(--ease-out-expo);
 }
+.token-card::before {
+  content: ''; position: absolute; inset: 0; z-index: 0;
+  background: radial-gradient(240px circle at var(--mx, -200px) var(--my, -200px), var(--accent-glow), transparent 65%);
+  opacity: 0; transition: opacity 0.25s var(--ease-out-expo);
+  pointer-events: none;
+}
+.token-card:hover::before { opacity: 1; }
+.token-card > * { position: relative; z-index: 1; }
 .token-card:hover {
   border-color: var(--border-strong);
   box-shadow: var(--shadow-sm);
@@ -248,6 +304,7 @@ const quickActions = [
 
 .quick-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 9px; }
 .quick-card {
+  position: relative; overflow: hidden;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -255,6 +312,14 @@ const quickActions = [
   cursor: pointer;
   transition: all 0.18s var(--ease-out-expo);
 }
+.quick-card::before {
+  content: ''; position: absolute; inset: 0; z-index: 0;
+  background: radial-gradient(280px circle at var(--mx, -200px) var(--my, -200px), var(--accent-glow), transparent 65%);
+  opacity: 0; transition: opacity 0.25s var(--ease-out-expo);
+  pointer-events: none;
+}
+.quick-card:hover::before { opacity: 1; }
+.quick-card > * { position: relative; z-index: 1; }
 .quick-card:hover {
   background: var(--bg-card);
   border-color: var(--accent-border);

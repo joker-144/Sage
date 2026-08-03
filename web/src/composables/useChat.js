@@ -1,4 +1,4 @@
-import { ref, nextTick } from 'vue'
+import { ref, reactive, nextTick } from 'vue'
 import { usePoolMode } from './usePoolMode'
 
 const SSE_TIMEOUT_MS = 60000   // 60 秒无响应超时（配合后端 10s 心跳保活）
@@ -23,6 +23,10 @@ export function useChat() {
   const messageSentCount = ref(0)  // 每发一条消息+1，父组件 watch 后刷新侧栏
   const writingMode = ref(false)  // 写作模式开关（智能选择流程：简单任务单Agent，复杂任务多智能体）
 
+  // 当前正在调用的智能体 role 集合（用于侧边栏圆圈高亮）
+  // 写作模式：collaborate 事件的 role；单 Agent 模式：load_skill 触发 'general'
+  const activeAgentRoles = reactive(new Set())
+
   let currentAssistant = null
   let abortController = null
 
@@ -43,6 +47,8 @@ export function useChat() {
       abortController.abort()
       abortController = null
     }
+    // 清空智能体高亮状态
+    activeAgentRoles.clear()
   }
 
   async function loadConversation(convId) {
@@ -220,6 +226,8 @@ export function useChat() {
       if (currentAssistant && !currentAssistant.content && currentAssistant.tools.length === 0) {
         currentAssistant.content = '（已取消）'
       }
+      // 取消时清空所有智能体高亮
+      activeAgentRoles.clear()
     }
   }
 
@@ -264,6 +272,8 @@ export function useChat() {
       if (statusText.value === 'Agent 思考中...' || statusText.value.startsWith('执行:')) {
         statusText.value = '系统就绪'
       }
+      // 流结束/出错时确保所有高亮复位
+      activeAgentRoles.clear()
     }
   }
 
@@ -401,6 +411,29 @@ export function useChat() {
         scrollToBottom()
         break
 
+      case 'delete_confirm_required': {
+        // delete_file 工具请求用户确认删除
+        const { token, path, type } = data
+        const typeLabel = type === '目录' ? '目录及其所有内容' : '文件'
+        const confirmed = window.confirm(
+          `智能体请求删除以下${typeLabel}：\n\n${path}\n\n确认删除吗？此操作不可恢复。`
+        )
+        // 调用后端确认端点
+        fetch('/api/sage/confirm-delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, confirmed }),
+        }).catch(() => {})
+        // 在工具区显示确认状态
+        if (currentAssistant.tools.length > 0) {
+          const last = currentAssistant.tools[currentAssistant.tools.length - 1]
+          last.result = confirmed ? `已确认删除: ${path}` : `已取消删除: ${path}`
+          last.done = true
+        }
+        scrollToBottom()
+        break
+      }
+
       case 'reasoning':
         // 模型思考内容（reasoning_content）— 拼接到 currentAssistant.reasoning
         currentAssistant.reasoning = (currentAssistant.reasoning || '') + (data.content || '')
@@ -446,6 +479,8 @@ export function useChat() {
 
           // 将协作进度作为工具调用展示（便于用户看到流程）
           if (data.phase === 'start' || data.phase === 'plan') {
+            // 智能体开始工作 → 高亮
+            activeAgentRoles.add(data.role)
             currentAssistant.tools.push({
               name: `collaborate_${data.role}`,
               args: { phase: data.phase },
@@ -458,6 +493,8 @@ export function useChat() {
               agentName: label,
             })
           } else if (data.phase === 'done' || data.phase === 'reflection') {
+            // 智能体完成 → 取消高亮
+            activeAgentRoles.delete(data.role)
             // 更新最后一个对应角色的协作工具状态
             const last = [...currentAssistant.tools].reverse().find(
               t => t.isCollaborate && t.name === `collaborate_${data.role}` && !t.done
@@ -521,6 +558,7 @@ export function useChat() {
     messagesRef,
     messageSentCount,
     writingMode,
+    activeAgentRoles,
     sendMessage,
     cancel,
     reset,

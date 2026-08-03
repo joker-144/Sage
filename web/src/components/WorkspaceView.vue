@@ -435,6 +435,13 @@ const selectedWsInfo = computed(() => {
   return workspaces.value.find(w => w.id === selectedWs.value)
 })
 
+// 卡片聚光效果：鼠标移动时更新 CSS 变量，驱动径向渐变光晕
+function handleCardGlow(e) {
+  const rect = e.currentTarget.getBoundingClientRect()
+  e.currentTarget.style.setProperty('--mx', `${e.clientX - rect.left}px`)
+  e.currentTarget.style.setProperty('--my', `${e.clientY - rect.top}px`)
+}
+
 onMounted(() => {
   loadWorkspaces()
   syncPoolMode()
@@ -489,7 +496,16 @@ onMounted(() => {
         <span>全选池模式已启用 — 对话检索将覆盖全部 {{ workspaces.length }} 个工作空间</span>
       </div>
 
-      <div v-if="loading" class="loading-state">加载中...</div>
+      <div v-if="loading" class="ws-grid">
+        <div class="ws-card" v-for="i in 3" :key="i">
+          <div class="ws-card-header">
+            <div class="skeleton" style="width:64px;height:22px;border-radius:11px"></div>
+          </div>
+          <div class="skeleton" style="width:80%;height:16px;margin-top:14px"></div>
+          <div class="skeleton" style="width:55%;height:13px;margin-top:10px"></div>
+          <div class="skeleton" style="width:100%;height:13px;margin-top:6px"></div>
+        </div>
+      </div>
 
       <div v-else-if="workspaces.length === 0" class="empty-state">
         <div class="empty-icon">
@@ -510,6 +526,7 @@ onMounted(() => {
           tabindex="0"
           @click="viewPapers(ws.id)"
           @keydown.enter="viewPapers(ws.id)"
+          @mousemove="handleCardGlow"
         >
           <span v-if="ws.id === activeWsId" class="ws-active-badge">当前</span>
           <div class="ws-card-header">
@@ -584,7 +601,15 @@ onMounted(() => {
       </div>
 
       <!-- 论文列表 -->
-      <div v-if="papersLoading" class="loading-state">加载中...</div>
+      <div v-if="papersLoading" class="paper-list">
+        <div class="paper-item" v-for="i in 4" :key="i">
+          <div class="skeleton" style="width:36px;height:36px;border-radius:8px;flex-shrink:0"></div>
+          <div class="paper-info">
+            <div class="skeleton" style="width:70%;height:14px"></div>
+            <div class="skeleton" style="width:50%;height:12px;margin-top:8px"></div>
+          </div>
+        </div>
+      </div>
 
       <div v-else-if="papers.length === 0" class="empty-state">
         <div class="empty-icon">
@@ -785,7 +810,7 @@ onMounted(() => {
   transition: all 0.18s var(--ease-out-expo);
 }
 .btn-primary { color: white; background: var(--accent); }
-.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(13, 148, 136, 0.22); }
 .btn-secondary { color: var(--text-secondary); background: var(--bg-surface); border: 1px solid var(--border); }
 .btn-secondary:hover { border-color: var(--accent-border); color: var(--text-primary); }
 .btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -828,6 +853,15 @@ onMounted(() => {
   transition: transform 0.18s var(--ease-out-expo), box-shadow 0.18s var(--ease-out-expo), border-color 0.18s var(--ease-out-expo), background 0.18s var(--ease-out-expo);
   display: flex; flex-direction: column; gap: 12px; cursor: pointer;
 }
+.ws-card::before {
+  content: ''; position: absolute; inset: 0; z-index: 0;
+  border-radius: inherit;
+  background: radial-gradient(300px circle at var(--mx, -200px) var(--my, -200px), var(--accent-glow), transparent 65%);
+  opacity: 0; transition: opacity 0.25s var(--ease-out-expo);
+  pointer-events: none;
+}
+.ws-card:hover::before, .ws-card:focus::before { opacity: 1; }
+.ws-card > *:not(.ws-active-badge) { position: relative; z-index: 1; }
 .ws-card:hover, .ws-card:focus {
   transform: translateY(-2px); border-color: var(--accent-border);
   box-shadow: var(--shadow-md); outline: none;

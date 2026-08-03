@@ -54,6 +54,7 @@ class ToolEngine:
         self.register("write_file", file_ops.write_file, WRITE_FILE_SCHEMA)
         self.register("edit_file", file_ops.edit_file, EDIT_FILE_SCHEMA)
         self.register("list_dir", file_ops.list_dir, LIST_DIR_SCHEMA)
+        self.register("delete_file", file_ops.delete_file, DELETE_FILE_SCHEMA)
 
         # 文献与索引（Sage 专用）
         self.register("index_papers", paper_ops.index_papers, INDEX_PAPERS_SCHEMA)
@@ -139,11 +140,11 @@ READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "读取指定文本文件的内容（支持 .txt, .md, .tex, .bib, .json, .csv 等）。不支持二进制文件（如 .pdf, .docx, .png 等），读取 PDF 请使用 parse_pdf 工具。支持通过行号范围读取部分内容。",
+        "description": "读取指定文本文件的内容（支持 .txt, .md, .tex, .bib, .json, .csv 等）。不支持二进制文件（如 .pdf, .docx, .png 等），读取 PDF 请使用 parse_pdf 工具。支持通过行号范围读取部分内容。路径支持相对路径（相对 workspace）或绝对路径（如 C:\\Users\\用户名\\Desktop\\file.txt）。C 盘仅允许访问当前用户目录，禁止访问 Windows/Program Files 等系统目录。",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "要读取的文件路径（相对 workspace）"},
+                "path": {"type": "string", "description": "要读取的文件路径（相对 workspace 或绝对路径）"},
                 "start_line": {"type": "integer", "description": "起始行号（从 1 开始），默认从头读", "default": 0},
                 "end_line": {"type": "integer", "description": "结束行号，默认读到末尾", "default": 0},
             },
@@ -156,11 +157,11 @@ WRITE_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "write_file",
-        "description": "创建或覆写文件。如果文件已存在会被覆盖，父目录自动创建。",
+        "description": "创建或覆写文件。如果文件已存在会被覆盖，父目录自动创建。路径支持相对路径（相对 workspace）或绝对路径（如 D:\\论文\\draft.md）。C 盘仅允许访问当前用户目录，禁止写入系统目录。",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "要写入的文件路径（相对 workspace）"},
+                "path": {"type": "string", "description": "要写入的文件路径（相对 workspace 或绝对路径）"},
                 "content": {"type": "string", "description": "文件完整内容"},
             },
             "required": ["path", "content"],
@@ -176,11 +177,12 @@ EDIT_FILE_SCHEMA = {
             "通过搜索-替换的方式编辑文件的指定部分。"
             "old_str 必须是文件中唯一匹配的文本片段，否则会报错要求提供更多上下文。"
             "相比 write_file 整文件重写，edit_file 只修改需要改的部分，节省 token 且更安全。"
+            "路径支持相对路径（相对 workspace）或绝对路径。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "要编辑的文件路径（相对 workspace）"},
+                "path": {"type": "string", "description": "要编辑的文件路径（相对 workspace 或绝对路径）"},
                 "old_str": {"type": "string", "description": "要替换的原文（必须精确匹配文件中的内容）"},
                 "new_str": {"type": "string", "description": "替换后的新文本"},
             },
@@ -193,13 +195,29 @@ LIST_DIR_SCHEMA = {
     "type": "function",
     "function": {
         "name": "list_dir",
-        "description": "列出指定目录下的文件和子目录。",
+        "description": "列出指定目录下的文件和子目录。路径支持相对路径（相对 workspace）或绝对路径（如 C:\\Users\\用户名\\Desktop）。C 盘仅允许访问当前用户目录，禁止访问系统目录。",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目录路径（相对 workspace），默认为根目录", "default": "."},
+                "path": {"type": "string", "description": "目录路径（相对 workspace 或绝对路径），默认为 workspace 根目录", "default": "."},
             },
             "required": [],
+        },
+    },
+}
+
+DELETE_FILE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "delete_file",
+        "description": "删除文件或目录（需用户确认后才实际执行）。路径支持相对路径或绝对路径。删除目录时需设置 recursive=true。每次删除都会弹出确认对话框，用户点击确认后才执行。禁止删除系统目录。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "要删除的文件或目录路径（相对 workspace 或绝对路径）"},
+                "recursive": {"type": "boolean", "description": "删除目录时是否递归删除子内容", "default": False},
+            },
+            "required": ["path"],
         },
     },
 }

@@ -1033,7 +1033,7 @@ function closeDownloadModal() {
 </template>
 
 <style scoped>
-.settings { flex: 1; overflow-y: auto; padding: 30px; max-width: 660px; margin: 0 auto; }
+.settings { flex: 1; overflow-y: auto; padding: 30px; max-width: 660px; margin: 0 auto; display: flex; flex-direction: column; }
 
 .settings-header { margin-bottom: 22px; }
 .settings-header h1 { font-size: 21px; font-weight: 650; color: var(--text-primary); letter-spacing: -0.01em; }
@@ -1059,7 +1059,7 @@ function closeDownloadModal() {
   box-shadow: 0 1px 3px rgba(0,0,0,0.06);
   font-weight: 600;
 }
-.tab-content { animation: tab-fade-in 0.18s var(--ease-out-expo); }
+.tab-content { animation: tab-fade-in 0.18s var(--ease-out-expo); flex: 1; }
 @keyframes tab-fade-in {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }

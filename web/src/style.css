@@ -111,6 +111,18 @@ html, body {
   to   { opacity: 1; transform: scale(1); }
 }
 
+/* ── 骨架屏闪烁动画 ── */
+@keyframes shimmer {
+  0%   { background-position: -200px 0; }
+  100% { background-position: calc(200px + 100%) 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-hover) 25%, var(--border-light) 50%, var(--bg-hover) 75%);
+  background-size: 200px 100%;
+  animation: shimmer 1.4s infinite linear;
+  border-radius: var(--radius-sm);
+}
+
 .fade-enter-active,.fade-leave-active { transition: opacity 0.2s var(--ease-out-expo); }
 .fade-enter-from,.fade-leave-to { opacity: 0; }
 .modal-enter-active,.modal-leave-active { transition: all 0.22s var(--ease-out-expo); }
@@ -118,8 +130,16 @@ html, body {
 .slide-right-enter-active,.slide-right-leave-active { transition: all 0.22s var(--ease-out-expo); }
 .slide-right-enter-from,.slide-right-leave-to { opacity: 0; transform: translateX(16px); }
 
+/* ── 视图切换过渡：仅入场动画，离场瞬间完成避免布局挤压 ── */
+.view-enter-active { transition: opacity 0.28s var(--ease-out-expo), transform 0.28s var(--ease-out-expo); }
+.view-enter-from { opacity: 0; transform: translateY(8px); }
+
 /* ── Global interactive styles ── */
 button { font-family: var(--font-sans); cursor: pointer; }
+/* 通用按压反馈：未自定义 :active 的按钮按下时轻微缩放（已有自定义的 class 不受影响） */
+button:active:not(.send-btn):not(.stop-btn):not(.btn-danger-confirm):not(.activity-btn) {
+  transform: scale(0.97);
+}
 
 input:focus, textarea:focus, select:focus {
   outline: none;

@@ -379,7 +379,23 @@ async def chat_stream(req: ChatRequest):
                         is_agent = bool(event.skill_name) and event.tool_name == "load_skill"
                         yield f"event: tool_start\ndata: {json.dumps({'tool': event.tool_name, 'args': event.tool_args, 'content': event.content, 'tokens': event.tokens or {}, 'is_agent': is_agent, 'agent_name': event.skill_name or ''}, ensure_ascii=False)}\n\n"
                     elif event.type == "tool_result":
-                        yield f"event: tool_result\ndata: {json.dumps({'tool': event.tool_name, 'content': event.content}, ensure_ascii=False)}\n\n"
+                        # 拦截删除确认请求：delete_file 返回 __DELETE_CONFIRM_REQUIRED__ 标记
+                        content = event.content or ""
+                        if "__DELETE_CONFIRM_REQUIRED__" in content:
+                            # 解析 token 和 path
+                            token = ""
+                            del_path = ""
+                            del_type = ""
+                            for line in content.split("\n"):
+                                if line.startswith("token:"):
+                                    token = line.split(":", 1)[1].strip()
+                                elif line.startswith("path:"):
+                                    del_path = line.split(":", 1)[1].strip()
+                                elif line.startswith("type:"):
+                                    del_type = line.split(":", 1)[1].strip()
+                            yield f"event: delete_confirm_required\ndata: {json.dumps({'tool': event.tool_name, 'token': token, 'path': del_path, 'type': del_type}, ensure_ascii=False)}\n\n"
+                        else:
+                            yield f"event: tool_result\ndata: {json.dumps({'tool': event.tool_name, 'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "reasoning":
                         yield f"event: reasoning\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "text":
@@ -2752,6 +2768,28 @@ async def sage_search_external(req: SageExternalSearchRequest):
         "data": result.data if result.success else None,
         "error": result.error if not result.success else None,
     }
+
+
+@app.post("/api/sage/confirm-delete")
+async def sage_confirm_delete(req: dict):
+    """用户确认删除操作
+
+    前端收到 delete_confirm_required SSE 事件后，弹出确认对话框，
+    用户点击确认后调用此端点，传入 token 执行实际删除。
+    """
+    from sage.tools.file_ops import confirm_delete
+
+    token = req.get("token", "")
+    confirmed = req.get("confirmed", False)
+
+    if not token:
+        raise HTTPException(status_code=400, detail="缺少 token")
+
+    if not confirmed:
+        return {"success": False, "message": "用户取消删除"}
+
+    success, message = confirm_delete(token)
+    return {"success": success, "message": message}
 
 
 @app.get("/api/sage/citation-styles")

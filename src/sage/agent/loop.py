@@ -154,7 +154,9 @@ class AgentLoop:
         """初始化对话记录到 SQLite"""
         try:
             store = get_store()
-            if self.conversation_id is None:
+            # 防御：conversation_id 可能为 None 或空字符串（如测试入口传入 ""）
+            # 空字符串会绕过 is None 判断导致写入 id='' 的脏数据
+            if not self.conversation_id:
                 self.conversation_id = str(uuid.uuid4())
             store.create_conversation(self.conversation_id)
         except Exception:

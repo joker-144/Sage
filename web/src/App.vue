@@ -18,7 +18,7 @@ import IndexNotification from './components/IndexNotification.vue'
 
 const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
-  writingMode, sendMessage, cancel, reset, loadConversation, deleteConversation,
+  writingMode, activeAgentRoles, sendMessage, cancel, reset, loadConversation, deleteConversation,
 } = useChat()
 
 const activeView = ref('chat')
@@ -85,6 +85,7 @@ onMounted(() => { reset() })
         :sidebar-expanded="sidebarExpanded"
         :current-conversation-id="conversationId"
         :refresh-key="sidebarRefreshKey"
+        :active-agent-roles="activeAgentRoles"
         @new-chat="handleNewChat"
         @stats="showStats = true"
         @navigate="handleNavigate"
@@ -93,38 +94,50 @@ onMounted(() => { reset() })
       />
 
       <main class="main-content">
-        <div v-show="activeView === 'chat'" class="chat-area">
-          <div class="messages" ref="messagesRef">
-            <div class="messages-inner">
-              <ChatMessage v-for="(msg, i) in messages" :key="i" :message="msg" />
+        <Transition name="view" appear>
+          <div v-show="activeView === 'chat'" class="chat-area">
+            <div class="messages" ref="messagesRef">
+              <div class="messages-inner">
+                <ChatMessage v-for="(msg, i) in messages" :key="i" :message="msg" />
+              </div>
+            </div>
+            <div class="input-section">
+              <div class="input-toolbar">
+                <button
+                  class="collab-toggle"
+                  :class="{ active: writingMode }"
+                  :title="writingMode ? '当前为写作模式（智能选择流程），点击切换单 Agent' : '点击切换到写作模式（智能选择流程）'"
+                  @click="writingMode = !writingMode"
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="6" r="2.5" stroke="currentColor" stroke-width="1.8"/>
+                    <circle cx="6" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
+                    <circle cx="18" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
+                    <path d="M12 8.5v3M9.5 15.5l-2-1M14.5 15.5l2-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                  </svg>
+                  {{ writingMode ? '写作模式' : '单 Agent' }}
+                </button>
+              </div>
+              <ChatInput :disabled="isProcessing" @send="sendMessage" @stop="cancel" @open-settings="activeView = 'settings'" />
             </div>
           </div>
-          <div class="input-section">
-            <div class="input-toolbar">
-              <button
-                class="collab-toggle"
-                :class="{ active: writingMode }"
-                :title="writingMode ? '当前为写作模式（智能选择流程），点击切换单 Agent' : '点击切换到写作模式（智能选择流程）'"
-                @click="writingMode = !writingMode"
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-                  <circle cx="12" cy="6" r="2.5" stroke="currentColor" stroke-width="1.8"/>
-                  <circle cx="6" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
-                  <circle cx="18" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
-                  <path d="M12 8.5v3M9.5 15.5l-2-1M14.5 15.5l2-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                </svg>
-                {{ writingMode ? '写作模式' : '单 Agent' }}
-              </button>
-            </div>
-            <ChatInput :disabled="isProcessing" @send="sendMessage" @stop="cancel" @open-settings="activeView = 'settings'" />
-          </div>
-        </div>
+        </Transition>
 
-        <DashboardView v-show="activeView === 'dashboard'" :active-view="activeView" />
-        <AgentsView v-show="activeView === 'agents'" />
-        <SkillsView v-show="activeView === 'skills'" />
-        <WorkspaceView v-show="activeView === 'workspace'" />
-        <SettingsPanel v-show="activeView === 'settings'" />
+        <Transition name="view" appear>
+          <DashboardView v-show="activeView === 'dashboard'" :active-view="activeView" />
+        </Transition>
+        <Transition name="view" appear>
+          <AgentsView v-show="activeView === 'agents'" />
+        </Transition>
+        <Transition name="view" appear>
+          <SkillsView v-show="activeView === 'skills'" />
+        </Transition>
+        <Transition name="view" appear>
+          <WorkspaceView v-show="activeView === 'workspace'" />
+        </Transition>
+        <Transition name="view" appear>
+          <SettingsPanel v-show="activeView === 'settings'" />
+        </Transition>
       </main>
     </div>
 
