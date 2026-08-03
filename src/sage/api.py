@@ -2058,32 +2058,27 @@ def _fetch_commits_between_versions(current: str, latest: str) -> str:
 
 
 def _parse_compare_commits(compare_data: dict) -> str:
-    """解析 GitHub Compare API 返回的 JSON，提取 commit message 拼接为 changelog
+    """解析 GitHub Compare API 返回的 JSON，提取完整 commit message 拼接为 changelog
 
     格式：
-        • commit 标题1
-        • commit 标题2
+        • commit 完整 message1（可能多行）
+        • commit 完整 message2（可能多行）
         ...
 
-    只取每条 commit message 的第一行（标题），忽略多行 body，
-    保证更新日志简洁可读。对重复的 commit 标题自动去重。
+    保留 commit message 的完整内容（含多行 body），对重复内容自动去重。
     """
     commits = compare_data.get("commits", [])
     if not commits:
         return ""
 
-    seen = set()  # 记录已出现的 commit 标题，用于去重
+    seen = set()  # 记录已出现的 commit message，用于去重
     lines = []
     for c in commits:
         msg = (c.get("commit", {}).get("message") or "").strip()
-        if not msg:
+        if not msg or msg in seen:
             continue
-        # 只取第一行（标题），跳过 merge commit 等无意义信息
-        first_line = msg.split("\n", 1)[0].strip()
-        if not first_line or first_line in seen:
-            continue
-        seen.add(first_line)
-        lines.append(f"• {first_line}")
+        seen.add(msg)
+        lines.append(f"• {msg}")
 
     return "\n".join(lines) if lines else ""
 

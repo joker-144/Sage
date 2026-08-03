@@ -12,7 +12,7 @@ const stats = ref({
   todayToolCalls: 0,
   totalTokens: 0,
   activeAgents: 0,
-  apiVersion: '1.0.0',
+  apiVersion: '1.0.1',
 })
 
 const tokenStats = ref({
@@ -55,7 +55,7 @@ async function loadStats() {
     ])
     if (healthRes.status === 'fulfilled') {
       const h = await healthRes.value.json()
-      stats.value.apiVersion = h.version || '1.0.0'
+      stats.value.apiVersion = h.version || '1.0.1'
     }
     if (memRes.status === 'fulfilled') {
       const m = await memRes.value.json()
