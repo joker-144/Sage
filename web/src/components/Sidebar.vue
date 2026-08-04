@@ -5,19 +5,20 @@ const props = defineProps({
   statusText: { type: String, default: '就绪' },
   isProcessing: { type: Boolean, default: false },
   activeView: { type: String, default: 'chat' },
-  sidebarExpanded: { type: Boolean, default: true },
+  sidebarExpanded: { type: Boolean, default: false },
+  historyPanelVisible: { type: Boolean, default: true },
   currentConversationId: { type: String, default: null },
   refreshKey: { type: Number, default: 0 },
   activeAgentRoles: { type: Set, default: () => new Set() },
 })
-const emit = defineEmits(['new-chat', 'stats', 'navigate', 'load-conversation', 'delete-conversation'])
+const emit = defineEmits(['new-chat', 'stats', 'navigate', 'load-conversation', 'delete-conversation', 'toggle-sidebar', 'toggle-history-panel'])
 
 // 滑动指示器：跟随激活按钮位移
 const activityTopRef = ref(null)
 const indicatorOffsetY = ref(0)
 
-// Activity Bar 顶部 6 个视图按钮的顺序（与模板一致）
-const VIEW_ORDER = ['chat', 'dashboard', 'agents', 'skills', 'workspace', 'settings']
+// Activity Bar 顶部视图按钮的顺序（与模板一致）
+const VIEW_ORDER = ['chat', 'dashboard', 'agents', 'custom-agents', 'skills', 'workspace', 'settings']
 
 function updateIndicator() {
   const container = activityTopRef.value
@@ -26,8 +27,7 @@ function updateIndicator() {
   if (idx < 0) return
   const btn = container.children[idx]
   if (!btn) return
-  // 指示器竖条居中对齐到按钮：按钮相对容器顶部的偏移 + 按钮高度/2 - 竖条高度/2
-  // 竖条高度 18px（见 CSS），按钮高度 32px，居中即 offsetTop + (32-18)/2 = offsetTop + 7
+  // 指示器竖条居中对齐到按钮
   indicatorOffsetY.value = btn.offsetTop + (btn.offsetHeight - 18) / 2
 }
 
@@ -35,6 +35,7 @@ onMounted(() => {
   nextTick(updateIndicator)
 })
 watch(() => props.activeView, () => nextTick(updateIndicator))
+watch(() => props.sidebarExpanded, () => nextTick(updateIndicator))
 
 const conversations = ref([])
 const APP_VERSION = __APP_VERSION__
@@ -83,12 +84,8 @@ async function fetchConversations() {
 
 function formatTime(ts) {
   if (!ts) return ''
-  // SQLite CURRENT_TIMESTAMP 返回 UTC 时间字符串（"YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD"）
-  // 必须显式标记为 UTC（加 'Z' 后缀），否则 new Date() 按本地时区解析，
-  // 在 UTC+8 时区下会少 8 小时（表现为"8 小时前"）
   let normalized = String(ts).replace(' ', 'T')
   if (normalized.length === 10) normalized += 'T00:00:00'
-  // 末尾追加 Z 标记为 UTC 时间（若未带时区标记）
   if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized)) normalized += 'Z'
   const d = new Date(normalized)
   if (isNaN(d.getTime())) return ''
@@ -105,7 +102,7 @@ onMounted(() => {
   fetchAgents()
 })
 
-// 切回对话视图时刷新列表（新对话/消息后自动更新）
+// 切回对话视图时刷新列表
 watch(() => props.activeView, (v) => {
   if (v === 'chat') fetchConversations()
 })
@@ -117,38 +114,60 @@ watch(() => props.refreshKey, () => {
 </script>
 
 <template>
-  <div class="sidebar-layout">
+  <div class="sidebar-layout" :class="{ collapsed: !sidebarExpanded }">
     <nav class="activity-bar">
       <span class="activity-indicator" :style="{ transform: 'translateY(' + indicatorOffsetY + 'px)' }"></span>
       <div class="activity-top" ref="activityTopRef">
         <button class="activity-btn" :class="{ active: activeView === 'chat' }" title="对话" @click="emit('navigate', 'chat')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">对话</span>
         </button>
         <button class="activity-btn" :class="{ active: activeView === 'dashboard' }" title="仪表盘" @click="emit('navigate', 'dashboard')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.6"/><rect x="14" y="3" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.6"/><rect x="3" y="14" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.6"/><rect x="14" y="14" width="7" height="7" rx="1" stroke="currentColor" stroke-width="1.6"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">仪表盘</span>
         </button>
         <button class="activity-btn" :class="{ active: activeView === 'agents' }" title="智能体" @click="emit('navigate', 'agents')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">智能体</span>
+        </button>
+        <button class="activity-btn" :class="{ active: activeView === 'custom-agents' }" title="自定义智能体" @click="emit('navigate', 'custom-agents')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.6"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">自定义智能体</span>
         </button>
         <button class="activity-btn" :class="{ active: activeView === 'skills' }" title="技能" @click="emit('navigate', 'skills')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18M5 12h4m-4 4h4m-4 4h10a2 2 0 002-2v-4M3 9h18" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">技能</span>
         </button>
         <button class="activity-btn" :class="{ active: activeView === 'workspace' }" title="工作区" @click="emit('navigate', 'workspace')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">工作区</span>
         </button>
         <button class="activity-btn" :class="{ active: activeView === 'settings' }" title="设置" @click="emit('navigate', 'settings')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.6"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">设置</span>
         </button>
       </div>
       <div class="activity-bottom">
         <button class="activity-btn" title="记忆统计" @click="emit('stats')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 19V10M10 19V4M16 19v-7M22 19H2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">记忆统计</span>
+        </button>
+        <button class="activity-btn toggle-btn" :title="sidebarExpanded ? '收缩侧边栏' : '展开侧边栏'" @click="emit('toggle-sidebar')">
+          <svg v-if="sidebarExpanded" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M15 18l-6-6 6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">收缩</span>
         </button>
       </div>
     </nav>
 
-    <!-- Expanded Sidebar Panel: 仅在对话页面显示，可收缩 -->
-    <aside v-show="sidebarExpanded && activeView === 'chat'" class="expanded-sidebar">
+    <!-- History Panel: 由面板顶部按钮独立控制，不受 Activity Bar 收缩状态影响 -->
+    <aside v-show="historyPanelVisible && activeView === 'chat'" class="expanded-sidebar">
+      <div class="history-panel-header">
+        <span class="panel-title">历史</span>
+        <button class="panel-collapse-btn" title="收起历史面板" @click="emit('toggle-history-panel')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M15 18l-6-6 6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
       <div class="sidebar-section">
         <div class="section-label">对话</div>
         <button class="new-chat-btn" @click="emit('new-chat')">
@@ -206,44 +225,70 @@ watch(() => props.refreshKey, () => {
         <span class="version-tag">v{{ APP_VERSION }}</span>
       </div>
     </aside>
+
+    <!-- 历史面板收起时的展开条：仅在对话页且面板隐藏时显示 -->
+    <button
+      v-show="!historyPanelVisible && activeView === 'chat'"
+      class="history-collapsed-bar"
+      title="展开历史面板"
+      @click="emit('toggle-history-panel')"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
   </div>
 </template>
 
 <style scoped>
 .sidebar-layout { display: flex; flex-shrink: 0; height: 100%; }
 
-/* ── Activity Bar: 40px ── */
+/* ── Activity Bar ── */
 .activity-bar {
-  width: 40px; flex-shrink: 0;
+  flex-shrink: 0;
   background: var(--bg-surface);
   border-right: 1px solid var(--border-light);
   display: flex; flex-direction: column; justify-content: space-between;
   padding: 5px 0;
   position: relative;
+  transition: width 0.25s var(--ease-out-expo);
+  width: 160px;
 }
+.sidebar-layout.collapsed .activity-bar { width: 40px; }
+
 .activity-top, .activity-bottom {
-  display: flex; flex-direction: column; align-items: center; gap: 0;
+  display: flex; flex-direction: column; gap: 0;
 }
-/* 滑动指示器：独立竖条，跟随激活按钮位移 */
+/* 滑动指示器 */
 .activity-indicator {
   position: absolute; left: 0; top: 0;
   width: 2px; height: 18px;
   background: var(--accent); border-radius: 0 2px 2px 0;
   transition: transform 0.34s var(--ease-spring);
   z-index: 1; pointer-events: none;
-  /* translateY 由 JS 计算，对齐到激活按钮垂直中心 */
 }
 .activity-btn {
-  width: 32px; height: 32px; border: none; border-radius: 6px;
+  border: none; border-radius: 6px;
   background: transparent; color: var(--text-faint);
-  display: flex; align-items: center; justify-content: center;
+  display: flex; align-items: center; gap: 10px;
   cursor: pointer; transition: all 0.18s var(--ease-out-expo);
   position: relative;
+  /* 收缩态：居中方形按钮 */
+  width: 32px; height: 32px; margin: 0 auto;
+  justify-content: center;
+}
+.sidebar-layout:not(.collapsed) .activity-btn {
+  /* 展开态：带文字标签 */
+  width: calc(100% - 12px); height: 32px; margin: 0 6px;
+  justify-content: flex-start; padding: 0 10px;
 }
 .activity-btn:hover { color: var(--text-secondary); background: var(--bg-hover); }
 .activity-btn.active { color: var(--accent); background: var(--accent-soft); }
 
-/* ── Expanded Sidebar: 188px ── */
+.btn-label {
+  font-size: 12px; font-weight: 500; white-space: nowrap;
+  font-family: var(--font-sans);
+}
+
+/* ── Expanded Sidebar: 仅对话页面显示 ── */
 .expanded-sidebar {
   width: 188px; flex-shrink: 0;
   background: var(--bg-elevated);
@@ -251,6 +296,38 @@ watch(() => props.refreshKey, () => {
   display: flex; flex-direction: column;
   padding: 10px 8px 8px;
 }
+
+/* 历史面板顶部标题栏 + 折叠按钮 */
+.history-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 6px 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border-light);
+  flex-shrink: 0;
+}
+.panel-title {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--text-faint);
+}
+.panel-collapse-btn {
+  width: 22px; height: 22px; border: none; border-radius: 4px;
+  background: transparent; color: var(--text-faint); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s var(--ease-out-expo);
+}
+.panel-collapse-btn:hover { color: var(--text-secondary); background: var(--bg-hover); }
+
+/* 历史面板收起时的展开条 */
+.history-collapsed-bar {
+  width: 18px; flex-shrink: 0;
+  background: var(--bg-elevated);
+  border: none; border-right: 1px solid var(--border);
+  color: var(--text-faint); cursor: pointer;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 10px 0;
+  transition: all 0.18s var(--ease-out-expo);
+}
+.history-collapsed-bar:hover { color: var(--accent); background: var(--bg-hover); }
 
 .sidebar-section { margin-bottom: 10px; }
 .section-label {
@@ -319,7 +396,6 @@ watch(() => props.refreshKey, () => {
 }
 .agent-item:hover { background: var(--bg-hover); }
 .agent-item.active { color: var(--accent); }
-/* 圆圈：默认灰色，调用中高亮 accent + 发光脉冲 */
 .agent-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--text-faint);
@@ -352,6 +428,8 @@ watch(() => props.refreshKey, () => {
   font-size: 10px; color: var(--text-faint);
   font-family: var(--font-mono);
 }
+
+.toggle-btn { margin-top: 4px !important; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }

@@ -26,6 +26,7 @@ from sage.tools.types import ToolResult
 from sage.tools.file_ops import FileOps
 from sage.tools.paper_ops import PaperOps
 from sage.tools.skill_ops import SkillOps
+from sage.tools.agent_ops import AgentOps
 from sage.tools.web import WebSearchTool, WebSearchProTool, WebFetchTool
 
 
@@ -99,6 +100,10 @@ class ToolEngine:
         self.register("web_search", web_search.web_search, WEB_SEARCH_SCHEMA)
         self.register("web_search_pro", web_search_pro.web_search_pro, WEB_SEARCH_PRO_SCHEMA)
         self.register("web_fetch", web_fetch.web_fetch, WEB_FETCH_SCHEMA)
+
+        # 智能体管理（自主创建 + 审核流程）
+        agent_ops = AgentOps(self.workspace)
+        self.register("create_agent", agent_ops.create_agent, CREATE_AGENT_SCHEMA)
 
     def register(self, name: str, func: Callable[..., Awaitable[ToolResult]], schema: dict[str, Any]):
         """注册工具"""
@@ -689,6 +694,53 @@ WEB_FETCH_SCHEMA = {
                 "max_length": {"type": "integer", "description": "返回内容最大字符数", "default": 8000},
             },
             "required": ["url"],
+        },
+    },
+}
+
+
+# ── 智能体管理 Schema ──
+
+CREATE_AGENT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "create_agent",
+        "description": (
+            "自主创建新智能体并注册到系统。"
+            "创建后会经过审核智能体的安全审查（危险指令/越权行为/失控风险/提示注入/行为边界），"
+            "审核通过才会注册，拒绝则丢弃定义。"
+            "创建的智能体仅单 Agent 模式可用，不参与多智能体协作。"
+            "工具池与现有工具共用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "description": "智能体角色标识（英文小写，如 'translator'），不可与内置角色冲突",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "中文显示名（如 '翻译专家'）",
+                },
+                "name_en": {
+                    "type": "string",
+                    "description": "英文名（如 'Translator'）",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "智能体职责描述",
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "智能体的系统提示词，定义其行为规范和职责边界",
+                },
+                "capabilities": {
+                    "type": "string",
+                    "description": "能力列表，逗号分隔（如 '中英互译,学术术语校对'）",
+                },
+            },
+            "required": ["role", "name", "system_prompt"],
         },
     },
 }

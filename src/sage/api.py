@@ -612,12 +612,30 @@ async def get_agent_info():
 
 @app.get("/api/agents")
 async def list_agents():
-    """获取所有已定义的 Agent 角色列表（含专属技能信息）"""
+    """获取所有已定义的 Agent 角色列表（含专属技能信息 + 自定义标记）"""
     from sage.agents.loader import get_agent_loader
 
     loader = get_agent_loader()
     agents = loader.get_all_role_info()
+    # 标记自定义智能体
+    for agent in agents:
+        agent["is_custom"] = loader.is_custom_agent(agent.get("role", ""))
     return {"agents": agents, "count": len(agents)}
+
+
+@app.delete("/api/agents/{role}")
+async def delete_agent(role: str):
+    """删除自定义智能体（仅允许删除自定义的，不可删除内置）"""
+    from sage.agents.loader import get_agent_loader
+
+    loader = get_agent_loader()
+    # 内置智能体不可删除
+    if not loader.is_custom_agent(role):
+        raise HTTPException(status_code=400, detail=f"内置智能体 '{role}' 不可删除")
+    # 执行删除
+    if loader.delete_custom_agent(role):
+        return {"success": True, "message": f"自定义智能体 '{role}' 已删除"}
+    raise HTTPException(status_code=404, detail=f"自定义智能体 '{role}' 不存在")
 
 
 # ── 工作区管理 API ──

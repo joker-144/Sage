@@ -8,6 +8,7 @@ import ChatMessage from './components/ChatMessage.vue'
 import ChatInput from './components/ChatInput.vue'
 import DashboardView from './components/DashboardView.vue'
 import AgentsView from './components/AgentsView.vue'
+import CustomAgentsView from './components/CustomAgentsView.vue'
 import SkillsView from './components/SkillsView.vue'
 import WorkspaceView from './components/WorkspaceView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
@@ -23,23 +24,21 @@ const {
 
 const activeView = ref('chat')
 const showStats = ref(false)
-const sidebarExpanded = ref(true)
+const sidebarExpanded = ref(false)
+const historyPanelVisible = ref(true)
 const sidebarRefreshKey = ref(0)
 const confirmDelete = ref({ show: false, convId: null })
 
 function handleNavigate(view) {
-  if (view === 'chat' && view === activeView.value) {
-    // 已在对话页面 — 切换侧边栏展开/收缩
-    sidebarExpanded.value = !sidebarExpanded.value
-  } else {
-    activeView.value = view
-    // 切到对话页时自动展开侧边栏，工作区页面不展开侧边栏
-    if (view === 'chat') {
-      sidebarExpanded.value = true
-    } else if (view === 'workspace') {
-      sidebarExpanded.value = false
-    }
-  }
+  activeView.value = view
+}
+
+function handleToggleSidebar() {
+  sidebarExpanded.value = !sidebarExpanded.value
+}
+
+function handleToggleHistoryPanel() {
+  historyPanelVisible.value = !historyPanelVisible.value
 }
 
 function handleDeleteConversation(convId) {
@@ -83,6 +82,7 @@ onMounted(() => { reset() })
         :is-processing="isProcessing"
         :active-view="activeView"
         :sidebar-expanded="sidebarExpanded"
+        :history-panel-visible="historyPanelVisible"
         :current-conversation-id="conversationId"
         :refresh-key="sidebarRefreshKey"
         :active-agent-roles="activeAgentRoles"
@@ -91,6 +91,8 @@ onMounted(() => { reset() })
         @navigate="handleNavigate"
         @load-conversation="handleLoadConversation"
         @delete-conversation="handleDeleteConversation"
+        @toggle-sidebar="handleToggleSidebar"
+        @toggle-history-panel="handleToggleHistoryPanel"
       />
 
       <main class="main-content">
@@ -128,6 +130,9 @@ onMounted(() => { reset() })
         </Transition>
         <Transition name="view" appear>
           <AgentsView v-show="activeView === 'agents'" />
+        </Transition>
+        <Transition name="view" appear>
+          <CustomAgentsView v-show="activeView === 'custom-agents'" />
         </Transition>
         <Transition name="view" appear>
           <SkillsView v-show="activeView === 'skills'" />
