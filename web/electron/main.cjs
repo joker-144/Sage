@@ -41,7 +41,7 @@ function readAppVersion() {
       }
     } catch { /* ignore */ }
   }
-  return '1.0.1';
+  return '1.0.2';
 }
 
 const APP_VERSION = readAppVersion();
@@ -226,13 +226,6 @@ function createWindow() {
     icon: path.join(__dirname, '../../public/log.ico'),
   });
 
-  mainWindow.loadURL(`http://localhost:${backendPort}`);
-
-  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-    console.error(`[Sage] Page load failed: ${errorDescription} (code: ${errorCode}) URL: ${validatedURL}`);
-    mainWindow.webContents.loadURL(`data:text/html,<h2>Sage 加载失败</h2><p>${errorDescription}</p><p>后端地址: ${validatedURL}</p><p>请检查后端是否正常运行。</p>`);
-  });
-
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
   });
@@ -246,6 +239,22 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+  });
+}
+
+// ── 启动屏：立即显示主窗口并加载本地 splash.html ──
+function showSplash() {
+  const splashPath = path.join(__dirname, 'splash.html');
+  mainWindow.loadFile(splashPath, { query: { v: APP_VERSION } });
+}
+
+// ── 后端就绪后切换到主页面 ──
+function loadMainPage() {
+  mainWindow.loadURL(`http://localhost:${backendPort}`);
+
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[Sage] Page load failed: ${errorDescription} (code: ${errorCode}) URL: ${validatedURL}`);
+    mainWindow.webContents.loadURL(`data:text/html,<h2>Sage 加载失败</h2><p>${errorDescription}</p><p>后端地址: ${validatedURL}</p><p>请检查后端是否正常运行。</p>`);
   });
 }
 
@@ -391,10 +400,37 @@ ipcMain.handle('update-install', async (_event, filePath) => {
 });
 
 app.whenReady().then(async () => {
+  // 启动屏：立即创建窗口并加载本地 splash.html，消除黑屏等待感
+  createWindow();
+  showSplash();
+
+  // 推送阶段文案的辅助函数（splash 页面未就绪时静默跳过）
+  function pushStatus(text) {
+    try {
+      mainWindow?.webContents.send('splash-status', text);
+    } catch { /* splash 未就绪，忽略 */ }
+  }
+
+  // 阶段 1：初始化中（splash 已显示后立即推送）
+  setTimeout(() => pushStatus('正在加载核心服务...'), 300);
+
   try {
-    await startBackend();
-    createWindow();
+    // 并行启动后端，期间持续推送阶段文案
+    const backendPromise = startBackend().then((port) => {
+      pushStatus('服务已就绪，正在加载工作台...');
+      return port;
+    });
+
+    // 阶段 2：启动中（1.5s 后若后端仍未就绪，提示正在启动）
+    setTimeout(() => pushStatus('正在启动智能体引擎...'), 1500);
+    // 阶段 3：稍长时间仍在启动（4s 后）
+    setTimeout(() => pushStatus('正在初始化记忆系统...'), 4000);
+
+    await backendPromise;
+    // 后端就绪，切换到主页面
+    loadMainPage();
   } catch (err) {
+    pushStatus('启动失败');
     dialog.showErrorBox(
       'Sage Startup Error',
       `Failed to start the backend service:\n\n${err.message}\n\nPlease ensure sage.exe is available and try again.`
