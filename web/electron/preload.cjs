@@ -1,4 +1,4 @@
-﻿const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   minimize: () => ipcRenderer.invoke('window-minimize'),
@@ -13,5 +13,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateInstall: (filePath) => ipcRenderer.invoke('update-install', filePath),
   onUpdateProgress: (callback) => {
     ipcRenderer.on('update-download-progress', (_event, msg) => callback(msg));
+  },
+  onSplashStatus: (callback) => {
+    ipcRenderer.on('splash-status', (_event, text) => callback(text));
   },
 });
