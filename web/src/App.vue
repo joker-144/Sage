@@ -16,6 +16,7 @@ import StatsModal from './components/StatsModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import DownloadNotification from './components/DownloadNotification.vue'
 import IndexNotification from './components/IndexNotification.vue'
+import UpdateNotification from './components/UpdateNotification.vue'
 
 const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
@@ -161,6 +162,8 @@ onMounted(() => { reset() })
     <DownloadNotification />
     <!-- 全局索引通知（右上角） -->
     <IndexNotification />
+    <!-- 全局版本更新通知（右上角） -->
+    <UpdateNotification />
   </div>
 </template>
 

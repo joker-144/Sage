@@ -285,6 +285,59 @@ async def health():
     return HealthResponse()
 
 
+def _parse_version(v: str) -> tuple:
+    """将版本字符串解析为可比较的元组，去除 v 前缀"""
+    v = v.strip().lstrip('vV')
+    parts = []
+    for p in v.split('.'):
+        # 仅保留数字部分，忽略 -beta 等后缀
+        num = ''
+        for ch in p:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+
+@app.get("/api/update-check")
+async def check_update():
+    """检查 GitHub Releases 是否有新版本
+
+    对比当前 __version__ 与 GitHub 最新 Release tag（格式如 v1.0.2）。
+    网络失败时返回 has_update=False，不抛异常以免打扰用户。
+    """
+    import httpx
+
+    repo = "joker-144/Sage"
+    current = __version__
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                f"https://api.github.com/repos/{repo}/releases/latest",
+                headers={"Accept": "application/vnd.github+json"},
+            )
+        if resp.status_code != 200:
+            return {"has_update": False, "current": current, "latest": None, "reason": "fetch_failed"}
+        data = resp.json()
+        latest_tag = data.get("tag_name") or ""
+        latest_version = latest_tag.lstrip('vV')
+        # 版本对比
+        if _parse_version(latest_version) > _parse_version(current):
+            return {
+                "has_update": True,
+                "current": current,
+                "latest": latest_version,
+                "release_url": data.get("html_url") or f"https://github.com/{repo}/releases",
+                "release_notes": data.get("body") or "",
+                "release_name": data.get("name") or latest_version,
+            }
+        return {"has_update": False, "current": current, "latest": latest_version}
+    except Exception:
+        return {"has_update": False, "current": current, "latest": None, "reason": "network_error"}
+
+
 @app.get("/debug/webfiles")
 async def debug_web_files():
     """调试接口：列出 WEB_DIR 路径和文件"""
