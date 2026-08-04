@@ -11,6 +11,7 @@ dist/
 build/
 !web/build/
 .trae
+.github
 
 # 调试临时文件
 body.json
