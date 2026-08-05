@@ -329,7 +329,7 @@ async def check_update():
                 "has_update": True,
                 "current": current,
                 "latest": latest_version,
-                "release_url": "https://gitcode.com/wu_yout/Sage/releases",
+                "release_url": data.get("html_url") or f"https://github.com/{repo}/releases",
                 "release_notes": data.get("body") or "",
                 "release_name": data.get("name") or latest_version,
             }
@@ -1644,7 +1644,6 @@ async def version_check():
         )
         # 速率限制场景：缓存 5 分钟，避免用户疯狂重试触发更多限制
         _version_cache = {"ts": now, "data": result, "current": current, "ttl": 300}
-        result["release_url"] = "https://gitcode.com/wu_yout/Sage/releases"
         return result
 
     # ── 有新版本时：用版本间的 commit 列表覆盖 changelog ──
@@ -1660,7 +1659,6 @@ async def version_check():
         _version_cache = {"ts": now, "data": result, "current": current, "ttl": 3600}
     else:
         _version_cache = None
-    result["release_url"] = "https://gitcode.com/wu_yout/Sage/releases"
     return result
 
 
