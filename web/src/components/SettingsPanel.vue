@@ -312,6 +312,7 @@ const isElectron = computed(() => !!window.electronAPI)
 // 更新来源徽章文本
 const sourceBadgeText = computed(() => {
   switch (updateSource.value) {
+    case 'gitcode': return 'GitCode'
     case 'github': return 'GitHub 直连'
     case 'github-mirror': return 'GitHub 镜像'
     case 'pypi': return 'PyPI'

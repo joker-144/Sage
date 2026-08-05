@@ -2059,19 +2059,41 @@ def _compare_versions(v1: str, v2: str) -> int:
 GITHUB_REPO = "joker-144/Sage"
 
 # ── GitCode Release API 配置 ──
-# 从 .env 读取 token 和仓库信息，用于版本检查与下载
-# pydantic-settings 不会把 .env 注入 os.environ，这里显式加载
-try:
-    from dotenv import load_dotenv as _load_dotenv
-    _env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-    if not _env_path.exists():
-        _env_path = Path.cwd() / ".env"
-    _load_dotenv(_env_path, override=False)
-except Exception:
-    pass
-GITCODE_TOKEN = os.environ.get("GITCODE_TOKEN", "")
-GITCODE_OWNER = os.environ.get("GITCODE_OWNER", "wu_yout")
-GITCODE_REPO = os.environ.get("GITCODE_REPO", "Sage")
+# 优先从 update_config.json 读取（打包时不清空，桌面端可用），
+# 回退到 .env（开发环境使用，pydantic-settings 不会注入 os.environ，这里显式加载）
+def _load_gitcode_config() -> tuple[str, str, str]:
+    """加载 GitCode 配置：优先 update_config.json，回退 .env 环境变量"""
+    # 1. 尝试从 update_config.json 读取（与 api.py 同目录，打包后在 _MEIPASS/sage/）
+    try:
+        _cfg_path = Path(__file__).resolve().parent / "update_config.json"
+        if _cfg_path.exists():
+            import json as _json
+            with open(_cfg_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+            token = cfg.get("gitcode_token", "")
+            owner = cfg.get("gitcode_owner", "")
+            repo = cfg.get("gitcode_repo", "")
+            if token:
+                return token, owner or "wu_yout", repo or "Sage"
+    except Exception:
+        pass
+
+    # 2. 回退：从 .env 读取（开发环境）
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        _env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+        if not _env_path.exists():
+            _env_path = Path.cwd() / ".env"
+        _load_dotenv(_env_path, override=False)
+    except Exception:
+        pass
+
+    token = os.environ.get("GITCODE_TOKEN", "")
+    owner = os.environ.get("GITCODE_OWNER", "wu_yout")
+    repo = os.environ.get("GITCODE_REPO", "Sage")
+    return token, owner, repo
+
+GITCODE_TOKEN, GITCODE_OWNER, GITCODE_REPO = _load_gitcode_config()
 
 # GitHub 下载加速镜像列表（按优先级排序，已验证可用性）
 # gh-proxy.com: 支持 Range 断点续传，国内可直连

@@ -131,6 +131,13 @@ if _skills_src.exists():
                 dest = f".agent/skills/{skill_dir.name}"
                 datas.append((str(f), dest))
 
+# ── 版本更新配置（GitCode API 凭据）────────────────────
+# 独立于 .env 的配置文件，打包时不清空，供桌面端检查更新使用。
+# api.py 通过 __file__ 路径定位（打包后在 _MEIPASS/sage/update_config.json）
+_update_cfg = Path("src/sage/update_config.json")
+if _update_cfg.exists():
+    datas.append((str(_update_cfg), "sage"))
+
 # ── 隐式导入（PyInstaller 静态分析可能漏掉的动态导入）───
 hiddenimports = []
 hiddenimports += collect_submodules("sage")
