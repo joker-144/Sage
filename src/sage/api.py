@@ -303,35 +303,34 @@ def _parse_version(v: str) -> tuple:
 
 @app.get("/api/update-check")
 async def check_update():
-    """检查 GitHub Releases 是否有新版本
+    """检查是否有新版本（自建版本源）
 
-    对比当前 __version__ 与 GitHub 最新 Release tag（格式如 v1.0.2）。
+    从 gitcode 仓库的 version.json 获取最新版本号，与当前 __version__ 对比。
+    version.json 由 scripts/gen_version.py 生成，提交到 gitcode 仓库根目录。
     网络失败时返回 has_update=False，不抛异常以免打扰用户。
     """
     import httpx
 
-    repo = "joker-144/Sage"
+    VERSION_SOURCE = "https://raw.gitcode.com/wu_yout/Sage/raw/main/version.json"
     current = __version__
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(
-                f"https://api.github.com/repos/{repo}/releases/latest",
-                headers={"Accept": "application/vnd.github+json"},
-            )
+            resp = await client.get(VERSION_SOURCE)
         if resp.status_code != 200:
             return {"has_update": False, "current": current, "latest": None, "reason": "fetch_failed"}
         data = resp.json()
-        latest_tag = data.get("tag_name") or ""
-        latest_version = latest_tag.lstrip('vV')
+        latest_version = (data.get("latest") or "").strip().lstrip('vV')
+        if not latest_version:
+            return {"has_update": False, "current": current, "latest": None, "reason": "invalid_version_source"}
         # 版本对比
         if _parse_version(latest_version) > _parse_version(current):
             return {
                 "has_update": True,
                 "current": current,
                 "latest": latest_version,
-                "release_url": data.get("html_url") or f"https://github.com/{repo}/releases",
-                "release_notes": data.get("body") or "",
-                "release_name": data.get("name") or latest_version,
+                "release_url": data.get("download_url") or "https://gitcode.com/wu_yout/Sage/releases",
+                "release_notes": data.get("release_notes") or "",
+                "release_name": data.get("release_name") or f"v{latest_version}",
             }
         return {"has_update": False, "current": current, "latest": latest_version}
     except Exception:
@@ -1644,6 +1643,7 @@ async def version_check():
         )
         # 速率限制场景：缓存 5 分钟，避免用户疯狂重试触发更多限制
         _version_cache = {"ts": now, "data": result, "current": current, "ttl": 300}
+        result["release_url"] = "https://gitcode.com/wu_yout/Sage/releases"
         return result
 
     # ── 有新版本时：用版本间的 commit 列表覆盖 changelog ──
@@ -1659,6 +1659,7 @@ async def version_check():
         _version_cache = {"ts": now, "data": result, "current": current, "ttl": 3600}
     else:
         _version_cache = None
+    result["release_url"] = "https://gitcode.com/wu_yout/Sage/releases"
     return result
 
 

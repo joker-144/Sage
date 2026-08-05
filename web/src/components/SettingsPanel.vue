@@ -2,6 +2,10 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import { useDownloadNotify } from '../composables/useDownloadNotify'
 
+const props = defineProps({
+  updateTrigger: { type: Number, default: 0 },
+})
+
 // 注意：从 composable 取出的 phase 重命名为 modelDlPhase，避免与版本更新模态框的 downloadPhase 冲突
 const { startDownload, phase: modelDlPhase, currentModelType } = useDownloadNotify()
 
@@ -332,6 +336,14 @@ const totalModelCount = computed(() => {
     count += (allProviderModels.value[pid] || []).length
   }
   return count
+})
+
+// 监听外部跳转触发（从更新通知卡片"前往更新"按钮）
+watch(() => props.updateTrigger, (v) => {
+  if (v > 0) {
+    activeTab.value = 'advanced'
+    checkVersion()
+  }
 })
 
 onMounted(() => {

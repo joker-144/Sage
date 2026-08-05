@@ -28,6 +28,7 @@ const showStats = ref(false)
 const sidebarExpanded = ref(false)
 const historyPanelVisible = ref(true)
 const sidebarRefreshKey = ref(0)
+const updateTrigger = ref(0)
 const confirmDelete = ref({ show: false, convId: null })
 
 function handleNavigate(view) {
@@ -40,6 +41,11 @@ function handleToggleSidebar() {
 
 function handleToggleHistoryPanel() {
   historyPanelVisible.value = !historyPanelVisible.value
+}
+
+function handleGotoUpdate() {
+  activeView.value = 'settings'
+  updateTrigger.value++
 }
 
 function handleDeleteConversation(convId) {
@@ -142,7 +148,7 @@ onMounted(() => { reset() })
           <WorkspaceView v-show="activeView === 'workspace'" />
         </Transition>
         <Transition name="view" appear>
-          <SettingsPanel v-show="activeView === 'settings'" />
+          <SettingsPanel v-show="activeView === 'settings'" :update-trigger="updateTrigger" />
         </Transition>
       </main>
     </div>
@@ -163,7 +169,7 @@ onMounted(() => { reset() })
     <!-- 全局索引通知（右上角） -->
     <IndexNotification />
     <!-- 全局版本更新通知（右上角） -->
-    <UpdateNotification />
+    <UpdateNotification @goto-update="handleGotoUpdate" />
   </div>
 </template>
 

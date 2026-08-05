@@ -1,6 +1,8 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 
+const emit = defineEmits(['goto-update'])
+
 const visible = ref(false)
 const loading = ref(false)
 const updateInfo = ref(null)
@@ -31,10 +33,10 @@ function closeNotify() {
   dismissed.value = true
 }
 
-function openRelease() {
-  if (updateInfo.value?.release_url) {
-    window.open(updateInfo.value.release_url, '_blank', 'noopener')
-  }
+function gotoUpdate() {
+  // 跳转到设置页版本更新位置，同时关闭提示卡片
+  emit('goto-update')
+  closeNotify()
 }
 
 onMounted(() => {
@@ -66,7 +68,7 @@ onMounted(() => {
               当前版本 v{{ updateInfo.current }}，新版本 v{{ updateInfo.latest }} 已发布，建议更新以获取最新功能。
             </div>
             <div class="un-actions">
-              <button class="un-btn un-btn-primary" @click="openRelease">
+              <button class="un-btn un-btn-primary" @click="gotoUpdate">
                 前往更新
               </button>
               <button class="un-btn un-btn-secondary" @click="closeNotify">
