@@ -303,24 +303,16 @@ def _parse_version(v: str) -> tuple:
 
 @app.get("/api/update-check")
 async def check_update():
-    """检查 GitHub Releases 是否有新版本
+    """检查 GitCode Releases 是否有新版本
 
-    对比当前 __version__ 与 GitHub 最新 Release tag（格式如 v1.0.2）。
+    对比当前 __version__ 与 GitCode 最新 Release tag（格式如 v1.0.2）。
     网络失败时返回 has_update=False，不抛异常以免打扰用户。
     """
-    import httpx
-
-    repo = "joker-144/Sage"
     current = __version__
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(
-                f"https://api.github.com/repos/{repo}/releases/latest",
-                headers={"Accept": "application/vnd.github+json"},
-            )
-        if resp.status_code != 200:
+        data = await asyncio.to_thread(_fetch_gitcode_latest_release)
+        if not data:
             return {"has_update": False, "current": current, "latest": None, "reason": "fetch_failed"}
-        data = resp.json()
         latest_tag = data.get("tag_name") or ""
         latest_version = latest_tag.lstrip('vV')
         # 版本对比
@@ -329,7 +321,7 @@ async def check_update():
                 "has_update": True,
                 "current": current,
                 "latest": latest_version,
-                "release_url": data.get("html_url") or f"https://github.com/{repo}/releases",
+                "release_url": data.get("html_url") or f"https://gitcode.com/{GITCODE_OWNER}/{GITCODE_REPO}/releases",
                 "release_notes": data.get("body") or "",
                 "release_name": data.get("name") or latest_version,
             }
@@ -1513,6 +1505,38 @@ async def version_check():
     rate_limited = False       # 是否命中 GitHub API 速率限制
     rate_reset_at: float = 0   # 速率限制重置时间（Unix timestamp）
 
+    # ── 第 0 步：优先使用 GitCode API（国内可用，需 token）──
+    gc_data = _fetch_gitcode_latest_release()
+    if gc_data:
+        tag = gc_data.get("tag_name", "").lstrip("v")
+        changelog_body = gc_data.get("body", "") or ""
+        html_url = gc_data.get("html_url", "") or f"https://gitcode.com/{GITCODE_OWNER}/{GITCODE_REPO}/releases"
+        # 查找 Windows 安装包资源
+        download_url = ""
+        file_name = ""
+        for asset in gc_data.get("assets", []):
+            name = asset.get("name", "")
+            if name.endswith(".exe"):
+                file_name = name
+                break
+        if file_name and tag:
+            download_url = _build_gitcode_download_url(gc_data.get("tag_name", ""), file_name)
+
+        if tag:
+            result["latest"] = tag
+            result["changelog"] = changelog_body[:4096]
+            result["release_url"] = html_url
+            result["download_url"] = download_url
+            result["has_update"] = _compare_versions(tag, current) > 0
+            result["source"] = "gitcode"
+            # gitcode 成功则跳过后续 GitHub 回退逻辑
+            if result["has_update"] and result["latest"] != current:
+                commits_changelog = _fetch_commits_between_versions(current, result["latest"])
+                if commits_changelog:
+                    result["changelog"] = commits_changelog
+            _version_cache = {"ts": now, "data": result, "current": current, "ttl": 3600}
+            return result
+
     # ── 第 1 步：直连 GitHub API ──
     gh_api_ok = False
     try:
@@ -1682,8 +1706,21 @@ async def version_download():
         file_name = ""
 
         try:
-            # 获取最新 Release 信息 — 优先 api.github.com
-            gh_api_ok = False
+            # ── 优先使用 GitCode API 获取下载信息 ──
+            gc_data = await asyncio.to_thread(_fetch_gitcode_latest_release)
+            if gc_data:
+                gc_tag = gc_data.get("tag_name", "")
+                tag = gc_tag.lstrip("v")
+                release_url = gc_data.get("html_url", "") or f"https://gitcode.com/{GITCODE_OWNER}/{GITCODE_REPO}/releases"
+                for asset in gc_data.get("assets", []):
+                    name = asset.get("name", "")
+                    if name.endswith(".exe"):
+                        file_name = name
+                        download_url = _build_gitcode_download_url(gc_tag, name)
+                        break
+
+            # GitCode 失败 → 回退到 GitHub API 链路
+            gh_api_ok = bool(download_url)
             try:
                 async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
                     gh_resp = await client.get(
@@ -2019,6 +2056,22 @@ def _compare_versions(v1: str, v2: str) -> int:
 # ── GitHub 镜像辅助函数 ──
 # 国内访问 api.github.com 经常失败，使用多镜像回退机制确保可用性
 GITHUB_REPO = "joker-144/Sage"
+
+# ── GitCode Release API 配置 ──
+# 从 .env 读取 token 和仓库信息，用于版本检查与下载
+# pydantic-settings 不会把 .env 注入 os.environ，这里显式加载
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if not _env_path.exists():
+        _env_path = Path.cwd() / ".env"
+    _load_dotenv(_env_path, override=False)
+except Exception:
+    pass
+GITCODE_TOKEN = os.environ.get("GITCODE_TOKEN", "")
+GITCODE_OWNER = os.environ.get("GITCODE_OWNER", "wu_yout")
+GITCODE_REPO = os.environ.get("GITCODE_REPO", "Sage")
+
 # GitHub 下载加速镜像列表（按优先级排序，已验证可用性）
 # gh-proxy.com: 支持 Range 断点续传，国内可直连
 # gh.api.99988866.xyz: Cloudflare 加速
@@ -2040,6 +2093,40 @@ def _wrap_ghproxy(download_url: str) -> str:
         return download_url
     # 优先使用第一个镜像，下载失败时由上层重试逻辑切换
     return _GH_PROXY_MIRRORS[0] + download_url
+
+
+def _fetch_gitcode_latest_release() -> dict | None:
+    """通过 GitCode API 获取最新 Release（列表第一个）
+
+    使用 .env 中的 GITCODE_TOKEN 认证，返回含 tag_name、assets、html_url 的 dict。
+    失败时返回 None。
+    """
+    import httpx
+
+    if not GITCODE_TOKEN:
+        return None
+    api_url = f"https://api.gitcode.com/api/v5/repos/{GITCODE_OWNER}/{GITCODE_REPO}/releases"
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            resp = client.get(
+                api_url,
+                params={"access_token": GITCODE_TOKEN, "per_page": 1, "direction": "desc"},
+                headers={"Accept": "application/json", "User-Agent": "Sage-Updater"},
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data[0]
+            return None
+    except Exception:
+        return None
+
+
+def _build_gitcode_download_url(tag: str, file_name: str) -> str:
+    """构造 GitCode Release 附件下载 URL（带 token）"""
+    base = f"https://api.gitcode.com/api/v5/repos/{GITCODE_OWNER}/{GITCODE_REPO}/releases/{tag}/attach_files/{file_name}/download"
+    return f"{base}?access_token={GITCODE_TOKEN}"
 
 
 def _fetch_latest_release_via_ghproxy_api() -> dict | None:
