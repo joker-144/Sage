@@ -221,6 +221,119 @@ class LLMClient:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
 
+    async def achat_with_tools_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        tool_choice: str = "auto",
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> AsyncIterator:
+        """流式 function calling 对话 — 实时返回生成内容，同时累积 tool_calls
+
+        与 achat_with_tools（非流式）对应，但不阻塞等待完整响应。
+
+        Yields:
+            dict: 流式片段事件
+                {"type": "text_delta", "content": "..."}      — 文本片段（逐字）
+                {"type": "reasoning_delta", "content": "..."} — 思考片段（逐字，推理模型才有）
+            最后 yield:
+                ChatMessage — 完整消息（含累积的 content/tool_calls/usage/reasoning_content）
+        """
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "stream": True,
+            # 请求在最后一个 chunk 返回 usage（token 统计）
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        stream = await self._async.chat.completions.create(**kwargs)
+
+        content_buf = ""
+        reasoning_buf = ""
+        # tool_calls 按 index 累积：index -> {"id": "", "name": "", "arguments": ""}
+        tool_calls_acc: dict[int, dict] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+
+        async for chunk in stream:
+            # 某些 Provider 在最后会发一个 choices 为空的 chunk 仅携带 usage
+            if not chunk.choices:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                    }
+                continue
+
+            delta = chunk.choices[0].delta
+            choice_finish = chunk.choices[0].finish_reason
+
+            # 文本片段 — 逐字 yield
+            if delta.content:
+                content_buf += delta.content
+                yield {"type": "text_delta", "content": delta.content}
+
+            # 思考片段（推理模型 DeepSeek-R1/Thinking 等）— 逐字 yield
+            reasoning_delta = getattr(delta, "reasoning_content", None)
+            if reasoning_delta:
+                reasoning_buf += reasoning_delta
+                yield {"type": "reasoning_delta", "content": reasoning_delta}
+
+            # 工具调用片段累积（OpenAI 流式协议：按 index 分片返回）
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index if tc.index is not None else 0
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc.id:
+                        tool_calls_acc[idx]["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        tool_calls_acc[idx]["name"] += tc.function.name
+                    if tc.function and tc.function.arguments:
+                        tool_calls_acc[idx]["arguments"] += tc.function.arguments
+
+            if choice_finish:
+                finish_reason = choice_finish
+
+            # usage 也可能跟随在含 choices 的最后一个 chunk
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = {
+                    "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                }
+
+        # 解析累积的 tool_calls
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tool_calls_acc.keys()):
+            tc = tool_calls_acc[idx]
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {"_raw": tc["arguments"]}
+            call_id = tc["id"] or f"call_{idx}"
+            tool_calls.append(ToolCall(
+                id=call_id,
+                name=tc["name"],
+                arguments=args,
+            ))
+
+        # 最后 yield 完整 ChatMessage（供调用方获取 tool_calls / usage / 完整文本）
+        yield ChatMessage(
+            content=content_buf,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            reasoning_content=reasoning_buf,
+        )
+
 
 def create_llm_client() -> LLMClient:
     """创建 LLM 客户端（工厂函数）"""

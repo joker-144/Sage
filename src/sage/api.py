@@ -449,6 +449,7 @@ async def chat_stream(req: ChatRequest):
                         yield f"event: error\ndata: {json.dumps({'content': event.content, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
                     elif event.type == "done":
                         yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+                        break
                 elif item_type == "done":
                     yield f"event: done\ndata: {json.dumps({'conversation_id': item_data}, ensure_ascii=False)}\n\n"
                     break

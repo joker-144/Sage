@@ -216,14 +216,28 @@ class AgentLoop:
             messages = self.context.build_messages()
             tool_schemas = self.tools.get_schemas()
 
-            # 3. 调用 LLM（带弹性重试）
+            # 3. 调用 LLM（流式 + 弹性重试）— 实时逐字输出文本/思考内容
             llm_start = time.time()
+            streamed_text = False       # 是否已通过流式 delta 输出过文本
+            streamed_reasoning = False  # 是否已通过流式 delta 输出过思考
+            response = None
             try:
-                response = await self._call_llm_with_retry(
+                async for item in self._call_llm_stream_with_retry(
                     messages=messages,
                     tools=tool_schemas,
                     session_id=session_id,
-                )
+                ):
+                    if isinstance(item, dict):
+                        _itype = item.get("type")
+                        if _itype == "text_delta":
+                            streamed_text = True
+                            yield LoopEvent(type="text", content=item.get("content", ""))
+                        elif _itype == "reasoning_delta":
+                            streamed_reasoning = True
+                            yield LoopEvent(type="reasoning", content=item.get("content", ""))
+                    else:
+                        # 流结束，收到完整 ChatMessage（含累积的 tool_calls/usage）
+                        response = item
             except RetryExhaustedError as e:
                 yield LoopEvent(type="error", content=f"LLM 调用重试耗尽: {e}")
                 if self.observability:
@@ -231,6 +245,13 @@ class AgentLoop:
                 return
             except Exception as e:
                 yield LoopEvent(type="error", content=f"LLM 调用失败: {e}")
+                if self.observability:
+                    self.observability.record_request(session_id, time.time() - request_start, error=True)
+                return
+
+            # 极端兜底：流式调用未返回完整 ChatMessage
+            if response is None:
+                yield LoopEvent(type="error", content="LLM 流式调用未返回完整响应")
                 if self.observability:
                     self.observability.record_request(session_id, time.time() - request_start, error=True)
                 return
@@ -249,8 +270,9 @@ class AgentLoop:
             # 持久化 token 用量到 SQLite（供仪表盘统计）
             self._persist_token_usage(round_usage, session_id)
 
-            # 4. 输出模型思考内容（推理模型才有 reasoning_content，如 DeepSeek-R1）
-            if response.reasoning_content:
+            # 4. 兜底：非流式 Provider 未通过 delta 输出 reasoning，补发完整思考内容
+            #    （流式 Provider 的思考已通过 reasoning_delta 逐字 yield）
+            if response.reasoning_content and not streamed_reasoning:
                 yield LoopEvent(type="reasoning", content=response.reasoning_content)
 
             # 5. 判断 LLM 是否要调用工具
@@ -353,10 +375,12 @@ class AgentLoop:
                     reasoning=response.reasoning_content or "",
                     tokens=_final_total,
                 )
-                yield LoopEvent(type="text", content=response.content)
-                yield LoopEvent(type="done")
+                # 兜底：非流式 Provider 未通过 delta 输出文本，补发完整回复
+                # （流式 Provider 的文本已通过 text_delta 逐字 yield，此处不重复发送）
+                if response.content and not streamed_text:
+                    yield LoopEvent(type="text", content=response.content)
 
-                # 可观测性：记录请求
+                # 可观测性：记录请求（在 done 之前完成，确保 done 后流可立即关闭）
                 if self.observability:
                     self.observability.record_request(
                         session_id,
@@ -364,8 +388,11 @@ class AgentLoop:
                     )
                     self.observability.record_tool_metrics(session_id, total_tool_calls)
 
-                # v0.6.0 对话结束，保存会话摘要到长期记忆
+                # v0.6.0 对话结束，保存会话摘要到长期记忆（在 done 之前完成，
+                # 避免 done 事件后流关闭导致收尾任务被取消）
                 self._save_session_memory()
+
+                yield LoopEvent(type="done")
                 return
 
         # 超过最大轮数 — 不直接报错，让 LLM 基于已有上下文生成一条总结性回复
@@ -382,13 +409,13 @@ class AgentLoop:
                 "请告诉我是否需要继续，或检查上方已完成的工具调用结果。"
             )
             yield LoopEvent(type="text", content=fallback)
-        yield LoopEvent(type="done")
 
+        # 可观测性 + 记忆保存（在 done 之前完成，确保 done 后流可立即关闭）
         if self.observability:
             self.observability.record_request(session_id, time.time() - request_start)
-
-        # v0.6.0 对话结束，保存会话摘要到长期记忆
         self._save_session_memory()
+
+        yield LoopEvent(type="done")
 
     async def _generate_limit_summary(self, session_id: str, request_start: float) -> str:
         """达到工具调用上限时，调用 LLM（不带工具）生成总结性回复
@@ -477,6 +504,70 @@ class AgentLoop:
                 self.circuit_breaker.record_failure()
                 self.resilience_tracker.record("llm_call", success=False)
 
+                if attempt >= retry_cfg.max_retries or severity in (ErrorSeverity.PERMANENT, ErrorSeverity.FATAL):
+                    raise RetryExhaustedError(
+                        f"LLM 调用重试 {retry_cfg.max_retries} 次后仍失败: {e}"
+                    ) from e
+
+                delay = min(
+                    retry_cfg.base_delay * (retry_cfg.backoff_multiplier ** attempt),
+                    retry_cfg.max_delay,
+                )
+                if retry_cfg.jitter:
+                    import random
+                    delay *= (0.5 + random.random())
+                await asyncio.sleep(delay)
+
+        raise RetryExhaustedError(f"LLM 调用异常: {last_error}") from last_error
+
+    async def _call_llm_stream_with_retry(
+        self,
+        messages: list,
+        tools: list,
+        session_id: str,
+    ):
+        """带弹性重试的流式 LLM 调用
+
+        与 _call_llm_with_retry 对应，但使用流式接口：
+          - 连接建立阶段（尚未产出任何 chunk）失败 → 指数退避重试
+          - 已开始流式输出后失败 → 不重试（已 yield 的内容无法收回），直接抛出
+
+        Yields:
+            dict: {"type": "text_delta"|"reasoning_delta", "content": "..."}
+            ChatMessage: 流结束后的完整消息（最后产出）
+        """
+        retry_cfg = RetryConfig(max_retries=3, base_delay=1.0, max_delay=30.0)
+        last_error = None
+        started_streaming = False
+
+        for attempt in range(retry_cfg.max_retries + 1):
+            if self.circuit_breaker.is_open:
+                raise RetryExhaustedError("断路器开启，拒绝 LLM 调用")
+
+            try:
+                async for item in self.llm.achat_with_tools_stream(
+                    messages=messages,
+                    tools=tools,
+                ):
+                    # 首次产出片段即标记已开始流式（后续失败不再重试）
+                    if isinstance(item, dict):
+                        started_streaming = True
+                    yield item
+
+                self.circuit_breaker.record_success()
+                self.resilience_tracker.record("llm_call", success=True)
+                return
+
+            except Exception as e:
+                last_error = e
+                self.circuit_breaker.record_failure()
+                self.resilience_tracker.record("llm_call", success=False)
+
+                # 已开始流式输出 → 无法重试（内容已发往客户端）
+                if started_streaming:
+                    raise
+
+                severity = classify_error(e)
                 if attempt >= retry_cfg.max_retries or severity in (ErrorSeverity.PERMANENT, ErrorSeverity.FATAL):
                     raise RetryExhaustedError(
                         f"LLM 调用重试 {retry_cfg.max_retries} 次后仍失败: {e}"
