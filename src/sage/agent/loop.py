@@ -187,9 +187,12 @@ class AgentLoop:
         # v0.6.0 语义记忆注入：基于当前用户问题召回相关历史片段
         # 注意：只注入语义记忆（精准召回），不注入跨会话长期记忆摘要，
         # 避免旧对话全量摘要污染新对话（对话隔离）。
+        # 使用 asyncio.to_thread 包装，避免模型加载/encode 阻塞事件循环导致 SSE 心跳超时
         if self._memory_orch and self._memory_orch.semantic:
             try:
-                sem_text = self._memory_orch.semantic.format_for_prompt(user_input, top_k=3)
+                sem_text = await asyncio.to_thread(
+                    self._memory_orch.semantic.format_for_prompt, user_input, 3
+                )
                 if sem_text:
                     # 将语义记忆追加到 system prompt 中，重新构建上下文
                     self.context.system_prompt = self.system_prompt + sem_text

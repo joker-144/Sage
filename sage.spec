@@ -12,7 +12,7 @@ PyInstaller spec for Sage.
 
 注意:
 - 入口为 `sage.cli:app`（即 `sage` 命令入口，由 pyproject.toml 的 [project.scripts] 定义）
-- sentence-transformers 会在首次运行时下载模型，本 spec 不打包模型文件
+- sentence-transformers 模型文件已预打包到 _MEIPASS/models/，桌面端无需联网下载
 - pymupdf / python-docx 已通过 [paper] extras 显式安装
 """
 
@@ -137,6 +137,49 @@ if _skills_src.exists():
 _update_cfg = Path("src/sage/update_config.json")
 if _update_cfg.exists():
     datas.append((str(_update_cfg), "sage"))
+
+# ── HuggingFace 模型文件（预打包，避免桌面端首次使用时联网下载）──
+# 将已缓存的 embedding 和 reranker 模型打包到 _MEIPASS/models/
+# index.py 的 LocalEmbedder/CrossEncoderReranker 通过 refs/main 定位 snapshot 并加载
+_hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+_pretrained_models = [
+    "models--sentence-transformers--all-MiniLM-L6-v2",
+    "models--cross-encoder--ms-marco-MiniLM-L-6-v2",
+]
+for _model_dir_name in _pretrained_models:
+    _model_src = _hf_cache / _model_dir_name
+    if not _model_src.exists():
+        print(f"[sage.spec] 警告: 模型未缓存，跳过打包: {_model_dir_name}")
+        continue
+
+    # 打包 refs/main（用于定位正确的 snapshot hash）
+    _refs_main = _model_src / "refs" / "main"
+    if _refs_main.exists():
+        datas.append((str(_refs_main), f"models/{_model_dir_name}/refs"))
+
+    # 只打包 refs/main 指向的 snapshot，跳过其他历史 snapshot（节省空间）
+    _snapshot_hash = None
+    if _refs_main.exists():
+        _snapshot_hash = _refs_main.read_text(encoding="utf-8").strip()
+    if _snapshot_hash:
+        _snapshot_src = _model_src / "snapshots" / _snapshot_hash
+        if _snapshot_src.is_dir():
+            for _f in _snapshot_src.rglob("*"):
+                if _f.is_file():
+                    _rel = _f.relative_to(_snapshot_src)
+                    datas.append((str(_f), f"models/{_model_dir_name}/snapshots/{_snapshot_hash}/{_rel.parent}"))
+            print(f"[sage.spec] 已打包模型: {_model_dir_name} (snapshot: {_snapshot_hash[:12]}...)")
+        else:
+            print(f"[sage.spec] 警告: snapshot 目录不存在: {_snapshot_hash}")
+    else:
+        # 回退：无 refs/main 时打包所有 snapshot（兼容旧缓存）
+        _snapshots_dir = _model_src / "snapshots"
+        if _snapshots_dir.exists():
+            for _f in _snapshots_dir.rglob("*"):
+                if _f.is_file():
+                    _rel = _f.relative_to(_snapshots_dir)
+                    datas.append((str(_f), f"models/{_model_dir_name}/snapshots/{_rel.parent}"))
+            print(f"[sage.spec] 已打包模型（无 refs/main）: {_model_dir_name}")
 
 # ── 隐式导入（PyInstaller 静态分析可能漏掉的动态导入）───
 hiddenimports = []

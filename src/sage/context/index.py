@@ -75,6 +75,39 @@ class LocalEmbedder:
         # 设置下载超时（默认 30 秒），防止打包后首次启动在无网络环境无限等待
         os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
+    def _get_bundled_model_path(self, model_name: str) -> str | None:
+        """获取打包内置的模型目录路径（PyInstaller 打包后存在）
+
+        打包时通过 sage.spec 将模型文件放到 _MEIPASS/models/ 下，
+        此方法通过 refs/main 确定正确的 snapshot 目录路径。
+        """
+        import sys
+        if not getattr(sys, "frozen", False):
+            return None
+        try:
+            base = Path(sys._MEIPASS) / "models"
+            # 模型目录名格式：models--<org>--<name>
+            model_dir_name = "models--" + model_name.replace("/", "--")
+            model_root = base / model_dir_name
+            if not model_root.exists():
+                return None
+            # 优先通过 refs/main 确定正确的 snapshot hash
+            refs_main = model_root / "refs" / "main"
+            if refs_main.exists():
+                snapshot_hash = refs_main.read_text(encoding="utf-8").strip()
+                snapshot_dir = model_root / "snapshots" / snapshot_hash
+                if snapshot_dir.is_dir() and (snapshot_dir / "config.json").exists():
+                    return str(snapshot_dir)
+            # 回退：遍历 snapshots 找第一个含 config.json 的目录
+            snapshots_dir = model_root / "snapshots"
+            if snapshots_dir.exists():
+                for snapshot in snapshots_dir.iterdir():
+                    if snapshot.is_dir() and (snapshot / "config.json").exists():
+                        return str(snapshot)
+            return None
+        except Exception:
+            return None
+
     def _ensure_model(self, progress_callback=None):
         """延迟加载模型（类级单例，所有实例共享）
 
@@ -105,8 +138,26 @@ class LocalEmbedder:
             if progress_callback:
                 progress_callback("checking", 0, "正在检查模型缓存...")
 
-            # 已缓存 → 直接加载
+            # 优先从打包内置路径加载（桌面端，无需联网）
+            bundled_path = self._get_bundled_model_path(model_name)
+            if bundled_path:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                if progress_callback:
+                    progress_callback("loading", 50, "正在加载内置模型...")
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    LocalEmbedder._model = SentenceTransformer(bundled_path)
+                    if progress_callback:
+                        progress_callback("ready", 100, "模型就绪")
+                    return LocalEmbedder._model
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback("error", 0, f"内置模型加载失败: {e}")
+                    raise
+
+            # 已缓存 → 直接加载（设置离线模式，跳过 HEAD 更新检查，避免网络请求阻塞）
             if self._is_model_cached(model_name):
+                os.environ["HF_HUB_OFFLINE"] = "1"
                 if progress_callback:
                     progress_callback("loading", 50, "正在加载模型到内存...")
                 try:
@@ -120,7 +171,8 @@ class LocalEmbedder:
                         progress_callback("error", 0, f"加载失败: {e}")
                     raise
 
-            # 需要下载 → 流式下载并报告进度
+            # 需要下载 → 流式下载并报告进度（清除离线标记以允许联网下载）
+            os.environ.pop("HF_HUB_OFFLINE", None)
             try:
                 from sentence_transformers import SentenceTransformer
                 model_dir = self._download_model_streaming(model_name, progress_callback)
@@ -364,12 +416,21 @@ class CrossEncoderReranker:
             return True
         if CrossEncoderReranker._load_failed:
             return False
+        model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
         try:
+            # 优先从打包内置路径加载（桌面端，无需联网）
+            embedder_helper = LocalEmbedder()
+            bundled_path = embedder_helper._get_bundled_model_path(model_name)
+            if bundled_path:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                from sentence_transformers import CrossEncoder
+                CrossEncoderReranker._model = CrossEncoder(bundled_path, max_length=512)
+                return True
+            # 已缓存 → 设置离线模式，跳过 HEAD 更新检查
+            if LocalEmbedder._is_model_cached(model_name):
+                os.environ["HF_HUB_OFFLINE"] = "1"
             from sentence_transformers import CrossEncoder
-            CrossEncoderReranker._model = CrossEncoder(
-                "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                max_length=512,
-            )
+            CrossEncoderReranker._model = CrossEncoder(model_name, max_length=512)
             return True
         except Exception:
             # 模型下载/加载失败 — 标记降级，后续调用跳过重排
