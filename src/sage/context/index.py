@@ -486,10 +486,18 @@ class ProjectIndex:
         "__pycache__", ".git", ".venv", "venv", "env", "node_modules",
         ".egg-info", "data", "dist", "build", ".idea", ".vscode",
         ".agent",  # 排除 Sage 技能目录
+        ".sage",   # 排除 Sage 工作空间配置目录（索引数据库等）
     }
 
     # 单文件最大块数（防止超大文件拖慢索引）
+    # 代码文件用固定值；论文文档（PDF/DOCX/MD 等）通过 _max_chunks_for_file 动态放宽
     MAX_CHUNKS_PER_FILE = 50
+    # 论文文档最大块数（确保文末参考文献等尾部内容不被截断丢弃）
+    MAX_CHUNKS_PER_DOC = 300
+
+    # 索引 schema 版本：分块策略变更时递增此值，触发自动强制重建索引
+    # v2: 论文文档 MAX_CHUNKS 从 50 提升到 300，修复文末参考文献被截断问题
+    INDEX_SCHEMA_VERSION = 2
 
     def __init__(self, workspace: Path, store: Optional[MemoryStore] = None):
         self.workspace = workspace.resolve()
@@ -521,6 +529,20 @@ class ProjectIndex:
         """当前索引级别的分块行数上限（动态，根据 index_level）"""
         return _INDEX_LEVEL_PARAMS[self.index_level]["max_chunk_lines"]
 
+    def _max_chunks_for_file(self, file_path: str) -> int:
+        """根据文件类型返回最大块数
+
+        论文文档（PDF/DOCX/RTF/MD/TXT/TEX/BIB 等）放宽到 MAX_CHUNKS_PER_DOC，
+        确保文末参考文献等尾部内容不被截断；
+        代码文件保持 MAX_CHUNKS_PER_FILE 防止超大文件拖慢索引。
+        """
+        ext = Path(file_path).suffix.lower()
+        if ext in self.BINARY_EXTENSIONS or ext in {
+            ".md", ".txt", ".rst", ".tex", ".bib", ".csv", ".tsv",
+        }:
+            return self.MAX_CHUNKS_PER_DOC
+        return self.MAX_CHUNKS_PER_FILE
+
     @property
     def embedder(self) -> LocalEmbedder:
         """延迟创建本地 Embedder"""
@@ -537,6 +559,27 @@ class ProjectIndex:
 
     # ── 索引 ──
 
+    def _check_index_version(self) -> bool:
+        """检查索引 schema 版本是否匹配，返回是否需要强制重建"""
+        version_file = self.workspace / ".sage" / "index_version"
+        try:
+            if version_file.exists():
+                stored = int(version_file.read_text(encoding="utf-8").strip())
+                return stored < self.INDEX_SCHEMA_VERSION
+        except Exception:
+            pass
+        # 文件不存在或读取失败 → 需要重建
+        return True
+
+    def _write_index_version(self):
+        """写入当前索引 schema 版本"""
+        try:
+            version_file = self.workspace / ".sage" / "index_version"
+            version_file.parent.mkdir(parents=True, exist_ok=True)
+            version_file.write_text(str(self.INDEX_SCHEMA_VERSION), encoding="utf-8")
+        except Exception:
+            pass
+
     def index_project(self, force: bool = False) -> dict:
         """索引整个工作空间（论文文档 + 文本文件）
 
@@ -547,6 +590,10 @@ class ProjectIndex:
             统计信息 {"files": N, "chunks": N, "skipped": N}
         """
         stats = {"files": 0, "chunks": 0, "skipped": 0}
+
+        # 索引 schema 版本不匹配时自动强制重建（如分块策略变更）
+        if not force and self._check_index_version():
+            force = True
 
         # 索引后向量缓存失效
         self._embeddings_cache = None
@@ -568,54 +615,63 @@ class ProjectIndex:
                 stats["skipped"] += 1
                 continue
 
-            # 清理旧索引，重新分块
-            self.store.delete_file_chunks(rel_path)
+            try:
+                # 清理旧索引，重新分块
+                self.store.delete_file_chunks(rel_path)
 
-            chunks = self._chunk_file(content, rel_path)
-            if not chunks:
+                chunks = self._chunk_file(content, rel_path)
+                if not chunks:
+                    continue
+
+                # 提取论文元数据（标题/作者/年份/DOI），用于检索结果标注来源
+                metadata = self._extract_paper_metadata(content, file_path)
+
+                # PDF 文件：为每个 chunk 补充页码信息
+                if file_path.suffix.lower() == ".pdf":
+                    page_map = self._build_pdf_page_map(file_path)
+                    for chunk in chunks:
+                        ps, pe = self._lines_to_pages(chunk.start_line, chunk.end_line, page_map)
+                        chunk.page_start = ps
+                        chunk.page_end = pe
+
+                # 将元数据附加到每个 chunk
+                for chunk in chunks:
+                    chunk.title = metadata.get("title")
+                    chunk.authors = metadata.get("authors")
+                    chunk.year = metadata.get("year")
+                    chunk.doi = metadata.get("doi")
+
+                # 批量生成 Embedding（本地 sentence-transformers）
+                chunk_texts = [c.content for c in chunks]
+                embeddings = self.embedder.encode(chunk_texts)
+
+                for chunk, emb in zip(chunks, embeddings):
+                    emb_bytes = emb.tobytes()
+                    self.store.store_chunk(
+                        file_path=rel_path,
+                        start_line=chunk.start_line,
+                        end_line=chunk.end_line,
+                        content=chunk.content,
+                        embedding=emb_bytes,
+                        file_hash=file_hash,
+                        title=chunk.title,
+                        authors=chunk.authors,
+                        year=chunk.year,
+                        doi=chunk.doi,
+                        page_start=chunk.page_start,
+                        page_end=chunk.page_end,
+                    )
+                    stats["chunks"] += 1
+
+                stats["files"] += 1
+            except Exception as e:
+                # 单个文件处理失败不影响其他文件
+                print(f"[Sage] 索引文件失败 {rel_path}: {e}", file=sys.stderr)
                 continue
 
-            # 提取论文元数据（标题/作者/年份/DOI），用于检索结果标注来源
-            metadata = self._extract_paper_metadata(content, file_path)
-
-            # PDF 文件：为每个 chunk 补充页码信息
-            if file_path.suffix.lower() == ".pdf":
-                page_map = self._build_pdf_page_map(file_path)
-                for chunk in chunks:
-                    ps, pe = self._lines_to_pages(chunk.start_line, chunk.end_line, page_map)
-                    chunk.page_start = ps
-                    chunk.page_end = pe
-
-            # 将元数据附加到每个 chunk
-            for chunk in chunks:
-                chunk.title = metadata.get("title")
-                chunk.authors = metadata.get("authors")
-                chunk.year = metadata.get("year")
-                chunk.doi = metadata.get("doi")
-
-            # 批量生成 Embedding（本地 sentence-transformers）
-            chunk_texts = [c.content for c in chunks]
-            embeddings = self.embedder.encode(chunk_texts)
-
-            for chunk, emb in zip(chunks, embeddings):
-                emb_bytes = emb.tobytes()
-                self.store.store_chunk(
-                    file_path=rel_path,
-                    start_line=chunk.start_line,
-                    end_line=chunk.end_line,
-                    content=chunk.content,
-                    embedding=emb_bytes,
-                    file_hash=file_hash,
-                    title=chunk.title,
-                    authors=chunk.authors,
-                    year=chunk.year,
-                    doi=chunk.doi,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
-                )
-                stats["chunks"] += 1
-
-            stats["files"] += 1
+        # 索引完成后写入 schema 版本号
+        if stats["files"] > 0 or force:
+            self._write_index_version()
 
         return stats
 
@@ -834,19 +890,32 @@ class ProjectIndex:
     def _walk_source_files(self):
         """遍历工作空间中所有可索引的文档文件（文本+二进制）"""
         all_extensions = self.INDEXABLE_EXTENSIONS | self.BINARY_EXTENSIONS
+        # 论文文档扩展名（放宽大小限制）
+        doc_extensions = self.BINARY_EXTENSIONS | {".md", ".txt", ".rst", ".tex", ".bib", ".csv", ".tsv"}
+        # 代码/配置文件大小限制 5MB；论文文档大小限制 100MB
+        max_size_code = 5 * 1024 * 1024
+        max_size_doc = 100 * 1024 * 1024
+
         for root, dirs, files in os.walk(self.workspace):
             # 过滤排除目录（原地修改 dirs 实现 prune）
             dirs[:] = [d for d in dirs if d not in self.EXCLUDE_DIRS]
             for fname in files:
                 fpath = Path(root) / fname
-                if fpath.suffix.lower() in all_extensions:
-                    # 跳过大文件（> 5MB，论文文档通常较大）
-                    try:
-                        if fpath.stat().st_size > 5 * 1024 * 1024:
+                ext = fpath.suffix.lower()
+                if ext not in all_extensions:
+                    continue
+                # 根据文件类型应用不同的大小限制
+                try:
+                    fsize = fpath.stat().st_size
+                    if ext in doc_extensions:
+                        if fsize > max_size_doc:
                             continue
-                    except OSError:
-                        continue
-                    yield fpath
+                    else:
+                        if fsize > max_size_code:
+                            continue
+                except OSError:
+                    continue
+                yield fpath
 
     def _chunk_file(self, content: str, file_path: str) -> list[CodeChunk]:
         """将文档分块
@@ -880,6 +949,7 @@ class ProjectIndex:
             r"public |private |protected |static |async )",
             re.MULTILINE,
         )
+        max_chunks = self._max_chunks_for_file(file_path)
 
         chunks: list[CodeChunk] = []
         current_start = 0
@@ -900,11 +970,11 @@ class ProjectIndex:
                 ))
                 current_start = i
                 chunk_count += 1
-                if chunk_count >= self.MAX_CHUNKS_PER_FILE:
+                if chunk_count >= max_chunks:
                     break
 
         # 收尾：最后一块
-        if current_start < len(lines) and chunk_count < self.MAX_CHUNKS_PER_FILE:
+        if current_start < len(lines) and chunk_count < max_chunks:
             chunk_content = "\n".join(lines[current_start:])
             chunks.append(CodeChunk(
                 file_path=file_path,
@@ -929,6 +999,7 @@ class ProjectIndex:
             r"\d+\.?\d*\.?\d*\s+\S)",
             re.MULTILINE,
         )
+        max_chunks = self._max_chunks_for_file(file_path)
 
         chunks: list[CodeChunk] = []
         current_start = 0
@@ -952,13 +1023,13 @@ class ProjectIndex:
                 current_start = i
                 current_lines = 0
                 chunk_count += 1
-                if chunk_count >= self.MAX_CHUNKS_PER_FILE:
+                if chunk_count >= max_chunks:
                     break
 
             current_lines += 1
 
         # 收尾：最后一块
-        if current_start < len(lines) and chunk_count < self.MAX_CHUNKS_PER_FILE:
+        if current_start < len(lines) and chunk_count < max_chunks:
             chunk_content = "\n".join(lines[current_start:])
             if chunk_content.strip():
                 chunks.append(CodeChunk(

@@ -44,10 +44,12 @@ class PaperOps:
     async def index_papers(self, force: bool = False) -> ToolResult:
         """对工作空间中的论文文档建立向量索引"""
         try:
+            import asyncio
             from sage.context.index import ProjectIndex
             store = self._get_store()
             indexer = ProjectIndex(self.workspace, store)
-            stats = indexer.index_project(force=force)
+            # 使用 to_thread 避免阻塞事件循环（索引涉及 embedding 计算，CPU 密集）
+            stats = await asyncio.to_thread(indexer.index_project, force=force)
             return ToolResult(
                 success=True,
                 output=(
@@ -68,11 +70,12 @@ class PaperOps:
         top_k 为 None 时按工作空间索引级别自动选择（standard=5, premium=10）。
         """
         try:
+            import asyncio
             from sage.context.index import ProjectIndex
             store = self._get_store()
             indexer = ProjectIndex(self.workspace, store)
-            # rerank 由索引级别决定（standard=False, premium=True），不强制开启
-            results = indexer.search(query, top_k=top_k, threshold=0.3)
+            # 使用 to_thread 避免阻塞事件循环（embedding 计算是 CPU 密集型）
+            results = await asyncio.to_thread(indexer.search, query, top_k=top_k, threshold=0.3)
             if not results:
                 return ToolResult(
                     success=True,
@@ -126,12 +129,14 @@ class PaperOps:
     async def extract_references(self, file_path: str) -> ToolResult:
         """从论文文件中提取参考文献列表"""
         try:
+            import asyncio
             full_path = self.workspace / file_path
             if not full_path.exists():
                 return ToolResult(success=False, error=f"文件不存在: {file_path}")
 
             ext = full_path.suffix.lower()
-            content = self._read_document(full_path, ext)
+            # 使用 to_thread 避免阻塞事件循环（PDF 解析是 CPU/IO 密集型）
+            content = await asyncio.to_thread(self._read_document, full_path, ext)
             if not content:
                 return ToolResult(success=False, error="无法读取文件内容")
 
@@ -228,13 +233,15 @@ class PaperOps:
         - 校验已有字段（如纠正期刊名/栏目名混淆）
         """
         try:
+            import asyncio
             full_path = self.workspace / file_path
             if not full_path.exists():
                 return ToolResult(success=False, error=f"文件不存在: {file_path}")
 
             from sage.context.index import ProjectIndex
             indexer = ProjectIndex(self.workspace)
-            text = indexer._extract_pdf_text(full_path)
+            # 使用 to_thread 避免阻塞事件循环（PDF 解析是 CPU/IO 密集型）
+            text = await asyncio.to_thread(indexer._extract_pdf_text, full_path)
             if not text:
                 return ToolResult(success=False, error="PDF 解析失败（可能未安装 PyMuPDF）")
 
@@ -271,7 +278,10 @@ class PaperOps:
                 output_parts.append("## 差异校正")
                 output_parts.extend(discrepancies)
 
-            output_parts.append(f"\n## 内容预览\n{text[:2000]}")
+            output_parts.append(f"\n## 内容预览（开头）\n{text[:2000]}")
+            # 同时展示文末部分（参考文献通常位于文末），让 AI 能直接看到
+            if len(text) > 4000:
+                output_parts.append(f"\n## 内容预览（文末）\n{text[-2000:]}")
 
             return ToolResult(
                 success=True,
@@ -279,6 +289,7 @@ class PaperOps:
                 data={
                     "char_count": len(text),
                     "preview": text[:1000],
+                    "tail_preview": text[-1000:] if len(text) > 1000 else "",
                     "metadata": merged_metadata,
                     "verified": verified_metadata is not None,
                     "source": source,
@@ -339,12 +350,14 @@ class PaperOps:
     async def extract_metadata(self, file_path: str) -> ToolResult:
         """提取论文元数据（标题/作者/年份/DOI/摘要/关键词）"""
         try:
+            import asyncio
             full_path = self.workspace / file_path
             if not full_path.exists():
                 return ToolResult(success=False, error=f"文件不存在: {file_path}")
 
             ext = full_path.suffix.lower()
-            content = self._read_document(full_path, ext)
+            # 使用 to_thread 避免阻塞事件循环（PDF 解析是 CPU/IO 密集型）
+            content = await asyncio.to_thread(self._read_document, full_path, ext)
             if not content:
                 return ToolResult(success=False, error="无法读取文件内容")
 
@@ -743,23 +756,38 @@ class PaperOps:
         if not results:
             return None
 
-        # 从搜索结果中解析元数据
+        # 从搜索结果中解析元数据（同时验证标题相似度）
+        best_metadata = None
+        best_score = 0.0
+        SIMILARITY_THRESHOLD = 0.3
         for r in results:
-            text = f"{r.get('title', '')} {r.get('body', '')}"
+            result_title = r.get("title", "")
+            body = r.get("body", "")
+            # 标题相似度检查（搜索结果标题与原始标题的重叠度）
+            score = self._title_similarity(title, result_title)
+            if score < SIMILARITY_THRESHOLD:
+                continue
+            text = f"{result_title} {body}"
             metadata = self._parse_journal_metadata_from_text(text)
-            if metadata and metadata.get("journal"):
-                return metadata
+            if metadata and metadata.get("journal") and score > best_score:
+                best_metadata = metadata
+                best_score = score
 
-        return None
+        return best_metadata
 
     async def _search_crossref_by_title(self, title: str) -> Optional[dict]:
-        """通过标题搜索 CrossRef API 获取论文元数据"""
+        """通过标题搜索 CrossRef API 获取论文元数据
+
+        请求多条候选结果，用标题相似度筛选最匹配的项，
+        避免中文标题被 CrossRef 匹配到完全不相关的英文文献。
+        """
         try:
             import httpx
             import urllib.parse
 
             encoded_title = urllib.parse.quote(title)
-            url = f"https://api.crossref.org/works?query.bibliographic={encoded_title}&rows=1"
+            # 请求 5 条候选，用于相似度筛选
+            url = f"https://api.crossref.org/works?query.bibliographic={encoded_title}&rows=5"
 
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
@@ -774,61 +802,70 @@ class PaperOps:
             if not items:
                 return None
 
-            item = items[0]
-            metadata = {}
+            # 相似度阈值：低于此值视为不匹配（防止返回不相关结果如法律案例）
+            SIMILARITY_THRESHOLD = 0.3
+            best_metadata = None
+            best_score = 0.0
 
-            # 期刊名
-            container_titles = item.get("container-title", [])
-            if container_titles:
-                metadata["journal"] = container_titles[0]
+            for item in items:
+                titles = item.get("title", [])
+                if not titles:
+                    continue
+                candidate_title = titles[0]
+                score = self._title_similarity(title, candidate_title)
+                if score < SIMILARITY_THRESHOLD:
+                    continue
+                if score <= best_score:
+                    continue
 
-            # 标题
-            titles = item.get("title", [])
-            if titles:
-                metadata["title"] = titles[0]
+                metadata = {}
+                # 期刊名
+                container_titles = item.get("container-title", [])
+                if container_titles:
+                    metadata["journal"] = container_titles[0]
+                # 标题
+                metadata["title"] = candidate_title
+                # 作者
+                authors = item.get("author", [])
+                if authors:
+                    author_names = []
+                    for a in authors:
+                        given = a.get("given", "")
+                        family = a.get("family", "")
+                        name = f"{family}{given}".strip() if family or given else ""
+                        if name:
+                            author_names.append(name)
+                    if author_names:
+                        metadata["authors"] = ", ".join(author_names)
+                # 年份
+                date_parts = item.get("published", {}).get("date-parts", [[]])
+                if date_parts and date_parts[0]:
+                    metadata["year"] = str(date_parts[0][0])
+                # 卷期页
+                if item.get("volume"):
+                    metadata["volume"] = item["volume"]
+                if item.get("issue"):
+                    metadata["issue"] = item["issue"]
+                if item.get("page"):
+                    metadata["pages"] = item["page"]
+                # DOI
+                if item.get("DOI"):
+                    metadata["doi"] = item["DOI"]
+                # 摘要（CrossRef 摘要可能含 XML 标签）
+                if item.get("abstract"):
+                    abstract = re.sub(r"<[^>]+>", "", item["abstract"])
+                    metadata["abstract"] = abstract[:500]
+                # 关键词
+                subjects = item.get("subject", [])
+                if subjects:
+                    metadata["keywords"] = ", ".join(subjects)
 
-            # 作者
-            authors = item.get("author", [])
-            if authors:
-                author_names = []
-                for a in authors:
-                    given = a.get("given", "")
-                    family = a.get("family", "")
-                    name = f"{family}{given}".strip() if family or given else ""
-                    if name:
-                        author_names.append(name)
-                if author_names:
-                    metadata["authors"] = ", ".join(author_names)
+                # 必须有期刊名才算认证成功
+                if metadata.get("journal"):
+                    best_metadata = metadata
+                    best_score = score
 
-            # 年份
-            date_parts = item.get("published", {}).get("date-parts", [[]])
-            if date_parts and date_parts[0]:
-                metadata["year"] = str(date_parts[0][0])
-
-            # 卷期页
-            if item.get("volume"):
-                metadata["volume"] = item["volume"]
-            if item.get("issue"):
-                metadata["issue"] = item["issue"]
-            if item.get("page"):
-                metadata["pages"] = item["page"]
-
-            # DOI
-            if item.get("DOI"):
-                metadata["doi"] = item["DOI"]
-
-            # 摘要（CrossRef 摘要可能含 XML 标签）
-            if item.get("abstract"):
-                abstract = re.sub(r"<[^>]+>", "", item["abstract"])
-                metadata["abstract"] = abstract[:500]
-
-            # 关键词
-            subjects = item.get("subject", [])
-            if subjects:
-                metadata["keywords"] = ", ".join(subjects)
-
-            # 必须有期刊名才算认证成功
-            return metadata if metadata.get("journal") else None
+            return best_metadata
         except Exception:
             return None
 
@@ -898,6 +935,31 @@ class PaperOps:
             title = title[:100]
         return title
 
+    @staticmethod
+    def _title_similarity(a: str, b: str) -> float:
+        """计算两个标题的相似度（0~1），支持中英文混合
+
+        使用 difflib.SequenceMatcher 做整体比率，同时计算字符级重叠率，
+        取较高值以更好地处理中英文标题的匹配。
+        """
+        if not a or not b:
+            return 0.0
+        a_lower = a.lower().strip()
+        b_lower = b.lower().strip()
+        if a_lower == b_lower:
+            return 1.0
+        # SequenceMatcher 比率
+        from difflib import SequenceMatcher
+        ratio = SequenceMatcher(None, a_lower, b_lower).ratio()
+        # 字符重叠率（中文友好：计算共有字符占较短标题的比例）
+        a_chars = set(a_lower.replace(" ", ""))
+        b_chars = set(b_lower.replace(" ", ""))
+        if a_chars and b_chars:
+            overlap = len(a_chars & b_chars) / max(len(a_chars), len(b_chars))
+        else:
+            overlap = 0.0
+        return max(ratio, overlap)
+
     def _format_verified_metadata(self, metadata: dict, source: str) -> str:
         """格式化认证后的元数据为可读文本"""
         lines = [f"## 论文元数据认证（来源: {source}）"]
@@ -966,24 +1028,120 @@ class PaperOps:
         return file_path.read_text(encoding="utf-8", errors="ignore")
 
     def _parse_references(self, content: str) -> list[str]:
-        """从内容中解析参考文献列表"""
-        # 查找参考文献部分
+        """从内容中解析参考文献列表
+
+        支持多种标题格式：
+          - Markdown 标题：## 参考文献 / # References
+          - LaTeX：\\bibliography{...}
+          - 纯文本（PDF 提取的常见形式）：参考文献 / 参考文献：（无 # 前缀，可带冒号）
+          - 英文变体：REFERENCES / Bibliography / 文献
+        参考文献位于文末，匹配后取到文档结尾的内容。
+        支持全角方括号编号：［1］［2］...
+        兼容双栏排版 PDF 导致的文本顺序混乱（表格/图表可能插入在参考文献条目中间）。
+        """
+        # 查找参考文献部分（按匹配优先级排序）
         ref_patterns = [
-            r"##\s*参考文献.*?\n(.*?)(?=\n##|\Z)",
-            r"#\s*References.*?\n(.*?)(?=\n#|\Z)",
+            # Markdown 标题（保留原逻辑）
+            r"##\s*参考文献[:：]?.*?\n(.*?)(?=\n##\s|\Z)",
+            r"#\s*References[:：]?.*?\n(.*?)(?=\n#\s|\Z)",
+            # LaTeX bibliography
             r"\\bibliography\{([^}]+)\}",
+            # 纯文本标题（PDF 提取的常见形式，无 # 前缀，支持半角/全角冒号）
+            # 中文"参考文献"作为独立行/标题，后接参考文献条目直到文档结尾
+            r"(?:^|\n)\s*参\s*考\s*文\s*献\s*[:：]?\s*\n+(.*)",
+            # 英文 References 作为独立行/标题（全大写或首字母大写）
+            r"(?:^|\n)\s*References[:：]?\s*\n+(.*)",
+            r"(?:^|\n)\s*REFERENCES[:：]?\s*\n+(.*)",
+            r"(?:^|\n)\s*Bibliography[:：]?\s*\n+(.*)",
+            # 原宽松匹配（保留向后兼容）
             r"References\s*\n(.*?)(?=\n\n\n|\Z)",
         ]
         for pattern in ref_patterns:
             match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
             if match:
                 ref_text = match.group(1)
-                # 按行分割，过滤空行
-                refs = [r.strip() for r in ref_text.split("\n") if r.strip()]
-                # 移除编号前缀
-                refs = [re.sub(r"^\[\d+\]\s*", "", r) for r in refs]
-                refs = [re.sub(r"^\d+\.\s*", "", r) for r in refs]
-                return refs
+                # 按行分割，收集所有看起来像参考文献条目的行
+                # 编号模式：半角 [1] 或全角 ［1］
+                num_pattern = re.compile(r"^[\[［]\s*(\d+)\s*[\]］]")
+                lines = [r.strip() for r in ref_text.split("\n")]
+
+                # 收集编号的参考文献条目（以 [1] / ［1］ 开头）
+                numbered_refs = {}  # {序号: 条目文本}
+                current_num = None
+                # 跳过干扰模式（遇到表格/图表后，跳过内容直到下一个参考文献条目）
+                skip_until_next_ref = False
+                # 记录遇到的非参考文献内容（英文摘要等）
+                stop_triggered = False
+                stop_markers = [
+                    "Abstract:", "Key words:", "Keywords:", "作者简介",
+                    "基金项目", "致谢", "Acknowledgements", "附录", "Appendix",
+                ]
+
+                for line in lines:
+                    if not line:
+                        continue
+
+                    # 检查是否是新的参考文献条目
+                    m = num_pattern.match(line)
+                    if m:
+                        current_num = int(m.group(1))
+                        numbered_refs[current_num] = line
+                        skip_until_next_ref = False
+                        continue
+
+                    # 检查是否是表格/图表标题行
+                    is_table_fig = bool(re.match(r"^(?:表|图|Table|Figure|Fig\.)\s*\d+", line))
+                    if is_table_fig:
+                        skip_until_next_ref = True
+                        continue
+
+                    # 检查是否应该停止（遇到了参考文献之后的章节，如英文摘要）
+                    line_lower = line.lower()
+                    is_stop = False
+                    for marker in stop_markers:
+                        if marker.lower() in line_lower and len(line) < 200:
+                            is_stop = True
+                            break
+                    # 额外判断：如果行很长且是英文标题（通常在参考文献之后）
+                    if not is_stop and re.match(r"^[A-Z][a-zA-Z\s,]+$", line) and len(line) > 30 and numbered_refs:
+                        is_stop = True
+                    if is_stop:
+                        # 如果已经收集到了一些参考文献，就停止；否则继续
+                        if numbered_refs:
+                            stop_triggered = True
+                            break
+                        else:
+                            continue
+
+                    # 如果处于跳过干扰模式，跳过该行
+                    if skip_until_next_ref:
+                        # 但检查是否是页码/页眉（如 http://www... 或年份卷期号）
+                        if re.match(r"^https?://", line) or re.match(r"^\d{4}年\d+月", line):
+                            continue
+                        # 检查是否是明显的页码（·149 这样的）
+                        if re.match(r"^·\s*\d+\s*$", line):
+                            continue
+                        continue
+
+                    # 追加到当前条目
+                    if current_num is not None and len(line) >= 5:
+                        numbered_refs[current_num] += " " + line
+
+                if not numbered_refs:
+                    continue
+
+                # 按序号排序
+                refs = []
+                for num in sorted(numbered_refs.keys()):
+                    ref = numbered_refs[num]
+                    # 移除编号前缀
+                    ref = re.sub(r"^[\[［]\s*\d+\s*[\]］]\s*", "", ref)
+                    # 过滤过短条目
+                    if len(ref) >= 10:
+                        refs.append(ref)
+
+                if refs:
+                    return refs
         return []
 
     def _format_single_reference(self, ref: str, style: str) -> str:

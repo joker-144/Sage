@@ -472,31 +472,84 @@ async def chat_stream(req: ChatRequest):
 
 
 async def _collaborate_stream(req: ChatRequest):
-    """写作模式 SSE 流（智能选择流程：简单任务单Agent，复杂任务多智能体）"""
+    """写作模式 SSE 流（智能选择流程：简单任务单Agent，复杂任务多智能体）
+
+    与 chat_stream 一样采用 producer task + 心跳保活机制：
+    写作模式中意图分析、工具执行、_run_worker 收集输出等阶段可能长时间无事件，
+    需要定期发送 SSE 心跳注释（: heartbeat\\n\\n）防止前端 60s 超时 abort。
+    """
     from sage.agents.orchestrator import create_orchestrator
 
     orchestrator = create_orchestrator(workspace=_current_workspace())
     conv_id = req.conversation_id or str(uuid.uuid4())
 
+    async def event_stream():
+        """实际的事件生成器，由 producer task 驱动"""
+        try:
+            async for event in orchestrator.collaborate(req.message):
+                if event.type == "task_created":
+                    yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'plan', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n")
+                elif event.type == "worker_start":
+                    yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'start', 'role': event.role, 'content': event.content, 'tokens': event.tokens or {}}, ensure_ascii=False)}\n\n")
+                elif event.type == "worker_done":
+                    yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'done', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n")
+                elif event.type == "reflection":
+                    yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'reflection', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n")
+                elif event.type == "reasoning":
+                    yield ("event", f"event: reasoning\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
+                elif event.type == "text":
+                    yield ("event", f"event: text\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
+                elif event.type == "done":
+                    yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
+                    yield ("done", None)
+                    return
+        except Exception as e:
+            yield ("event", f"event: error\ndata: {json.dumps({'content': str(e), 'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
+            yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
+            yield ("done", None)
+
+    # 将事件生成器放入队列，主循环按心跳节奏消费
+    event_queue: asyncio.Queue = asyncio.Queue()
+
+    async def producer():
+        try:
+            async for item in event_stream():
+                await event_queue.put(item)
+        except Exception as e:
+            await event_queue.put(("event", f"event: error\ndata: {json.dumps({'content': str(e), 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"))
+            await event_queue.put(("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"))
+            await event_queue.put(("done", None))
+
+    producer_task = asyncio.create_task(producer())
+    heartbeat_interval = 10  # 秒（低于前端 60s 超时）
+
     try:
-        async for event in orchestrator.collaborate(req.message):
-            if event.type == "task_created":
-                yield f"event: collaborate\ndata: {json.dumps({'phase': 'plan', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
-            elif event.type == "worker_start":
-                yield f"event: collaborate\ndata: {json.dumps({'phase': 'start', 'role': event.role, 'content': event.content, 'tokens': event.tokens or {}}, ensure_ascii=False)}\n\n"
-            elif event.type == "worker_done":
-                yield f"event: collaborate\ndata: {json.dumps({'phase': 'done', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
-            elif event.type == "reflection":
-                yield f"event: collaborate\ndata: {json.dumps({'phase': 'reflection', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n"
-            elif event.type == "reasoning":
-                yield f"event: reasoning\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n"
-            elif event.type == "text":
-                yield f"event: text\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n"
-            elif event.type == "done":
-                yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-    except Exception as e:
-        yield f"event: error\ndata: {json.dumps({'content': str(e), 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-        yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+        while True:
+            try:
+                item_type, item_data = await asyncio.wait_for(
+                    event_queue.get(),
+                    timeout=heartbeat_interval,
+                )
+            except asyncio.TimeoutError:
+                # 10 秒无事件 — 发送心跳注释，保持连接活跃
+                if producer_task.done():
+                    break
+                yield ": heartbeat\n\n"
+                continue
+
+            if item_type == "done":
+                break
+            # item_type == "event"
+            yield item_data
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ── 对话管理接口 ──

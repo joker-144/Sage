@@ -345,14 +345,15 @@ class AgentLoop:
                         session_id=session_id,
                     )
 
-                    # 缓存成功的工具调用结果
+                    # 缓存成功的工具调用结果（使用完整 output，非截断 summary）
                     if result.success:
-                        _dedup_cache[dedup_key] = result.summary
+                        _dedup_cache[dedup_key] = result.output
 
-                    # 将结果加入上下文
-                    self.context.add_tool_result(call.id, call.name, result.summary)
+                    # 将完整结果加入 LLM 上下文（summary 会截断到 200 字符，导致 LLM 只能看到部分结果）
+                    tool_output = result.output if result.success else f"错误: {result.error}"
+                    self.context.add_tool_result(call.id, call.name, tool_output)
                     self._persist_message(
-                        "tool", result.summary,
+                        "tool", tool_output,
                         tool_call_id=call.id,
                         tool_name=call.name,
                     )
@@ -360,7 +361,7 @@ class AgentLoop:
                     yield LoopEvent(
                         type="tool_result",
                         tool_name=call.name,
-                        content=result.summary,
+                        content=tool_output,
                     )
                     total_tool_calls += 1
 
