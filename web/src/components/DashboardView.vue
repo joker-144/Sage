@@ -12,7 +12,7 @@ const stats = ref({
   todayToolCalls: 0,
   totalTokens: 0,
   activeAgents: 0,
-  apiVersion: '1.1.6',
+  apiVersion: '1.1.7',
 })
 
 const tokenStats = ref({
@@ -49,13 +49,13 @@ async function loadStats() {
   loading.value = true
   try {
     const [healthRes, memRes, tokenRes] = await Promise.allSettled([
-      fetch('/health'),
-      fetch('/memory/stats'),
-      fetch('/api/token-stats'),
+      fetch('/health', { signal: AbortSignal.timeout(10000) }),
+      fetch('/memory/stats', { signal: AbortSignal.timeout(10000) }),
+      fetch('/api/token-stats', { signal: AbortSignal.timeout(10000) }),
     ])
     if (healthRes.status === 'fulfilled') {
       const h = await healthRes.value.json()
-      stats.value.apiVersion = h.version || '1.1.6'
+      stats.value.apiVersion = h.version || '1.1.7'
     }
     if (memRes.status === 'fulfilled') {
       const m = await memRes.value.json()

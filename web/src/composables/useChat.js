@@ -29,6 +29,7 @@ export function useChat() {
 
   let currentAssistant = null
   let abortController = null
+  let sseTimedOut = false   // 标记是否因 SSE 超时而 abort（区分用户主动取消）
 
   function scrollToBottom() {
     nextTick(() => {
@@ -43,6 +44,7 @@ export function useChat() {
     saveConvId(null)
     // 新建对话时同样重置模块级引用 + 中断残留 SSE
     currentAssistant = null
+    sseTimedOut = false
     if (abortController) {
       abortController.abort()
       abortController = null
@@ -62,7 +64,9 @@ export function useChat() {
       isProcessing.value = false
     }
     try {
-      const res = await fetch(`/conversations/${convId}/messages?limit=200`)
+      const res = await fetch(`/conversations/${convId}/messages?limit=200`, {
+        signal: AbortSignal.timeout(15000),
+      })
       if (!res.ok) return
       const data = await res.json()
       conversationId.value = convId
@@ -215,6 +219,8 @@ export function useChat() {
   }
 
   function cancel() {
+    // 用户主动取消 — 标记为非超时，以便 catch 块区分
+    sseTimedOut = false
     if (abortController) {
       abortController.abort()
       abortController = null
@@ -260,7 +266,10 @@ export function useChat() {
     } catch (err) {
       // 切换对话时 currentAssistant 可能已被重置为 null，需做 null 检查
       if (currentAssistant) {
-        if (err.name === 'AbortError') {
+        if (err.name === 'AbortError' && sseTimedOut) {
+          // SSE 超时 — 后端长时间无响应（含心跳），提示用户检查后端
+          currentAssistant.content += `\n\n**请求超时：** 后端 ${SSE_TIMEOUT_MS / 1000} 秒内无响应，可能已停止运行或出现异常。请检查后端服务状态后重试。`
+        } else if (err.name === 'AbortError') {
           currentAssistant.content += `\n\n（已取消）`
         } else {
           currentAssistant.content += `\n\n**错误:** ${err.message}`
@@ -268,6 +277,7 @@ export function useChat() {
       }
     } finally {
       abortController = null
+      sseTimedOut = false
       isProcessing.value = false
       if (statusText.value === 'Agent 思考中...' || statusText.value.startsWith('执行:')) {
         statusText.value = '系统就绪'
@@ -279,6 +289,7 @@ export function useChat() {
 
   function streamChat(message) {
     abortController = new AbortController()
+    sseTimedOut = false   // 重置超时标记
 
     return new Promise((resolve, reject) => {
       // 读取前端设置并传递给后端
@@ -312,8 +323,9 @@ export function useChat() {
         body.pool_mode = true
       }
 
-      // SSE 超时兜底：3 分钟无任何数据则中止
+      // SSE 超时兜底：60 秒无任何数据则中止（后端 10s 心跳保活，超时说明后端异常）
       let sseTimer = setTimeout(() => {
+        sseTimedOut = true   // 标记为超时（区别于用户主动取消）
         if (abortController) {
           abortController.abort()
         }
@@ -439,6 +451,34 @@ export function useChat() {
         currentAssistant.reasoning = (currentAssistant.reasoning || '') + (data.content || '')
         scrollToBottom()
         break
+
+      case 'retry': {
+        // LLM 调用失败重试 — 在状态栏显示 "重试中 (1/3)..." 并在工具区记录
+        const attempt = data.attempt || 0
+        const maxRetries = data.max_retries || 0
+        const delay = data.delay || 0
+        const roleLabel = data.role ? {
+          supervisor: '主编', planner: '方法论专家', coder: '撰写员',
+          reviewer: '审校核查员', debugger: '修订员',
+          literature: '文献调研员', citation: '引用管理员', consolidator: '整理汇报员',
+          general: '通用助手',
+        }[data.role] || data.role : ''
+        const rolePrefix = roleLabel ? `[${roleLabel}] ` : ''
+        statusText.value = `${rolePrefix}重试中 (${attempt}/${maxRetries})，${delay}秒后重试...`
+        // 在工具区展示重试信息（作为一条特殊的工具调用卡片）
+        currentAssistant.tools.push({
+          name: 'llm_retry',
+          args: { attempt, max_retries: maxRetries, delay },
+          content: data.content || '',
+          result: data.error ? `错误: ${data.error}` : '',
+          expanded: false,
+          done: true,
+          isRetry: true,
+          agentName: roleLabel,
+        })
+        scrollToBottom()
+        break
+      }
 
       case 'text':
         // 协作模式下 text 事件带 role 字段，在内容前标注角色

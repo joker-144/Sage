@@ -97,7 +97,9 @@ async function fetchModels(providerId, apiKey, baseUrl) {
     if (apiKey) params.set('api_key', apiKey)
     if (baseUrl) params.set('base_url', baseUrl)
 
-    const resp = await fetch(`/api/models?${params}`)
+    const resp = await fetch(`/api/models?${params}`, {
+      signal: AbortSignal.timeout(15000),
+    })
     const data = await resp.json()
 
     if (data.error) {
@@ -244,7 +246,9 @@ async function refreshAllModels() {
     if (!key || !url) continue
     try {
       const params = new URLSearchParams({ provider: p.id, api_key: key, base_url: url })
-      const resp = await fetch(`/api/models?${params}`)
+      const resp = await fetch(`/api/models?${params}`, {
+        signal: AbortSignal.timeout(15000),
+      })
       const data = await resp.json()
       if (data.models?.length) {
         results.push({ provider: p.id, models: data.models })
@@ -386,18 +390,27 @@ onMounted(() => {
   loadLocalModels()
 })
 
-function saveSettings() {
+async function saveSettings() {
   try {
     localStorage.setItem('sage-settings', JSON.stringify(settings.value))
   } catch { /* ignore */ }
-  // 同步写入服务端磁盘持久化
-  fetch('/api/user-settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(settings.value),
-  }).catch(() => {})
-  saved.value = true
-  setTimeout(() => saved.value = false, 2000)
+  // 同步写入服务端磁盘持久化（await 确保后端真正写入成功后再提示已保存，
+  // 避免请求失败时前端误显示"已保存"，导致后端 .env 仍为旧值引发 401）
+  try {
+    const resp = await fetch('/api/user-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings.value),
+    })
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`)
+    }
+    saved.value = true
+    setTimeout(() => saved.value = false, 2000)
+  } catch (e) {
+    console.error('[SettingsPanel] 保存到服务端失败:', e)
+    alert(`配置保存失败：${e}\n请重试，否则后端可能仍使用旧的 API Key。`)
+  }
 }
 
 function resetSettings() {

@@ -49,7 +49,7 @@ from sage.tools.engine import ToolEngine
 @dataclass
 class LoopEvent:
     """AgentLoop 产生的事件（供 CLI/API 展示）"""
-    type: str  # "tool_start" | "tool_result" | "text" | "reasoning" | "error" | "done"
+    type: str  # "tool_start" | "tool_result" | "text" | "reasoning" | "retry" | "error" | "done"
     content: str = ""
     tool_name: str = ""
     tool_args: dict = None
@@ -235,6 +235,18 @@ class AgentLoop:
                         elif _itype == "reasoning_delta":
                             streamed_reasoning = True
                             yield LoopEvent(type="reasoning", content=item.get("content", ""))
+                        elif _itype == "retry":
+                            # LLM 调用失败即将重试 — 通知前端展示 "重试中 (1/3)..."
+                            yield LoopEvent(
+                                type="retry",
+                                content=f"LLM 调用失败，{item.get('delay', 0)}秒后重试（{item.get('attempt', 0)}/{item.get('max_retries', 0)}）",
+                                tool_args={
+                                    "attempt": item.get("attempt", 0),
+                                    "max_retries": item.get("max_retries", 0),
+                                    "delay": item.get("delay", 0),
+                                    "error": item.get("error", ""),
+                                },
+                            )
                     else:
                         # 流结束，收到完整 ChatMessage（含累积的 tool_calls/usage）
                         response = item
@@ -535,6 +547,8 @@ class AgentLoop:
 
         Yields:
             dict: {"type": "text_delta"|"reasoning_delta", "content": "..."}
+            dict: {"type": "retry", "attempt": 当前重试次数, "max_retries": 最大重试次数,
+                   "delay": 等待秒数, "error": 错误信息}  — 重试前通知调用方展示给用户
             ChatMessage: 流结束后的完整消息（最后产出）
         """
         retry_cfg = RetryConfig(max_retries=3, base_delay=1.0, max_delay=30.0)
@@ -581,6 +595,14 @@ class AgentLoop:
                 if retry_cfg.jitter:
                     import random
                     delay *= (0.5 + random.random())
+                # 通知调用方即将重试（供前端展示 "重试中 (1/3)..."）
+                yield {
+                    "type": "retry",
+                    "attempt": attempt + 1,
+                    "max_retries": retry_cfg.max_retries,
+                    "delay": round(delay, 1),
+                    "error": str(e)[:200],
+                }
                 await asyncio.sleep(delay)
 
         raise RetryExhaustedError(f"LLM 调用异常: {last_error}") from last_error
@@ -635,11 +657,11 @@ class AgentLoop:
         )
 
         if not reflection.needs_correction:
-            # 如果不需修正但有建议，将建议注入到最后一条助理消息后
-            if reflection.suggestion:
-                self.context.add_assistant_message(
-                    f"[反思建议] {reflection.suggestion}"
-                )
+            # 如果不需修正但有建议，将建议附加到工具结果中
+            # （不能单独添加 assistant 消息，否则在多 tool_calls 场景下会破坏
+            #   tool_calls → tool results 的消息顺序，导致 LLM 400 错误）
+            if reflection.suggestion and result.success:
+                result.output = f"{result.output}\n\n[反思建议] {reflection.suggestion}"
             return result
 
         # 需要修正 → 最多重试 2 次

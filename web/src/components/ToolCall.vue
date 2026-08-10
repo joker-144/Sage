@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { ref, computed } from 'vue'
 
 const props = defineProps({
@@ -16,12 +16,14 @@ function getIcon(name) {
     git_add: '+', git_create_branch: 'Br', error: '!',
     web_search: 'WS', web_search_pro: 'WS', web_fetch: 'WF',
     list_skills: 'SL', install_skill: 'SI', search_remote_skills: 'SR',
+    llm_retry: '↻',
   }
   return map[name] || '?'
 }
 
 function getColor(name) {
   if (name === 'error') return 'var(--error)'
+  if (name === 'llm_retry') return '#f59e0b'
   if (name.startsWith('git')) return '#8b5cf6'
   if (name.includes('search')) return '#0ea5e9'
   if (name.includes('write') || name.includes('edit')) return '#f97316'
@@ -31,6 +33,7 @@ function getColor(name) {
 
 function getCategory(tool) {
   if (tool.isAgent) return '智能体'
+  if (tool.isRetry) return '重试'
   const name = tool.name
   if (name === 'error') return '错误'
   if (name.startsWith('git')) return 'Git'

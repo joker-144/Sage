@@ -445,6 +445,9 @@ async def chat_stream(req: ChatRequest):
                         yield f"event: reasoning\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "text":
                         yield f"event: text\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
+                    elif event.type == "retry":
+                        # LLM 调用重试通知 — 前端展示 "重试中 (1/3)..."
+                        yield f"event: retry\ndata: {json.dumps({'content': event.content, 'attempt': (event.tool_args or {}).get('attempt', 0), 'max_retries': (event.tool_args or {}).get('max_retries', 0), 'delay': (event.tool_args or {}).get('delay', 0), 'error': (event.tool_args or {}).get('error', '')}, ensure_ascii=False)}\n\n"
                     elif event.type == "error":
                         yield f"event: error\ndata: {json.dumps({'content': event.content, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
                     elif event.type == "done":
@@ -499,6 +502,10 @@ async def _collaborate_stream(req: ChatRequest):
                     yield ("event", f"event: reasoning\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
                 elif event.type == "text":
                     yield ("event", f"event: text\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
+                elif event.type == "retry":
+                    # LLM 调用重试通知 — 前端展示 "重试中 (1/3)..."
+                    meta = event.metadata or {}
+                    yield ("event", f"event: retry\ndata: {json.dumps({'content': event.content, 'role': event.role, 'attempt': meta.get('attempt', 0), 'max_retries': meta.get('max_retries', 0), 'delay': meta.get('delay', 0), 'error': meta.get('error', '')}, ensure_ascii=False)}\n\n")
                 elif event.type == "done":
                     yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
                     yield ("done", None)
@@ -1377,13 +1384,20 @@ async def download_model(req: DownloadModelRequest):
 def _get_data_dir() -> Path:
     """获取用户数据目录
 
-    打包后 main.cjs 会将 cwd 设为 %LOCALAPPDATA%/Sage 并通过 SAGE_DATA_DIR 环境变量传递，
-    开发时默认为当前工作目录。
+    优先级（与 sage.config._get_data_dir 保持一致）：
+    1. 环境变量 SAGE_DATA_DIR（Electron main.cjs 设置）
+    2. PyInstaller frozen 模式 → %LOCALAPPDATA%/Sage
+    3. 开发模式 → 当前工作目录
     """
     import os as _os
+    import sys as _sys
     env_dir = _os.environ.get("SAGE_DATA_DIR", "")
     if env_dir:
         return Path(env_dir)
+    if getattr(_sys, "frozen", False):
+        local_appdata = _os.environ.get("LOCALAPPDATA", "")
+        if local_appdata:
+            return Path(local_appdata) / "Sage"
     return Path.cwd()
 
 

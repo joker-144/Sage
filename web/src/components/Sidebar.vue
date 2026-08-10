@@ -70,7 +70,9 @@ function isAgentActive(role) {
 async function fetchConversations() {
   loadingConversations.value = true
   try {
-    const res = await fetch('/conversations?limit=20')
+    const res = await fetch('/conversations?limit=20', {
+      signal: AbortSignal.timeout(10000),
+    })
     if (res.ok) {
       const data = await res.json()
       conversations.value = data.conversations || []
