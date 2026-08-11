@@ -41,7 +41,7 @@ function readAppVersion() {
       }
     } catch { /* ignore */ }
   }
-  return '1.1.8';
+  return '1.1.9';
 }
 
 const APP_VERSION = readAppVersion();

@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -22,10 +23,37 @@ from pydantic import BaseModel, Field
 from sage import __version__
 from sage.config import get_config, reset_config
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期 — 启动时后台预热 Embedding 模型
+
+    避免首条消息处理时才懒加载模型导致明显延迟（开发环境约30s，桌面端
+    onefile 模式首次解压 .pyd/.dll 需数分钟）。
+
+    后台执行不阻塞应用就绪，与前端初始化并行；即使预热未完成用户就发消息，
+    LocalEmbedder._ensure_model 的类级单例锁会复用正在进行的加载，不会重复加载。
+    """
+    async def _warmup_embedder():
+        try:
+            from sage.context.index import LocalEmbedder
+            embedder = LocalEmbedder()
+            # 在线程池中执行，避免阻塞 asyncio 事件循环
+            await asyncio.to_thread(embedder._ensure_model)
+        except Exception:
+            # 预热失败不影响应用启动，首条消息时仍会尝试加载
+            pass
+
+    asyncio.create_task(_warmup_embedder())
+
+    yield
+
+
 app = FastAPI(
     title="Sage API",
     description="Sage — 多智能体协作的学术论文写作辅助系统",
     version=__version__,
+    lifespan=lifespan,
 )
 
 # CORS 允许前端直连后端（绕过 Vite 代理的 SSE 缓冲问题）
