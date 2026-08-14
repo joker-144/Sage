@@ -2,7 +2,7 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
-**当前版本：1.1.7** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+**当前版本：1.1.9** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
 
 ---
 
@@ -31,10 +31,19 @@
 - **写作模式（智能选择流程）**：内置意图分析结构（规则快速判断 + LLM 精细分析），简单任务自动路由到匹配角色 Agent 或通用助手，复杂任务启动 8 智能体完整协作流程，兼顾效率与质量。
 - **多智能体协作**：8 个角色分工（主编 / 文献调研员 / 方法论专家 / 撰写员 / 引用管理员 / 整理汇报员 / 审校核查员 / 修订员），采用"主编动态调度 + 批次并行执行"协作模式。
 - **动态执行计划**：主编根据用户需求用 LLM 生成执行计划（JSON 格式），按批次组织子智能体并行执行，通过规则校验依赖合理性，不通过时回退到经典串行流程。
+- **共享草稿文档（全文一致性）**：[`PaperProject`](src/sage/paper_project.py) 作为多智能体共享草稿，大纲（章节树 + 字数预算）、各角色完整产出、正文分节持久化存储，下游角色可读全文而非 2000 字符残片，成稿落盘 `paper.md`，支持跨会话加载与多轮修订。
+- **大纲先行**：主编先出 IMRaD 结构化大纲，撰写员按大纲逐节撰写，每节以 `##` 标题开头，避免章节遗漏与结构混乱。
+- **确定性质量门与二次复核**：[`paper_quality.py`](src/sage/paper_quality.py) 做不依赖 LLM 的硬校验（章节完整性、`[CITE:]` 残留、参考文献存在、字数预算），发现可修复问题触发"审校→修订→再查"二次复核闭环（上限 2 轮），修订后再跑 LLM 软复核验证。
+- **数据占位与来源建议**：撰写阶段对实验数据/统计结果用 `【数据】` 占位（禁止编造），成稿后 [`paper_data.py`](src/sage/paper_data.py) 扫描占位，由 LLM 生成"数据处理与来源建议"。
+- **多格式导出**：[`paper_export.py`](src/sage/paper_export.py) 支持 LaTeX / Word 导出，成稿自动导出 `paper.tex`。
+- **生成前成本预估**：`estimate_paper_cost()` 按大纲目标字数预估全文规模与 LLM 调用量，批次执行前反馈给用户。
+- **长任务进度反馈**：工具执行期间实时上报进度（`index_papers` 按文件、`ocr_document` 按页、`parse_pdf` 按阶段、`check_plagiarism` 按段落），前端状态栏与工具卡片进度条同步更新。
 - **LLM 重试可视化**：LLM 调用重试过程通过 SSE 事件实时反馈，状态栏显示"重试中 (1/3)..."，工具区展示橙色重试卡片（含尝试次数、重试原因、延迟），用户全程可见。
 - **思考内容输出**：自动捕获推理模型（如 DeepSeek-R1）的思考链（reasoning_content），以独立卡片展示，默认折叠，支持点击展开查看完整推理过程。
 - **token 消耗透明**：工具调用、智能体调用、技能调用卡片后方实时显示该轮消耗的 token 总数，便于成本监控。
-- **本地文献索引**：基于 `sentence-transformers`（all-MiniLM-L6-v2，384 维）构建向量化索引，语义检索已上传文献库，无需依赖外部 API。
+- **会话并发保护**：同一会话同一时刻只允许一个 SSE 请求，冲突时返回 `busy` 事件并提示"上一条消息仍在处理中"；Agent 缓存采用 LRU 淘汰，跳过运行中会话避免误删。
+- **配置原子写**：`.env` 采用临时文件 + `os.replace()` 原子替换 + 写锁，API Key 日志脱敏，写失败显式返回 500 而非静默。
+- **本地文献索引（可选）**：基于 `sentence-transformers`（all-MiniLM-L6-v2，384 维）构建向量化索引，语义检索已上传文献库。`sentence-transformers` 已从核心依赖移出为 `embed` 可选依赖，未安装时对话功能不受影响，仅向量索引相关功能提示安装。
 - **多文档解析**：支持 PDF / Word / LaTeX / 扫描版 OCR，自动提取标题、作者、年份、DOI、摘要、关键词等元数据，并通过外部源（维普/万方/CrossRef）认证纠正期刊名等关键字段。
 - **外部学术检索**：集成 Google Scholar / arXiv / CrossRef / Semantic Scholar 四大学术数据源，用于补充检索与引用真实性验证；额外集成 `search_cnki` 工具，通过维普/万方 web 检索 + CrossRef API 回退认证论文元数据（如纠正 PDF 提取中常见的期刊名/栏目名混淆问题）。
 - **联网搜索（可选）**：集成 Tavily AI 搜索（`web_search_pro`），当 DuckDuckGo 免费搜索结果质量不高时自动切换，需配置 `TAVILY_API_KEY`（每月 1000 次免费额度）。
@@ -69,6 +78,9 @@ pip install -e .
 
 # （可选）安装论文文档解析依赖
 pip install -e ".[paper]"
+
+# （可选）安装本地向量索引（文献索引/语义检索/语义记忆，含 sentence-transformers）
+pip install -e ".[embed]"
 
 # （可选）安装开发与测试依赖
 pip install -e ".[dev]"
@@ -134,7 +146,7 @@ Sage 采用 6 层架构，自底向上：
 | **2. 开发框架层** | `agent/loop.py`, `agent/system_prompt.py` | 自研 Agentic Loop（思考 → 调用工具 → 观察结果 → 继续思考） |
 | **3. 记忆与上下文层** | `memory/`, `context/` | SQLite 持久化 + 向量 Embedding + 对话历史压缩 |
 | **4. 工具与集成层** | `tools/`, `skill_system.py` | 18+ Sage 专用工具 + 技能系统 + SkillHub 远程技能下载 |
-| **5. 多 Agent 协同层** | `agents/` | 8 个角色智能体 + 主编动态调度 + 批次并行执行 + 多重验证 |
+| **5. 多 Agent 协同层** | `agents/`, `paper_project.py`, `paper_quality.py`, `paper_data.py`, `paper_export.py` | 8 个角色智能体 + 主编动态调度 + 批次并行执行 + 共享草稿文档 + 确定性质量门 + 二次复核 + 数据占位 + 多格式导出 |
 | **6. 运维与治理层** | `core/observability.py`, `core/resilience.py`, `core/mcp.py` | 可观测性 + 弹性重试 + 断路器 + MCP 协议支持 |
 
 ### 协作流程
@@ -180,13 +192,21 @@ Sage 采用 6 层架构，自底向上：
                                         │
                                         ▼
                      ┌────────────────────────────────────────────┐
-                     │  Step 3: 按批次并行执行                     │
+                     │  Step 3: 大纲先行 + 成本预估                │
+                     │  主编生成 IMRaD 结构化大纲（章节+字数预算） │
+                     │  estimate_paper_cost() 反馈规模与调用量     │
+                     └──────────────────┬─────────────────────────┘
+                                        │
+                                        ▼
+                     ┌────────────────────────────────────────────┐
+                     │  Step 4: 按批次并行执行（写入 PaperProject  │
+                     │  共享草稿，下游读全文而非残片）             │
                      │                                            │
                      │  批次1: ┌──────────┐ ┌──────────┐          │
                      │         │文献调研员│ │方法论专家│  并行    │
                      │         └──────────┘ └──────────┘          │
                      │  批次2: ┌──────────┐                       │
-                     │         │ 撰写员  │                        │
+                     │         │ 撰写员  │ 按大纲逐节写           │
                      │         └──────────┘                       │
                      │  批次3: ┌──────────────┐                   │
                      │         │ 整理汇报员   │  整合产出          │
@@ -201,19 +221,49 @@ Sage 采用 6 层架构，自底向上：
                                         │
                                         ▼
                      ┌────────────────────────────────────────────┐
-                     │  Step 4: 主编执行最终质量检查               │
+                     │  Step 5: 确定性质量门（paper_quality.py）   │
+                     │  章节完整性 / [CITE:] 残留 / 参考文献存在   │
+                     │  / 字数预算（纯规则，不依赖 LLM）           │
+                     └──────────────────┬─────────────────────────┘
+                                        │
+                          ┌─────────────┴─────────────┐
+                          │ 有可修复问题？             │
+                          └─────────────┬─────────────┘
+                     是 ─────────────────┘ └────────────────┘ 否
+                     ▼                                      ▼
+                     ┌──────────────────────┐  ┌──────────────────┐
+                     │ 审校→修订二次复核    │  │ 直接进入下一步   │
+                     │ （上限 2 轮）        │  └────────┬─────────┘
+                     │ 修订后再跑 LLM 软复核│           │
+                     └──────────┬───────────┘           │
+                                └──────────┬────────────┘
+                                           ▼
+                     ┌────────────────────────────────────────────┐
+                     │  Step 6: 数据占位扫描 + 成稿落盘           │
+                     │  paper_data.py 扫描【数据】占位生成来源建议│
+                     │  PaperProject.finalize() 落盘 paper.md     │
+                     └──────────────────┬─────────────────────────┘
+                                        │
+                                        ▼
+                     ┌────────────────────────────────────────────┐
+                     │  Step 7: 多格式导出                         │
+                     │  paper_export.py 自动导出 paper.tex        │
+                     │  支持 LaTeX / Word 导出                    │
                      └──────────────────┬─────────────────────────┘
                                         │
         ┌──────────┬───────────────────┘
         │          │
         ▼          ▼
-     最终论文输出
+     最终论文输出（paper.md + paper.tex）
 ```
 
 **关键设计**：
 - 同一批次内的子智能体通过 [`_run_parallel_workers`](src/sage/agents/orchestrator.py) 并行执行，使用 `asyncio.as_completed()` 实时收集事件
 - 后续批次可依赖前置批次的产出（通过 `batch_results` 字典累积传递上下文）
 - 依赖规则校验（如 citation 依赖 coder/consolidator，reviewer 依赖 coder/citation 等）确保执行顺序合理
+- 共享草稿 [`PaperProject`](src/sage/paper_project.py)：各角色完整产出写入草稿，下游读全文（仅超 45000 token 预算才安全阀截断），解决"前序产出只剩 2000 字符残片"的全文一致性瓶颈
+- 确定性质量门与二次复核：[`paper_quality.py`](src/sage/paper_quality.py) 硬校验触发"审校→修订→再查"闭环（上限 2 轮），修订后 LLM 软复核二次验证
+- 多轮修订路由：修订类指令（"把结论改保守"）读已有草稿修改并写回；新论文任务清空旧稿
 - LLM 调用重试通过 SSE `retry` 事件透传，全过程对用户可见
 
 ---
@@ -425,7 +475,9 @@ Sage 支持多工作空间，按"时间戳_领域标签"命名（如 `20260721_1
 | `LLM_CHAT_STREAMING` | 是否流式输出 | `true` |
 | `LLM_CHAT_MAX_TOOL_ROUNDS` | 单轮对话最大工具调用次数 | `20` |
 
-### Embedding 配置
+### Embedding 配置（可选，需安装 `embed` extra）
+
+> `sentence-transformers` 已从核心依赖移出。未安装时对话功能不受影响，仅文献索引、语义检索、语义记忆降级不可用。安装：`pip install 'sage-paper[embed]'`
 
 | 环境变量 | 说明 | 默认值 |
 |----------|------|--------|
@@ -647,25 +699,42 @@ python scripts/bump_version.py set 1.2.3
 ### 安装开发依赖
 
 ```bash
-pip install -e ".[dev,paper]"
+pip install -e ".[dev,paper,embed]"
 ```
 
 ### 运行测试
 
+测试采用标准库 `unittest` 风格，位于 `tests/` 目录，直接用 Python 运行（需设置 `PYTHONPATH` 指向 `src`）：
+
 ```bash
-pytest tests/ -v                              # 全部测试
-pytest tests/test_workspace_manager.py -v     # 单个测试文件
-pytest tests/test_api.py::TestSageWorkspacesAPI::test_upload_file -v  # 指定测试
+# Windows (PowerShell)
+$env:PYTHONPATH="src"
+python tests/test_paper_project.py      # 单个测试文件
+python tests/test_paper_quality.py      # 质量门边界测试
+python tests/test_paper_export.py       # LaTeX/Word 导出测试
+python tests/test_paper_data.py         # 数据占位扫描测试
+python tests/test_orchestrator_context.py  # 编排器端到端测试
+
+# macOS / Linux
+PYTHONPATH=src python tests/test_paper_project.py
 ```
 
-测试套件覆盖配置、记忆、上下文索引、工具、技能系统、智能体、工作空间管理、API、Agent Loop 等模块（共 200+ 测试用例）。
+当前测试套件覆盖以下模块：
+
+| 测试文件 | 覆盖范围 |
+|----------|----------|
+| `test_paper_project.py` | PaperProject 共享草稿（大纲/素材/分节存储、save/load 往返、finalize 落盘、read_draft 一致性） |
+| `test_paper_quality.py` | 确定性质量门（章节完整性、`[CITE:]` 残留、参考文献存在、字数预算、`### References` 边界） |
+| `test_paper_export.py` | LaTeX/Word 导出（标题/加粗/列表/引用转义、空草稿、特殊字符、`.docx` 真实生成） |
+| `test_paper_data.py` | `【数据】` 占位扫描（位置定位、上下文截取、章节推断） |
+| `test_orchestrator_context.py` | 编排器端到端（意图→计划→大纲→成本预估→批次→质量门→修订→软复核→数据建议→导出，含 LLM mock） |
 
 ### 测试隔离设计
 
-- 每个测试通过 `tmp_path` + `monkeypatch.chdir` 实现文件系统隔离
-- `env_setup` 夹具显式设置所有环境变量，避免 `.env` 污染
-- `reset_singletons` autouse 夹具在每个测试前后重置 `config` 和 `store` 单例
-- 使用 `MockLLMClient` 避免真实 API 调用，加快测试速度
+- 临时数据固定放在 `_test_data/tmp_testdata/`（用 `os.makedirs` 创建，`shutil.rmtree` 清理），避免沙箱拦截 `tempfile.mkdtemp`
+- 测试用例通过 `os.environ["SAGE_DATA_DIR"]` 指向独立工作目录，避免污染全局配置
+- 编排器端到端测试用 `_FakeWorker` 与 mock 函数替换 `_analyze_intent`/`_generate_execution_plan`/`_generate_outline`/`_get_worker_by_role_name`，避免真实 LLM 调用
+- 导出测试在装了 `python-docx` 的环境真实生成 `.docx` 并重新打开校验内容，未装时验证抛出带安装指引的 `RuntimeError`
 
 ### 代码规范
 

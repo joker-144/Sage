@@ -11,10 +11,15 @@ dist/
 build/
 !web/build/
 .trae
-.github/
 
 # 调试临时文件
 body.json
+_test_data/
+.pytest_cache/
+pytest-cache-files-*
+tests/tmp_testdata/
+tests/.tmp/
+tests
 
 # Node.js
 node_modules/

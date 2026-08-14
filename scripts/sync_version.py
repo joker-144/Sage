@@ -12,6 +12,7 @@ sync_version.py — 统一版本号同步脚本
   python scripts/sync_version.py --check    # CI 用：发现不一致则退出码 1
 
 被 web/package.json 的 prebuild / prepack 钩子自动调用。
+
 """
 from __future__ import annotations
 

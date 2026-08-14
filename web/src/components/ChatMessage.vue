@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
 import ToolCall from './ToolCall.vue'
@@ -101,7 +102,10 @@ watch(() => props.message.content, (newVal, oldVal) => {
 const renderedContent = computed(() => {
   const text = typedContent.value
   if (!text) return ''
-  try { return marked.parse(text) } catch { return text }
+  try {
+    // XSS 防护：marked 输出后经 DOMPurify 净化，剥离脚本/事件处理器/危险 URL
+    return DOMPurify.sanitize(marked.parse(text))
+  } catch { return text }
 })
 </script>
 
