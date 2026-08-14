@@ -20,16 +20,34 @@ Embedding: 本地 sentence-transformers（all-MiniLM-L6-v2，384 维）
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
 from sage.memory.store import MemoryStore
+
+logger = logging.getLogger(__name__)
+
+
+def _import_sentence_transformers():
+    """导入 sentence-transformers（可选依赖）
+
+    未安装时抛出带安装指引的 RuntimeError，避免裸 ImportError 让用户困惑。
+    """
+    try:
+        import sentence_transformers as st
+        return st
+    except ImportError as e:
+        raise RuntimeError(
+            "本地向量索引需要 sentence-transformers 库，请安装可选依赖: "
+            "pip install 'sage-paper[embed]'"
+        ) from e
 
 
 @dataclass
@@ -145,8 +163,8 @@ class LocalEmbedder:
                 if progress_callback:
                     progress_callback("loading", 50, "正在加载内置模型...")
                 try:
-                    from sentence_transformers import SentenceTransformer
-                    LocalEmbedder._model = SentenceTransformer(bundled_path)
+                    st = _import_sentence_transformers()
+                    LocalEmbedder._model = st.SentenceTransformer(bundled_path)
                     if progress_callback:
                         progress_callback("ready", 100, "模型就绪")
                     return LocalEmbedder._model
@@ -161,8 +179,8 @@ class LocalEmbedder:
                 if progress_callback:
                     progress_callback("loading", 50, "正在加载模型到内存...")
                 try:
-                    from sentence_transformers import SentenceTransformer
-                    LocalEmbedder._model = SentenceTransformer(model_name)
+                    st = _import_sentence_transformers()
+                    LocalEmbedder._model = st.SentenceTransformer(model_name)
                     if progress_callback:
                         progress_callback("ready", 100, "模型就绪")
                     return LocalEmbedder._model
@@ -174,13 +192,13 @@ class LocalEmbedder:
             # 需要下载 → 流式下载并报告进度（清除离线标记以允许联网下载）
             os.environ.pop("HF_HUB_OFFLINE", None)
             try:
-                from sentence_transformers import SentenceTransformer
+                st = _import_sentence_transformers()
                 model_dir = self._download_model_streaming(model_name, progress_callback)
 
                 if progress_callback:
                     progress_callback("loading", 95, "正在加载模型到内存...")
 
-                LocalEmbedder._model = SentenceTransformer(model_dir or model_name)
+                LocalEmbedder._model = st.SentenceTransformer(model_dir or model_name)
 
                 if progress_callback:
                     progress_callback("ready", 100, "模型就绪")
@@ -197,7 +215,7 @@ class LocalEmbedder:
                     "  3. 磁盘空间不足\n"
                     "语义搜索和记忆检索功能将降级不可用，但对话功能不受影响。"
                 )
-                print(f"[Sage] {error_msg}", file=sys.stderr)
+                logger.error("Embedding 模型加载失败: %s", error_msg)
                 raise RuntimeError(error_msg) from e
 
         return LocalEmbedder._model
@@ -423,18 +441,19 @@ class CrossEncoderReranker:
             bundled_path = embedder_helper._get_bundled_model_path(model_name)
             if bundled_path:
                 os.environ["HF_HUB_OFFLINE"] = "1"
-                from sentence_transformers import CrossEncoder
-                CrossEncoderReranker._model = CrossEncoder(bundled_path, max_length=512)
+                st = _import_sentence_transformers()
+                CrossEncoderReranker._model = st.CrossEncoder(bundled_path, max_length=512)
                 return True
             # 已缓存 → 设置离线模式，跳过 HEAD 更新检查
             if LocalEmbedder._is_model_cached(model_name):
                 os.environ["HF_HUB_OFFLINE"] = "1"
-            from sentence_transformers import CrossEncoder
-            CrossEncoderReranker._model = CrossEncoder(model_name, max_length=512)
+            st = _import_sentence_transformers()
+            CrossEncoderReranker._model = st.CrossEncoder(model_name, max_length=512)
             return True
-        except Exception:
+        except Exception as e:
             # 模型下载/加载失败 — 标记降级，后续调用跳过重排
             CrossEncoderReranker._load_failed = True
+            logger.warning("CrossEncoder 重排模型不可用，检索降级为仅 bi-encoder 召回: %s", e)
             return False
 
     def rerank(self, query: str, chunks: list[CodeChunk], top_k: int = 5) -> list[CodeChunk]:
@@ -460,8 +479,9 @@ class CrossEncoderReranker:
                 chunk.score = float(score)
             chunks.sort(key=lambda c: c.score, reverse=True)
             return chunks[:top_k]
-        except Exception:
+        except Exception as e:
             # 重排出错 — 降级返回原顺序
+            logger.warning("CrossEncoder 重排失败，降级返回 bi-encoder 结果: %s", e)
             return chunks[:top_k]
 
 
@@ -641,11 +661,14 @@ class ProjectIndex:
         except Exception:
             pass
 
-    def index_project(self, force: bool = False) -> dict:
+    def index_project(self, force: bool = False, progress: Optional[Callable[..., None]] = None) -> dict:
         """索引整个工作空间（论文文档 + 文本文件）
 
         Args:
             force: 是否强制重新索引（忽略 hash 跳过逻辑）
+            progress: 可选进度回调 progress(message, current, total)，
+                      在索引每个文件时调用（可能在 to_thread 工作线程中执行，
+                      调用方需自行保证线程安全）
 
         Returns:
             统计信息 {"files": N, "chunks": N, "skipped": N}
@@ -659,7 +682,11 @@ class ProjectIndex:
         # 索引后向量缓存失效
         self._embeddings_cache = None
 
-        for file_path in self._walk_source_files():
+        source_files = list(self._walk_source_files())
+        total_files = len(source_files)
+        processed = 0
+
+        for file_path in source_files:
             try:
                 content = self._read_file_content(file_path)
             except (UnicodeDecodeError, PermissionError, OSError):
@@ -668,7 +695,10 @@ class ProjectIndex:
             if not content or not content.strip():
                 continue
 
+            processed += 1
             rel_path = str(file_path.relative_to(self.workspace)).replace("\\", "/")
+            if progress:
+                progress(f"正在索引 ({processed}/{total_files}): {rel_path}", processed, total_files)
             file_hash = hashlib.md5(content.encode()).hexdigest()
 
             # 增量更新：跳过未修改的文件
@@ -727,7 +757,7 @@ class ProjectIndex:
                 stats["files"] += 1
             except Exception as e:
                 # 单个文件处理失败不影响其他文件
-                print(f"[Sage] 索引文件失败 {rel_path}: {e}", file=sys.stderr)
+                logger.warning("索引文件失败 %s: %s", rel_path, e)
                 continue
 
         # 索引完成后写入 schema 版本号

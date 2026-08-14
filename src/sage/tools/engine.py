@@ -17,6 +17,8 @@ Sage 系统工具分为:
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +45,39 @@ class ToolEngine:
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self._tools: dict[str, ToolDef] = {}
+        # 进度上报队列（由 AgentLoop 在执行工具期间设置）
+        # 长任务工具通过 progress 参数上报进度，实现前端实时进度展示
+        self._progress_queue: asyncio.Queue | None = None
         self._register_defaults()
+
+    def set_progress_queue(self, queue: asyncio.Queue | None):
+        """设置/清除进度上报队列（AgentLoop 在工具执行期间调用）"""
+        self._progress_queue = queue
+
+    def _make_progress_reporter(self, tool_name: str) -> Callable[..., None]:
+        """构造进度上报函数（线程安全，可安全传给 asyncio.to_thread 中的代码）
+
+        使用 loop.call_soon_threadsafe 把进度投递回事件循环队列，
+        无论调用方处于事件循环线程还是工作线程都不会出错。
+        """
+        queue = self._progress_queue
+        loop = asyncio.get_running_loop()
+
+        def report(message: str = "", current: int | None = None, total: int | None = None):
+            if queue is None:
+                return
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, {
+                    "tool": tool_name,
+                    "message": message,
+                    "current": current,
+                    "total": total,
+                })
+            except RuntimeError:
+                # 事件循环已关闭等极端情况 — 静默丢弃进度，不影响工具执行
+                pass
+
+        return report
 
     def _register_defaults(self):
         """注册内置工具（Sage 论文写作系统）"""
@@ -132,7 +166,17 @@ class ToolEngine:
 
         tool = self._tools[name]
         try:
-            return await tool.func(**arguments)
+            kwargs = dict(arguments)
+            # 进度注入：工具函数声明了 progress 参数且当前有进度队列时，
+            # 注入线程安全的进度上报函数（无队列时不注入，保持原签名行为）
+            if self._progress_queue is not None:
+                try:
+                    params = inspect.signature(tool.func).parameters
+                except (TypeError, ValueError):
+                    params = {}
+                if "progress" in params:
+                    kwargs["progress"] = self._make_progress_reporter(name)
+            return await tool.func(**kwargs)
         except TypeError as e:
             return ToolResult(success=False, error=f"参数错误: {e}")
         except Exception as e:

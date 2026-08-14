@@ -18,6 +18,7 @@ PyInstaller spec for Sage.
 
 import sys
 import atexit
+import importlib.util
 from pathlib import Path
 from PyInstaller.utils.hooks import (
     collect_data_files,
@@ -74,12 +75,19 @@ atexit.register(_restore_dev_data)
 # ── 收集隐式数据 / 元数据 ────────────────────────────────
 # sentence-transformers / huggingface-hub 依赖大量动态元数据
 datas = []
-datas += copy_metadata("sentence-transformers")
-datas += copy_metadata("huggingface-hub")
-datas += copy_metadata("transformers")
-datas += copy_metadata("tokenizers")
-datas += copy_metadata("safetensors")
-datas += copy_metadata("torch")
+# sentence-transformers 为可选依赖（[embed]）：未安装时跳过相关收集，
+# 打包产物仍可正常启动，仅本地向量索引功能不可用
+_has_sentence_transformers = importlib.util.find_spec("sentence_transformers") is not None
+if _has_sentence_transformers:
+    datas += copy_metadata("sentence-transformers")
+    datas += copy_metadata("huggingface-hub")
+    datas += copy_metadata("transformers")
+    datas += copy_metadata("tokenizers")
+    datas += copy_metadata("safetensors")
+    datas += copy_metadata("torch")
+else:
+    print("[sage.spec] 警告: 未安装 sentence-transformers（可选依赖 'sage-paper[embed]'），"
+          "打包产物将不含本地向量索引功能")
 datas += copy_metadata("numpy")
 datas += copy_metadata("tiktoken")
 
@@ -184,16 +192,17 @@ for _model_dir_name in _pretrained_models:
 # ── 隐式导入（PyInstaller 静态分析可能漏掉的动态导入）───
 hiddenimports = []
 hiddenimports += collect_submodules("sage")
-hiddenimports += collect_submodules("sentence_transformers")
-hiddenimports += collect_submodules("huggingface_hub")
-hiddenimports += collect_submodules("transformers")
+if _has_sentence_transformers:
+    hiddenimports += collect_submodules("sentence_transformers")
+    hiddenimports += collect_submodules("huggingface_hub")
+    hiddenimports += collect_submodules("transformers")
+    hiddenimports += collect_submodules("tokenizers")
+    hiddenimports += collect_submodules("torch")
+    hiddenimports += collect_submodules("scipy")
+    hiddenimports += collect_submodules("sklearn")
 hiddenimports += collect_submodules("tiktoken")
 hiddenimports += collect_submodules("fitz")        # pymupdf
 hiddenimports += collect_submodules("docx")       # python-docx
-hiddenimports += collect_submodules("torch")
-hiddenimports += collect_submodules("scipy")
-hiddenimports += collect_submodules("sklearn")
-hiddenimports += collect_submodules("tokenizers")
 # OCR 引擎子模块（rapidocr_onnxruntime 动态导入各子包）
 hiddenimports += collect_submodules("rapidocr_onnxruntime")
 hiddenimports += collect_submodules("onnxruntime")

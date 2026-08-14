@@ -1,4 +1,4 @@
-﻿"""
+"""
 语义记忆系统 — Semantic Memory
 
 基于向量检索的知识召回系统。
@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Optional
 
 import numpy as np
 
 from sage.memory.store import MemoryStore, get_store
+
+logger = logging.getLogger(__name__)
 
 
 class SemanticMemory:
@@ -60,7 +63,8 @@ class SemanticMemory:
         try:
             embedding = self.embedder.encode([content])[0]
             emb_bytes = embedding.tobytes()
-        except Exception:
+        except Exception as e:
+            logger.warning("语义记忆向量化失败，将以无向量形式存储: %s", e)
             emb_bytes = b""
 
         return self.store.store_memory_embedding(
@@ -84,7 +88,8 @@ class SemanticMemory:
         texts = [m["content"] for m in memories]
         try:
             embeddings = self.embedder.encode(texts)
-        except Exception:
+        except Exception as e:
+            logger.warning("批量记忆向量化失败，将以无向量形式存储: %s", e)
             embeddings = [np.array([], dtype=np.float32)] * len(texts)
 
         ids = []
@@ -113,7 +118,8 @@ class SemanticMemory:
         """
         try:
             query_vec = self.embedder.encode([query])[0]
-        except Exception:
+        except Exception as e:
+            logger.warning("语义记忆检索向量化失败: %s", e)
             return []
 
         # 加载所有带向量的记忆

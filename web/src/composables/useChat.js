@@ -480,6 +480,47 @@ export function useChat() {
         break
       }
 
+      case 'busy':
+        // 同一会话已有请求在处理中 — 后端拒绝本次请求，提示用户稍候
+        currentAssistant.content = data.content || '该对话上一条消息仍在处理中，请稍候再发送。'
+        statusText.value = '上一条消息仍在处理中'
+        break
+
+      case 'progress': {
+        // 长任务进度通知（索引/OCR/查重等）— 更新状态栏 + 进行中工具卡片
+        const roleLabels = {
+          supervisor: '主编', planner: '方法论专家', coder: '撰写员',
+          reviewer: '审校核查员', debugger: '修订员',
+          literature: '文献调研员', citation: '引用管理员', consolidator: '整理汇报员',
+          general: '通用助手',
+        }
+        const current = data.current || 0
+        const total = data.total || 0
+        const fraction = total > 0 && current > 0 ? `（${current}/${total}）` : ''
+        if (data.role) {
+          const label = roleLabels[data.role] || data.role
+          statusText.value = `[${label}] ${data.content || ''}${fraction}`
+        } else {
+          statusText.value = `执行: ${data.tool || ''} ${data.content || ''}${fraction}`.trim()
+        }
+        // 将进度附加到对应的进行中工具卡片（找不到时退回最后一张未完成卡片）
+        let target = null
+        if (data.tool) {
+          target = [...currentAssistant.tools].reverse().find(t => !t.done && t.name === data.tool)
+        }
+        if (!target) {
+          target = [...currentAssistant.tools].reverse().find(t => !t.done)
+        }
+        if (target) {
+          target.progress = {
+            message: data.content || '',
+            current,
+            total,
+          }
+        }
+        break
+      }
+
       case 'text':
         // 协作模式下 text 事件带 role 字段，在内容前标注角色
         if (data.role) {

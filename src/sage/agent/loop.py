@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -45,11 +46,13 @@ from sage.llm.client import LLMClient
 from sage.memory.store import get_store
 from sage.tools.engine import ToolEngine
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class LoopEvent:
     """AgentLoop 产生的事件（供 CLI/API 展示）"""
-    type: str  # "tool_start" | "tool_result" | "text" | "reasoning" | "retry" | "error" | "done"
+    type: str  # "tool_start" | "tool_result" | "text" | "reasoning" | "retry" | "progress" | "error" | "done"
     content: str = ""
     tool_name: str = ""
     tool_args: dict = None
@@ -113,14 +116,15 @@ class AgentLoop:
             skill_text = SkillLoader().format_for_prompt()
             if skill_text:
                 self.system_prompt += skill_text
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("注入技能信息到 system prompt 失败: %s", e)
 
         # v0.6.0 三层记忆注入
         try:
             from sage.memory.memory_orch import MemoryOrchestrator
             self._memory_orch = MemoryOrchestrator(enable_semantic=True)
-        except Exception:
+        except Exception as e:
+            logger.warning("初始化记忆编排器失败: %s", e)
             self._memory_orch = None
 
         # 对话隔离：新对话不预加载跨会话长期记忆摘要到 system prompt，
@@ -159,9 +163,9 @@ class AgentLoop:
             if not self.conversation_id:
                 self.conversation_id = str(uuid.uuid4())
             store.create_conversation(self.conversation_id)
-        except Exception:
+        except Exception as e:
             # 持久化失败不影响核心功能
-            pass
+            logger.warning("初始化对话记录失败: %s", e)
 
     async def run(self, user_input: str) -> AsyncIterator[LoopEvent]:
         """运行 Agent 循环，流式输出事件 (v0.5.0 增强)
@@ -196,8 +200,8 @@ class AgentLoop:
                 if sem_text:
                     # 将语义记忆追加到 system prompt 中，重新构建上下文
                     self.context.system_prompt = self.system_prompt + sem_text
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("语义记忆召回失败: %s", e)
 
         # 重置反思状态（新任务开始）
         if self.reflection_engine:
@@ -355,10 +359,39 @@ class AgentLoop:
                         )
                         continue
 
-                    result = await self._execute_tool_with_reflection(
-                        call=call,
-                        session_id=session_id,
+                    # 工具执行期间挂接进度队列：长任务（索引/OCR/查重等）
+                    # 通过 progress 参数上报进度，实时透传给前端
+                    self._progress_queue = asyncio.Queue()
+                    self.tools.set_progress_queue(self._progress_queue)
+                    exec_task = asyncio.create_task(
+                        self._execute_tool_with_reflection(call=call, session_id=session_id)
                     )
+                    try:
+                        while not exec_task.done():
+                            try:
+                                prog = await asyncio.wait_for(
+                                    self._progress_queue.get(), timeout=0.5
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                            yield LoopEvent(
+                                type="progress",
+                                content=prog.get("message", ""),
+                                tool_args={
+                                    "tool": prog.get("tool", ""),
+                                    "current": prog.get("current"),
+                                    "total": prog.get("total"),
+                                },
+                            )
+                        result = await exec_task
+                    except asyncio.CancelledError:
+                        # 客户端断开 → 取消仍在执行的工具，避免后台残留任务
+                        if not exec_task.done():
+                            exec_task.cancel()
+                        raise
+                    finally:
+                        self.tools.set_progress_queue(None)
+                        self._progress_queue = None
 
                     # 缓存成功的工具调用结果（使用完整 output，非截断 summary）
                     if result.success:
@@ -454,7 +487,8 @@ class AgentLoop:
             if response.usage:
                 self._persist_token_usage(response.usage, session_id)
             return response.content or ""
-        except Exception:
+        except Exception as e:
+            logger.warning("生成轮数上限总结失败: %s", e)
             return ""
 
     def _persist_token_usage(self, usage: dict, session_id: str):
@@ -470,8 +504,8 @@ class AgentLoop:
                 session_id=session_id,
                 model=getattr(self.llm, "model", ""),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("持久化 token 用量失败: %s", e)
 
     def _save_session_memory(self):
         """保存当前对话到长期记忆（会话摘要 + 语义索引）"""
@@ -489,8 +523,8 @@ class AgentLoop:
                 conversation_id=self.conversation_id,
                 messages=msgs,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("保存会话记忆失败: %s", e)
 
     async def _call_llm_with_retry(self, messages: list, tools: list, session_id: str):
         """带弹性重试的 LLM 调用
@@ -720,8 +754,8 @@ class AgentLoop:
             # 用首条用户消息自动设置对话标题
             if role == "user":
                 store.update_conversation_title(self.conversation_id, content)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("持久化消息失败 (role=%s): %s", role, e)
 
     def _format_tool_call(self, name: str, args: dict) -> str:
         """格式化工具调用用于展示"""

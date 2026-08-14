@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,9 +45,9 @@ async def lifespan(app: FastAPI):
             embedder = LocalEmbedder()
             # 在线程池中执行，避免阻塞 asyncio 事件循环
             await asyncio.to_thread(embedder._ensure_model)
-        except Exception:
+        except Exception as e:
             # 预热失败不影响应用启动，首条消息时仍会尝试加载
-            pass
+            logger.warning("Embedding 模型预热失败: %s", e)
 
     asyncio.create_task(_warmup_embedder())
 
@@ -114,6 +119,13 @@ else:
 # key: conversation_id, value: AgentLoop 实例
 _MAX_AGENTS = 50  # 缓存上限，防止内存无限增长
 _agents: dict[str, "AgentLoop"] = {}
+# 最近使用时间（unix 秒），配合 LRU 淘汰
+_agent_last_used: dict[str, float] = {}
+# 正在处理中的会话集合 — 并发请求保护：
+# 同一会话同一时刻只允许一个 SSE 请求在执行，后续请求返回 busy 提示
+_conv_busy: set[str] = set()
+# .env 写锁 — 防止并发保存配置时读改写竞态
+_ENV_WRITE_LOCK = threading.Lock()
 
 
 async def _pool_search_literature(query: str, top_k: int | None = None):
@@ -146,7 +158,8 @@ async def _pool_search_literature(query: str, top_k: int | None = None):
                     r["workspace_id"] = ws_id
                     r["workspace_tag"] = ws_tag
                     all_results.append(r)
-        except Exception:
+        except Exception as e:
+            logger.warning("池模式检索工作空间 %s 失败: %s", ws_id, e)
             continue
 
     if not all_results:
@@ -201,6 +214,19 @@ def _apply_pool_mode(agent, pool_mode: bool):
         agent.tools.register("search_literature", paper_ops.search_literature, SEARCH_LITERATURE_SCHEMA)
 
 
+def _evict_lru_agent():
+    """LRU 淘汰：删除最久未使用且当前未在处理中的 Agent
+
+    正在处理中的会话（在 _conv_busy 中）绝不淘汰，即使因此短暂超过缓存上限。
+    """
+    candidates = [cid for cid in _agents if cid not in _conv_busy]
+    if not candidates:
+        return
+    oldest = min(candidates, key=lambda cid: _agent_last_used.get(cid, 0.0))
+    del _agents[oldest]
+    _agent_last_used.pop(oldest, None)
+
+
 def _get_or_create_agent(conversation_id: str | None = None):
     """获取或创建 Agent（按 conversation_id 复用，保持多轮对话上下文）
 
@@ -210,6 +236,7 @@ def _get_or_create_agent(conversation_id: str | None = None):
     from sage.agent.loop import create_agent
 
     if conversation_id and conversation_id in _agents:
+        _agent_last_used[conversation_id] = time.time()
         return _agents[conversation_id], conversation_id
 
     agent = create_agent(workspace=_current_workspace(), conversation_id=conversation_id)
@@ -218,12 +245,12 @@ def _get_or_create_agent(conversation_id: str | None = None):
     if conversation_id:
         _restore_agent_context(agent, conversation_id)
 
-    # 超过上限时淘汰最早的 Agent
+    # 超过上限时按 LRU 淘汰最久未使用的 Agent
     if len(_agents) >= _MAX_AGENTS:
-        oldest = next(iter(_agents))
-        del _agents[oldest]
+        _evict_lru_agent()
 
     _agents[agent.conversation_id] = agent
+    _agent_last_used[agent.conversation_id] = time.time()
     return agent, agent.conversation_id
 
 
@@ -231,16 +258,44 @@ def _restore_agent_context(agent, conversation_id: str):
     """从 SQLite 恢复历史消息到 Agent 的 ContextManager 中
 
     这样 Agent 在回答前就知道之前对话的全部内容，避免 AI 失忆。
+
+    带 token 预算控制：从最新消息往前累计，超出预算（默认取配置
+    summary_trigger_tokens）的更早消息被丢弃，并在上下文开头插入系统提示，
+    避免超长对话恢复后直接顶满上下文窗口。
     """
     import json as _json
     try:
         from sage.memory.store import get_store
+        from sage.context.tokenizer import count_tokens
         store = get_store()
         msgs = store.get_messages(conversation_id, limit=500)
         if not msgs:
             return
 
-        for msg in msgs:
+        cfg = get_config()
+        budget = int(cfg.summary_trigger_tokens or 45000)
+
+        # 从最新往前选，控制总 token 数在预算内
+        selected: list[dict] = []
+        used = 0
+        omitted = 0
+        for msg in reversed(msgs):
+            content = msg.get("content") or ""
+            tool_args_raw = msg.get("tool_args") or ""
+            est = count_tokens(content) + count_tokens(tool_args_raw) + 4
+            if used + est > budget and selected:
+                omitted += 1
+                continue
+            selected.append(msg)
+            used += est
+
+        if omitted:
+            agent.context.add_user_message(
+                f"（系统提示：更早的 {omitted} 条历史消息因上下文长度限制未加载，"
+                "如需回顾请直接提问。）"
+            )
+
+        for msg in reversed(selected):  # 恢复为时间顺序
             role = msg.get("role")
             content = msg.get("content") or ""
             tool_name = msg.get("tool_name")
@@ -254,8 +309,8 @@ def _restore_agent_context(agent, conversation_id: str):
                 if tool_args_raw:
                     try:
                         tool_calls = _json.loads(tool_args_raw)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("解析历史 tool_calls 失败 conversation_id=%s: %s", conversation_id, e)
                 agent.context.add_assistant_message(content, tool_calls if tool_calls else None)
             elif role == "tool":
                 agent.context.add_tool_result(
@@ -263,9 +318,9 @@ def _restore_agent_context(agent, conversation_id: str):
                     tool_name=tool_name or "",
                     result=content,
                 )
-    except Exception:
-        # 恢复失败不影响核心功能
-        pass
+    except Exception as e:
+        # 恢复失败不影响核心功能，但必须留痕
+        logger.warning("恢复对话上下文失败 conversation_id=%s: %s", conversation_id, e)
 
 
 # ── 请求/响应模型 ──
@@ -418,6 +473,13 @@ async def chat_stream(req: ChatRequest):
     _apply_pool_mode(agent, req.pool_mode)
 
     async def event_stream():
+        # 并发保护：同一会话已有请求在处理中 → busy 提示，避免上下文互相污染
+        if conv_id in _conv_busy:
+            yield f"event: busy\ndata: {json.dumps({'content': '该对话上一条消息仍在处理中，请稍候再发送。'}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+            return
+        _conv_busy.add(conv_id)
+
         event_queue: asyncio.Queue = asyncio.Queue()
 
         async def agent_producer():
@@ -471,6 +533,10 @@ async def chat_stream(req: ChatRequest):
                             yield f"event: tool_result\ndata: {json.dumps({'tool': event.tool_name, 'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "reasoning":
                         yield f"event: reasoning\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
+                    elif event.type == "progress":
+                        # 长任务进度通知（索引/OCR/查重等）
+                        pa = event.tool_args or {}
+                        yield f"event: progress\ndata: {json.dumps({'content': event.content, 'tool': pa.get('tool', ''), 'current': pa.get('current'), 'total': pa.get('total')}, ensure_ascii=False)}\n\n"
                     elif event.type == "text":
                         yield f"event: text\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
                     elif event.type == "retry":
@@ -490,6 +556,7 @@ async def chat_stream(req: ChatRequest):
         finally:
             if not producer_task.done():
                 producer_task.cancel()
+            _conv_busy.discard(conv_id)
 
     return StreamingResponse(
         event_stream(),
@@ -516,6 +583,14 @@ async def _collaborate_stream(req: ChatRequest):
 
     async def event_stream():
         """实际的事件生成器，由 producer task 驱动"""
+        # 并发保护：同一会话已有请求在处理中 → busy 提示，避免上下文互相污染
+        if conv_id in _conv_busy:
+            yield ("event", f"event: busy\ndata: {json.dumps({'content': '该对话上一条消息仍在处理中，请稍候再发送。'}, ensure_ascii=False)}\n\n")
+            yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
+            yield ("done", None)
+            return
+        _conv_busy.add(conv_id)
+
         try:
             async for event in orchestrator.collaborate(req.message):
                 if event.type == "task_created":
@@ -528,6 +603,10 @@ async def _collaborate_stream(req: ChatRequest):
                     yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'reflection', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n")
                 elif event.type == "reasoning":
                     yield ("event", f"event: reasoning\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
+                elif event.type == "progress":
+                    # 长任务进度通知（索引/OCR/查重等），带角色前缀
+                    meta = event.metadata or {}
+                    yield ("event", f"event: progress\ndata: {json.dumps({'content': event.content, 'role': event.role, 'tool': meta.get('tool', ''), 'current': meta.get('current'), 'total': meta.get('total')}, ensure_ascii=False)}\n\n")
                 elif event.type == "text":
                     yield ("event", f"event: text\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
                 elif event.type == "retry":
@@ -585,6 +664,7 @@ async def _collaborate_stream(req: ChatRequest):
                 await producer_task
             except (asyncio.CancelledError, Exception):
                 pass
+        _conv_busy.discard(conv_id)
 
 
 # ── 对话管理接口 ──
@@ -1437,8 +1517,8 @@ def _load_user_settings() -> dict:
     try:
         if _USER_SETTINGS_FILE.exists():
             return json.loads(_USER_SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("加载 settings.json 失败: %s", e)
     return {}
 
 
@@ -1453,84 +1533,99 @@ _DOTENV_KEY_MAP = {
 
 
 def _save_to_dotenv(data: dict) -> None:
-    """将前端用户配置写入 .env 文件，确保后端始终使用前端配置"""
-    dotenv_path = _get_data_dir() / ".env"
-    if not dotenv_path.exists():
-        # 打包后首次运行通常没有 .env，自动创建空文件
-        try:
+    """将前端用户配置写入 .env 文件，确保后端始终使用前端配置
+
+    原子写入：先写临时文件再 os.replace，崩溃/并发中断不会留下半截 .env。
+    写失败抛异常由上层转成 500 返回，不再静默吞掉。
+    """
+    with _ENV_WRITE_LOCK:
+        dotenv_path = _get_data_dir() / ".env"
+        if not dotenv_path.exists():
+            # 打包后首次运行通常没有 .env，自动创建空文件
             dotenv_path.parent.mkdir(parents=True, exist_ok=True)
             dotenv_path.touch()
-        except Exception as e:
-            print(f"[WARN] 无法创建 .env 文件: {dotenv_path} ({e})")
+
+        # 从 data 中提取值，映射为 .env 变量
+        env_values: dict[str, str] = {}
+        for env_key, keys in _DOTENV_KEY_MAP.items():
+            if env_key == "LLM_CHAT_API_KEY":
+                # apiKeys 是 { provider: key } 字典，需要知道当前 provider
+                api_keys = data.get("apiKeys") or {}
+                provider = data.get("provider", "deepseek")
+                value = api_keys.get(provider, "")
+            else:
+                # 其他字段直接取
+                value = data.get(keys[0])
+            if value is not None and value != "":
+                env_values[env_key] = str(value)
+
+        if not env_values:
             return
 
-    # 从 data 中提取值，映射为 .env 变量
-    env_values: dict[str, str] = {}
-    for env_key, keys in _DOTENV_KEY_MAP.items():
-        if env_key == "LLM_CHAT_API_KEY":
-            # apiKeys 是 { provider: key } 字典，需要知道当前 provider
-            api_keys = data.get("apiKeys") or {}
-            provider = data.get("provider", "deepseek")
-            value = api_keys.get(provider, "")
-        else:
-            # 其他字段直接取
-            value = data.get(keys[0])
-        if value is not None and value != "":
-            env_values[env_key] = str(value)
+        # 读取当前 .env，逐行替换
+        lines = dotenv_path.read_text(encoding="utf-8").splitlines()
+        new_lines: list[str] = []
+        updated_keys = set()
+        for line in lines:
+            stripped = line.strip()
+            # 跳过注释，但保留
+            if stripped.startswith("#") or "=" not in stripped:
+                new_lines.append(line)
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in env_values:
+                new_lines.append(f"{key}={env_values[key]}")
+                updated_keys.add(key)
+            else:
+                new_lines.append(line)
 
-    if not env_values:
-        return
+        # 追加尚未在 .env 中的新变量
+        for key, value in env_values.items():
+            if key not in updated_keys:
+                new_lines.append(f"{key}={value}")
 
-    # 读取当前 .env，逐行替换
-    lines = dotenv_path.read_text(encoding="utf-8").splitlines()
-    new_lines: list[str] = []
-    updated_keys = set()
-    for line in lines:
-        stripped = line.strip()
-        # 跳过注释，但保留
-        if stripped.startswith("#") or "=" not in stripped:
-            new_lines.append(line)
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in env_values:
-            new_lines.append(f"{key}={env_values[key]}")
-            updated_keys.add(key)
-        else:
-            new_lines.append(line)
-
-    # 追加尚未在 .env 中的新变量
-    for key, value in env_values.items():
-        if key not in updated_keys:
-            new_lines.append(f"{key}={value}")
-
-    dotenv_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    print(f"[INFO] .env 已更新: {', '.join(f'{k}={v}' for k, v in env_values.items())}")
+        # 原子替换：临时文件 + os.replace，避免写入中断损坏 .env
+        tmp_path = dotenv_path.with_name(".env.tmp")
+        tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        os.replace(tmp_path, dotenv_path)
+        # 日志脱敏：API Key 只显示前后各 4 位
+        masked = {
+            k: (v[:4] + "..." + v[-4:] if len(v) > 12 else "***")
+            for k, v in env_values.items()
+        }
+        logger.info(".env 已更新: %s", masked)
 
 
 def _save_user_settings(data: dict) -> None:
-    """将用户配置写入磁盘，同时写入 .env 并重载配置"""
+    """将用户配置写入磁盘，同时写入 .env 并重载配置
+
+    settings.json 写入失败仅告警（.env 是权威来源）；
+    .env 写入失败向上抛异常，由接口返回 500。
+    """
     # 1) 写入 data/settings.json（保持向前兼容）
     try:
         _USER_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         _USER_SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
-        print(f"[WARN] 保存 settings.json 失败: {e}")
+        logger.warning("保存 settings.json 失败: %s", e)
 
-    # 2) 写入 .env 并重载配置
+    # 2) 写入 .env 并重载配置（失败向上传播）
     _save_to_dotenv(data)
     reset_config()
     # 触发一次 get_config() 让新配置生效并打印
     cfg = get_config()
     masked_key = cfg.llm_chat_api_key[:8] + "..." + cfg.llm_chat_api_key[-4:] if len(cfg.llm_chat_api_key) > 12 else "***"
-    print(f"[INFO] 配置已重载: model={cfg.llm_chat_model}, base_url={cfg.llm_chat_base_url}, api_key={masked_key}")
+    logger.info("配置已重载: model=%s, base_url=%s, api_key=%s", cfg.llm_chat_model, cfg.llm_chat_base_url, masked_key)
 
     # 3) 清空已缓存的 AgentLoop 实例
     # 已缓存的 Agent 在创建时就持有了旧 LLMClient（用旧 config 初始化），
     # 仅 reset_config 不会更新它们的 api_key。清空后下次对话会用新配置重建 AgentLoop。
+    # 注意：_conv_busy 不清空，正在处理的会话由请求自身的 finally 负责释放。
     cleared = len(_agents)
     _agents.clear()
+    _agent_last_used.clear()
     if cleared:
-        print(f"[INFO] 已清空 {cleared} 个缓存的 Agent 实例，下次对话将使用新配置")
+        logger.info("已清空 %d 个缓存的 Agent 实例，下次对话将使用新配置", cleared)
 
 
 @app.get("/api/user-settings")
@@ -1556,7 +1651,11 @@ async def save_user_settings(payload: UserSettingsPayload):
     # 仅更新传入的非 None 字段
     update = payload.model_dump(exclude_none=True)
     current.update(update)
-    _save_user_settings(current)
+    try:
+        _save_user_settings(current)
+    except Exception as e:
+        logger.error("保存用户配置失败: %s", e)
+        raise HTTPException(status_code=500, detail=f"配置保存失败: {e}")
     return {"success": True}
 
 

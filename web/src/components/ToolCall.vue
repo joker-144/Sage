@@ -52,6 +52,19 @@ const tokenText = computed(() => {
   return `${total}`
 })
 
+// 长任务进度（progress SSE 事件附加到工具卡片）
+const progress = computed(() => props.tool.progress || null)
+const progressFraction = computed(() => {
+  const p = progress.value
+  if (!p || !p.total || !p.current) return ''
+  return `${p.current}/${p.total}`
+})
+const progressStyle = computed(() => {
+  const p = progress.value
+  if (!p || !p.total || !p.current) return {}  // 未知进度 → 不确定动画
+  return { width: `${Math.min(100, Math.round((p.current / p.total) * 100))}%` }
+})
+
 function copyResult() {
   navigator.clipboard.writeText(props.tool.result || '')
   copied.value = true
@@ -110,6 +123,14 @@ function copyResult() {
           <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
         </svg>
       </div>
+    </div>
+
+    <!-- 长任务进度条（progress 事件驱动） -->
+    <div v-if="progress && !tool.done" class="tool-progress">
+      <div class="progress-bar">
+        <div class="progress-fill" :class="{ indeterminate: !progress.total }" :style="progressStyle"></div>
+      </div>
+      <span class="progress-text">{{ progress.message }}<template v-if="progressFraction"> ({{ progressFraction }})</template></span>
     </div>
 
     <transition name="fade">
@@ -230,6 +251,37 @@ function copyResult() {
 .chevron.rotated { transform: rotate(180deg); }
 
 .tool-body { padding: 0 9px 9px; }
+
+/* 长任务进度条 */
+.tool-progress {
+  display: flex; align-items: center; gap: 7px;
+  padding: 0 9px 7px;
+}
+.progress-bar {
+  flex: 1; height: 4px; min-width: 60px;
+  background: var(--bg-hover);
+  border-radius: 2px; overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+.progress-fill.indeterminate {
+  width: 40%;
+  animation: progressSlide 1.2s ease-in-out infinite;
+}
+@keyframes progressSlide {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+.progress-text {
+  font-size: 9px; color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 55%;
+}
 
 .tool-section { margin-top: 5px; }
 

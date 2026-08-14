@@ -10,7 +10,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sage.tools.types import ToolResult
 
@@ -41,15 +41,21 @@ class PaperOps:
 
     # ── 文献与索引工具 ──
 
-    async def index_papers(self, force: bool = False) -> ToolResult:
-        """对工作空间中的论文文档建立向量索引"""
+    async def index_papers(self, force: bool = False, progress: Optional[Callable[..., None]] = None) -> ToolResult:
+        """对工作空间中的论文文档建立向量索引
+
+        progress: 可选进度上报函数 progress(message, current, total)，
+                  由 ToolEngine 在执行期间注入，用于前端实时进度展示。
+        """
         try:
             import asyncio
             from sage.context.index import ProjectIndex
             store = self._get_store()
             indexer = ProjectIndex(self.workspace, store)
+            if progress:
+                progress("正在扫描工作空间文件...")
             # 使用 to_thread 避免阻塞事件循环（索引涉及 embedding 计算，CPU 密集）
-            stats = await asyncio.to_thread(indexer.index_project, force=force)
+            stats = await asyncio.to_thread(indexer.index_project, force=force, progress=progress)
             return ToolResult(
                 success=True,
                 output=(
@@ -191,7 +197,7 @@ class PaperOps:
         except Exception as e:
             return ToolResult(success=False, error=f"格式化失败: {e}")
 
-    async def check_plagiarism(self, content: str, threshold: float = 0.8) -> ToolResult:
+    async def check_plagiarism(self, content: str, threshold: float = 0.8, progress: Optional[Callable[..., None]] = None) -> ToolResult:
         """查重检测，识别与已索引文献的重复内容"""
         try:
             from sage.context.index import ProjectIndex
@@ -201,7 +207,10 @@ class PaperOps:
             # 将内容分段检索
             paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
             duplicates = []
+            total = len(paragraphs)
             for i, para in enumerate(paragraphs):
+                if progress and (i % 5 == 0 or i == total - 1):
+                    progress(f"正在比对第 {i + 1}/{total} 段...", i + 1, total)
                 results = indexer.search(para, top_k=1)
                 if results and results[0].score >= threshold:
                     duplicates.append({
@@ -225,7 +234,7 @@ class PaperOps:
 
     # ── 文档处理工具 ──
 
-    async def parse_pdf(self, file_path: str) -> ToolResult:
+    async def parse_pdf(self, file_path: str, progress: Optional[Callable[..., None]] = None) -> ToolResult:
         """解析 PDF 文件提取文本内容
 
         解析后自动查询维普/万方/CrossRef 认证元数据：
@@ -241,6 +250,8 @@ class PaperOps:
             from sage.context.index import ProjectIndex
             indexer = ProjectIndex(self.workspace)
             # 使用 to_thread 避免阻塞事件循环（PDF 解析是 CPU/IO 密集型）
+            if progress:
+                progress("正在解析 PDF 文本（大文件或扫描版可能需要较长时间）...")
             text = await asyncio.to_thread(indexer._extract_pdf_text, full_path)
             if not text:
                 return ToolResult(success=False, error="PDF 解析失败（可能未安装 PyMuPDF）")
@@ -254,6 +265,8 @@ class PaperOps:
             source = ""
             discrepancies = []
             if title:
+                if progress:
+                    progress("正在联网认证论文元数据（维普/万方/CrossRef，最长约 30 秒）...")
                 try:
                     verified_metadata, source = await asyncio.wait_for(
                         self._verify_metadata_online(title), timeout=30.0
@@ -370,7 +383,7 @@ class PaperOps:
         except Exception as e:
             return ToolResult(success=False, error=f"元数据提取失败: {e}")
 
-    async def ocr_document(self, file_path: str) -> ToolResult:
+    async def ocr_document(self, file_path: str, progress: Optional[Callable[..., None]] = None) -> ToolResult:
         """OCR 识别扫描版文档
 
         使用 RapidOCR (ONNX Runtime) 识别扫描版 PDF。
@@ -407,8 +420,11 @@ class PaperOps:
             doc = fitz.open(str(full_path))
             text_parts = []
             ocr_page_count = 0
+            total_pages = len(doc)
             try:
-                for page in doc:
+                for idx, page in enumerate(doc, 1):
+                    if progress:
+                        progress(f"正在处理第 {idx}/{total_pages} 页...", idx, total_pages)
                     # 先尝试直接提取文本层
                     page_text = page.get_text()
                     if page_text.strip():

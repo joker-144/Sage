@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -41,6 +42,8 @@ from sage.agent.loop import AgentLoop, LoopEvent
 from sage.config import get_config
 from sage.agents.loader import get_agent_loader
 from sage.llm.client import LLMClient
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRole(Enum):
@@ -81,7 +84,7 @@ class SubTask:
 @dataclass
 class CollaborationEvent:
     """协同事件（供 CLI/Web 展示）"""
-    type: str  # "task_created" | "worker_start" | "worker_done" | "reflection" | "text" | "reasoning" | "retry" | "done"
+    type: str  # "task_created" | "worker_start" | "worker_done" | "reflection" | "text" | "reasoning" | "retry" | "progress" | "done"
     role: str = ""
     content: str = ""
     metadata: dict = field(default_factory=dict)
@@ -257,6 +260,7 @@ class AgentOrchestrator:
             )
 
         except Exception as e:
+            logger.warning("多智能体协作流程出错: %s", e)
             yield CollaborationEvent(
                 type="worker_done",
                 role="supervisor",
@@ -302,6 +306,7 @@ class AgentOrchestrator:
             return await self._analyze_intent_with_llm(user_input)
         except Exception as e:
             # LLM 分析失败时降级为复杂任务（多智能体兜底，确保不漏）
+            logger.warning("意图分析 LLM 调用失败，降级为复杂任务: %s", e)
             return IntentResult(
                 complexity="complex",
                 role="supervisor",
@@ -595,6 +600,7 @@ class AgentOrchestrator:
             return plan
         except Exception as e:
             # LLM 生成失败 → 回退到经典流程（文献→方法→撰写→整理→引用→审校）
+            logger.warning("执行计划生成失败，回退经典串行流程: %s", e)
             return self._fallback_plan()
 
     def _validate_plan(self, plan: dict) -> dict:
@@ -790,6 +796,14 @@ class AgentOrchestrator:
         if event.type == "retry":
             return CollaborationEvent(
                 type="retry",
+                role=role,
+                content=event.content,
+                metadata=event.tool_args or {},
+            )
+        # progress 事件直接透传（长任务进度通知）
+        if event.type == "progress":
+            return CollaborationEvent(
+                type="progress",
                 role=role,
                 content=event.content,
                 metadata=event.tool_args or {},
