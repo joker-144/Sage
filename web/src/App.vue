@@ -20,7 +20,8 @@ import UpdateNotification from './components/UpdateNotification.vue'
 
 const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
-  writingMode, activeAgentRoles, sendMessage, cancel, reset, loadConversation, deleteConversation,
+  writingMode, contextUsage, activeAgentRoles, sendMessage, cancel, reset, loadConversation, deleteConversation,
+  recheckContextOnModelSwitch,
 } = useChat()
 
 const activeView = ref('chat')
@@ -76,6 +77,13 @@ function handleNewChat() {
   sidebarRefreshKey.value++
 }
 
+// 模型切换后重新检查当前对话的上下文（超限则后端压缩并提醒）
+function handleModelChanged() {
+  if (conversationId.value) {
+    recheckContextOnModelSwitch(conversationId.value)
+  }
+}
+
 onMounted(() => { reset() })
 </script>
 
@@ -127,7 +135,7 @@ onMounted(() => { reset() })
                   {{ writingMode ? '写作模式' : '单 Agent' }}
                 </button>
               </div>
-              <ChatInput :disabled="isProcessing" @send="sendMessage" @stop="cancel" @open-settings="activeView = 'settings'" />
+              <ChatInput :disabled="isProcessing" :context-usage="contextUsage" @send="sendMessage" @stop="cancel" @open-settings="activeView = 'settings'" @model-changed="handleModelChanged" />
             </div>
           </div>
         </Transition>

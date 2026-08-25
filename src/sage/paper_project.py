@@ -37,6 +37,54 @@ DEFAULT_OUTLINE = [
     {"key": "references", "title": "参考文献", "target_words": 0},
 ]
 
+# 不同论文类型的差异化大纲（P2 研究类型识别）
+OUTLINES_BY_TYPE = {
+    "review": [
+        {"key": "abstract", "title": "摘要", "target_words": 300},
+        {"key": "introduction", "title": "引言", "target_words": 800},
+        {"key": "progress", "title": "研究现状与进展", "target_words": 2500},
+        {"key": "controversy", "title": "争议与挑战", "target_words": 1500},
+        {"key": "future", "title": "总结与展望", "target_words": 800},
+        {"key": "references", "title": "参考文献", "target_words": 0},
+    ],
+    "empirical": [
+        {"key": "abstract", "title": "摘要", "target_words": 300},
+        {"key": "introduction", "title": "引言", "target_words": 800},
+        {"key": "literature", "title": "文献综述与假设提出", "target_words": 1200},
+        {"key": "methodology", "title": "研究方法", "target_words": 1200},
+        {"key": "data", "title": "数据与变量", "target_words": 800},
+        {"key": "results", "title": "实证结果", "target_words": 1800},
+        {"key": "discussion", "title": "讨论", "target_words": 1000},
+        {"key": "conclusion", "title": "结论", "target_words": 500},
+        {"key": "references", "title": "参考文献", "target_words": 0},
+    ],
+    "theoretical": [
+        {"key": "abstract", "title": "摘要", "target_words": 300},
+        {"key": "introduction", "title": "引言", "target_words": 800},
+        {"key": "foundation", "title": "理论基础", "target_words": 1500},
+        {"key": "model", "title": "理论模型", "target_words": 1500},
+        {"key": "derivation", "title": "推导与证明", "target_words": 1500},
+        {"key": "discussion", "title": "讨论", "target_words": 800},
+        {"key": "conclusion", "title": "结论", "target_words": 500},
+        {"key": "references", "title": "参考文献", "target_words": 0},
+    ],
+    "case": [
+        {"key": "abstract", "title": "摘要", "target_words": 300},
+        {"key": "introduction", "title": "引言", "target_words": 800},
+        {"key": "background", "title": "案例背景", "target_words": 1000},
+        {"key": "framework", "title": "分析框架", "target_words": 1000},
+        {"key": "analysis", "title": "案例分析", "target_words": 2000},
+        {"key": "discussion", "title": "讨论", "target_words": 1000},
+        {"key": "conclusion", "title": "结论", "target_words": 500},
+        {"key": "references", "title": "参考文献", "target_words": 0},
+    ],
+}
+
+
+def get_outline_for_type(paper_type: str) -> list[dict]:
+    """按论文类型返回默认大纲（未知类型回退 IMRaD）。"""
+    return OUTLINES_BY_TYPE.get(paper_type, DEFAULT_OUTLINE)
+
 # 角色产出 → 素材 key（全文保存，供下游 worker 读取）
 ROLE_MATERIAL_KEY = {
     "literature": "literature_review",

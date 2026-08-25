@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -42,7 +43,7 @@ from sage.agent.loop import AgentLoop, LoopEvent
 from sage.config import get_config
 from sage.agents.loader import get_agent_loader
 from sage.llm.client import LLMClient
-from sage.paper_project import PaperProject, DEFAULT_OUTLINE, estimate_paper_cost
+from sage.paper_project import PaperProject, DEFAULT_OUTLINE, estimate_paper_cost, get_outline_for_type
 from sage.paper_quality import run_quality_checks
 
 logger = logging.getLogger(__name__)
@@ -176,7 +177,7 @@ class AgentOrchestrator:
         except ValueError:
             return None
 
-    async def collaborate(self, user_input: str) -> AsyncIterator[CollaborationEvent]:
+    async def collaborate(self, user_input: str, force_role: Optional[str] = None) -> AsyncIterator[CollaborationEvent]:
         """写作模式入口 — 智能选择流程
 
         流程:
@@ -186,18 +187,40 @@ class AgentOrchestrator:
 
         Args:
             user_input: 用户原始需求
-
-        Yields:
-            CollaborationEvent: 协同过程中产生的事件
+            force_role: 用户显式指定处理角色（如"literature"/"coder"），
+                        提供时跳过意图分析、按简单任务路由到该角色
         """
-        # Step 1: 意图分析
-        yield CollaborationEvent(
-            type="task_created",
-            role="supervisor",
-            content=f"正在分析用户意图: {user_input[:100]}",
-        )
-
-        intent = await self._analyze_intent(user_input)
+        # Step 1: 意图分析（force_role 时跳过，用户已明确指定角色）
+        if force_role:
+            intent = IntentResult(
+                complexity="simple",
+                role=force_role,
+                reason="用户指定角色",
+            )
+            yield CollaborationEvent(
+                type="task_created",
+                role="supervisor",
+                content=f"用户指定角色: {_ROLE_LABELS.get(force_role, force_role)}",
+            )
+        else:
+            # 澄清回路：信息严重不足时反问，而非盲目开工
+            if _needs_clarification(user_input, has_draft=bool(self.project.read_draft().strip())):
+                yield CollaborationEvent(
+                    type="reflection",
+                    role="supervisor",
+                    content=(
+                        "请求信息不足，请补充后再试。例如：论文的主题/方向是什么？"
+                        "需要完整论文，还是某个部分（摘要/目录/引言/结论/某一章节）？"
+                    ),
+                )
+                yield CollaborationEvent(type="done", role="supervisor")
+                return
+            yield CollaborationEvent(
+                type="task_created",
+                role="supervisor",
+                content=f"正在分析用户意图: {user_input[:100]}",
+            )
+            intent = await self._analyze_intent(user_input)
 
         role_label = _ROLE_LABELS.get(intent.role, intent.role)
         yield CollaborationEvent(
@@ -267,40 +290,34 @@ class AgentOrchestrator:
                 content=f"由 {role_label} 处理简单任务",
             )
 
-            # 多轮修订：修订类任务基于已有草稿修改（跨会话持久草稿）
-            prompt = user_input
-            is_revision = intent.role == "debugger" and self.project.read_draft().strip()
-            if is_revision:
-                prompt = (
-                    f"## 当前论文草稿\n{self.project.read_draft()}\n\n"
-                    f"## 用户修订要求\n{user_input}\n\n"
-                    "请按修订要求修改草稿，输出修订后的完整论文"
-                    "（markdown，保留 '## 章节标题' 结构）。"
-                )
+            # 简单任务统一注入当前草稿（撰写/修订类角色；P1-⑤ 泛化，替代原 debugger 特判）
+            uses_draft = intent.role in ("coder", "debugger") and bool(self.project.read_draft().strip())
+            prompt = _build_simple_prompt(intent.role, user_input, self.project)
+            if uses_draft:
                 yield CollaborationEvent(
                     type="reflection",
                     role="supervisor",
-                    content="修订员基于已有草稿执行修订...",
+                    content=f"{role_label}基于已有草稿处理请求...",
                 )
 
-            revised_parts: list[str] = []
+            out_parts: list[str] = []
             async for event in worker.run(prompt):
                 mapped = self._map_event(event, intent.role)
                 if mapped:
                     yield mapped
                 if event.type == "text":
-                    revised_parts.append(event.content)
+                    out_parts.append(event.content)
 
-            # 修订结果写回共享草稿并落盘
-            if is_revision and revised_parts:
-                revised = "\n".join(revised_parts)
-                self.project.parse_draft_to_sections(revised)
-                self.project.store_material("debugger", revised)
+            # 撰写/修订结果写回共享草稿并落盘
+            if uses_draft and out_parts:
+                output = "\n".join(out_parts)
+                self.project.parse_draft_to_sections(output)
+                self.project.store_material(intent.role, output)
                 path = self.project.finalize()
                 yield CollaborationEvent(
                     type="reflection",
                     role="supervisor",
-                    content=f"修订完成，草稿已更新: {path}",
+                    content=f"草稿已更新: {path}",
                 )
 
             yield CollaborationEvent(type="done", role="supervisor")
@@ -333,9 +350,10 @@ class AgentOrchestrator:
                 content=f"执行计划:\n" + "\n".join(plan_desc_parts),
             )
 
-            # 大纲先行：主编生成结构化大纲（IMRaD 分节 + 字数预算），
+            # 大纲先行：主编生成结构化大纲（按论文类型差异化 + 字数预算），
             # 后续撰写/整理/审校据此逐节进行，保证结构与篇幅可控
-            outline_sections = await self._generate_outline(user_input)
+            paper_type = _detect_paper_type(user_input)
+            outline_sections = await self._generate_outline(user_input, paper_type=paper_type)
             self.project.set_outline(outline_sections)
             yield CollaborationEvent(
                 type="reflection",
@@ -357,13 +375,20 @@ class AgentOrchestrator:
 
             # 按批次执行（共享草稿：worker 产出写入 project，下游读全文）
             batch_results: dict[str, str] = {}  # 累积各角色产出，供后续批次依赖
+            batch_id_to_roles = {b.get("id"): b.get("roles", []) for b in batches}
             for batch in batches:
                 roles = batch.get("roles", [])
                 if not roles:
                     continue
+                # 方案A：依赖角色由 depends_on 批次推导，真正驱动下游上下文
+                dep_roles: list[str] = []
+                for dep_id in batch.get("depends_on", []):
+                    dep_roles.extend(batch_id_to_roles.get(dep_id, []))
+                dep_roles = list(dict.fromkeys(dep_roles))  # 去重保序
                 # 同一批次并行执行
                 async for event in self._run_parallel_workers(
-                    roles, user_input, batch_results, project=self.project
+                    roles, user_input, batch_results,
+                    project=self.project, dep_roles=dep_roles,
                 ):
                     yield event
 
@@ -492,17 +517,32 @@ class AgentOrchestrator:
         return ""
 
     async def _analyze_intent(self, user_input: str) -> IntentResult:
-        """意图分析 — 规则快速判断 + 不确定时 LLM 精细分析
+        """意图分析 — 长输入 LLM 主判 + 短输入规则快判（P2-⑨）
+
+        - 长输入（>=30 字）更易被规则误命中 → 交给 LLM 主判，规则/复杂任务兜底
+        - 短输入：规则快速判断优先，避免 LLM 调用延迟
 
         Returns:
             IntentResult: 含 complexity(simple/complex)、role(角色名)、reason(判断理由)
         """
-        # 第一层：快速规则判断（明显简单/复杂直接返回，避免 LLM 调用延迟）
+        # ── 长输入：LLM 主判，规则兜底 ──
+        if len(user_input) >= 30:
+            try:
+                return await self._analyze_intent_with_llm(user_input)
+            except Exception as e:
+                logger.warning("长输入 LLM 意图分析失败，回退规则: %s", e)
+                quick = self._quick_classify(user_input)
+                if quick is not None:
+                    return quick
+                return IntentResult(
+                    complexity="complex", role="supervisor",
+                    reason="LLM 分析失败，降级为复杂任务",
+                )
+
+        # ── 短输入：规则快判优先，未命中再 LLM ──
         quick = self._quick_classify(user_input)
         if quick is not None:
             return quick
-
-        # 第二层：LLM 精细意图分析（规则无法确定时调用）
         try:
             return await self._analyze_intent_with_llm(user_input)
         except Exception as e:
@@ -518,32 +558,53 @@ class AgentOrchestrator:
         """快速规则判断 — 基于动词+宾语模式直接匹配智能体，不确定返回 None 触发 LLM 分析
 
         优先级:
-          1. 明确的多智能体协作任务（写一篇完整论文/多章节/开题报告等）→ complex
-          2. 精细的动词+宾语模式匹配 → simple + 具体角色（如"生成目录"→coder）
-          3. 问候/简单对话 → simple + general
-          4. 短问题兜底匹配 → simple + 匹配角色
-          5. 不确定 → None，交给 LLM 精细分析
-
-        注意：单独的"论文"一词不再触发复杂任务，避免"生成论文目录"被误判。
+          1. 论文局部写作（"论文的摘要/目录/某章"）→ simple + coder
+          2. 明确的多智能体协作任务（写一篇完整论文/多章节/开题报告等）→ complex
+          3. 精细的动词+宾语模式匹配 → simple + 具体角色（如"生成目录"→coder）
+          4. 问候/简单对话 → simple + general
+          5. 短问题兜底匹配 → simple + 匹配角色
+          6. 不确定 → None，交给 LLM 精细分析
         """
         lower = user_input.lower().strip()
 
-        # ── 第一优先级：明确的多智能体协作任务 ──
-        # 只有明确的"完整论文写作"才判为复杂任务，单独"论文"不触发
+        # ── 第一优先级：修订意图（修改/润色 + 论文/段落/内容等 → 修订员）──
+        # 先于"论文局部写作"判断，避免"修改论文结论"被误判为撰写
+        revise_actions = ("修改", "修订", "润色", "调整", "修复")
+        revise_objects = ("论文", "内容", "段落", "章节", "语句", "结论", "引言", "摘要", "前言", "目录", "正文")
+        if any(a in lower for a in revise_actions) and any(o in lower for o in revise_objects):
+            return IntentResult(
+                complexity="simple",
+                role="debugger",
+                reason="修订意图，由修订员处理",
+            )
+
+        # ── 第二优先级：论文局部写作 ──
+        # "论文的摘要/目录/引言/第N章" 是局部撰写，先于"完整论文"判断，避免误路由到多智能体
+        if _PARTIAL_OF_PAPER_RE.search(lower):
+            return IntentResult(
+                complexity="simple",
+                role="coder",
+                reason="论文局部写作（摘要/目录/某章节），由撰写员处理",
+            )
+
+        # ── 第三优先级：明确的多智能体协作任务 ──
         complex_keywords = [
             "完整论文", "多章节", "写一篇论文", "撰写一篇论文", "帮我写论文",
-            "sci ", "ssci", "cssci", "ei ", "期刊投稿", "开题报告",
+            "ssci", "cssci", "期刊投稿", "开题报告",
             "毕业论文", "学位论文", "综述论文", "写一篇 paper", "survey paper",
         ]
-        if any(kw in lower for kw in complex_keywords):
+        # sci/ei 需边界匹配（避免 "science"/"their" 等误命中）
+        is_complex = any(kw in lower for kw in complex_keywords) or bool(
+            re.search(r"\b(sci|ei)\b", lower) or re.search(r"(sci|ei)[\u4e00-\u9fff]", lower)
+        )
+        if is_complex:
             return IntentResult(
                 complexity="complex",
                 role="supervisor",
                 reason="包含完整论文写作关键词，需要多智能体协作",
             )
 
-        # ── 第二优先级：精细的动词+宾语模式匹配 → 直接分配智能体 ──
-        # 优先于泛化关键词匹配，确保"生成目录"等明确指令不被"文献调研"等前缀干扰
+        # ── 第四优先级：精细的动词+宾语模式匹配 → 直接分配智能体 ──
         role = self._match_role_by_patterns(user_input)
         if role is not None:
             return IntentResult(
@@ -552,7 +613,7 @@ class AgentOrchestrator:
                 reason=f"规则匹配到 {_ROLE_LABELS.get(role, role)} 处理",
             )
 
-        # ── 第三优先级：问候/简单对话 ──
+        # ── 第五优先级：问候/简单对话 ──
         simple_greetings = ["你好", "hello", "hi ", "hey", "在吗", "谢谢", "thanks"]
         if any(lower.startswith(g) for g in simple_greetings) or lower in simple_greetings:
             return IntentResult(
@@ -561,7 +622,7 @@ class AgentOrchestrator:
                 reason="问候或简单对话，由通用助手处理",
             )
 
-        # ── 第四优先级：短问题兜底匹配 ──
+        # ── 第六优先级：短问题兜底匹配 ──
         if len(user_input) < 30:
             fallback_role = self._match_role_by_keywords(user_input)
             return IntentResult(
@@ -596,9 +657,9 @@ class AgentOrchestrator:
         if any(a in lower for a in lit_actions) and any(o in lower for o in lit_objects):
             return "literature"
 
-        # 引用管理员(citation)：检查/格式化 + 引用格式/参考文献格式
-        cite_actions = ["格式化", "规范化", "整理"]
-        cite_objects = ["引用格式", "参考文献格式", "citation", "引用规范"]
+        # 引用管理员(citation)：格式化/检查/核查 + 引用/参考文献
+        cite_actions = ["格式化", "规范化", "整理", "检查", "核查", "验证"]
+        cite_objects = ["引用格式", "参考文献格式", "citation", "引用规范", "参考文献", "引用"]
         if any(a in lower for a in cite_actions) and any(o in lower for o in cite_objects):
             return "citation"
 
@@ -807,14 +868,11 @@ class AgentOrchestrator:
     def _validate_plan(self, plan: dict) -> dict:
         """规则校验执行计划的依赖合理性，自动修正不合理的依赖
 
-        规则:
-        - citation 必须在 coder 或 consolidator 之后
-        - reviewer 必须在 coder/consolidator/citation 之后
-        - debugger 必须在 reviewer 之后
-        - consolidator 必须在 coder 之后
-        - 每个角色只能在计划中出现一次
+        校验分两层：
+        1. 结构校验（方案A）：depends_on 必须引用更早批次，禁止自引用/环/不存在批次
+        2. 域规则校验：关键角色必须出现在更早批次（按批次位置比较，非 id 数值）
         """
-        # 依赖规则：角色 -> 它依赖的角色（至少一个必须在更早的批次出现）
+        # 域依赖规则：角色 -> 它依赖的角色（至少一个必须在更早的批次出现）
         dependency_rules = {
             "citation": ["coder", "consolidator"],      # 引用需要内容
             "reviewer": ["coder", "consolidator", "citation"],  # 审校需要内容
@@ -826,7 +884,7 @@ class AgentOrchestrator:
         if not batches:
             return self._fallback_plan()
 
-        # 收集所有已分配角色（去重，重复的只保留第一个）
+        # 1) 收集所有已分配角色（去重，重复的只保留第一个）
         seen_roles = set()
         cleaned_batches = []
         for batch in batches:
@@ -838,31 +896,35 @@ class AgentOrchestrator:
                 cleaned_batches.append(batch)
         batches = cleaned_batches
 
-        # 检查并修正依赖：如果角色依赖的角色还没出现，把它推迟到下一批
-        # 记录每个角色出现的批次 id
-        role_batch_map = {}
-        for batch in batches:
-            for role in batch.get("roles", []):
-                role_batch_map[role] = batch.get("id", 0)
+        # 2) 结构校验：批次 id 必须唯一且非空
+        batch_positions: dict = {}
+        for i, b in enumerate(batches):
+            bid = b.get("id")
+            if bid is None or bid in batch_positions:
+                return self._fallback_plan()
+            batch_positions[bid] = i
+        # depends_on 必须引用更早批次（杜绝自引用/环/引用不存在批次）
+        for i, b in enumerate(batches):
+            for dep_id in b.get("depends_on", []):
+                if dep_id not in batch_positions or batch_positions[dep_id] >= i:
+                    return self._fallback_plan()
 
-        # 找出违反依赖的角色
-        violations = []
+        # 3) 域规则校验：关键角色必须出现在更早批次（按位置比较）
+        role_position: dict = {}
+        for i, b in enumerate(batches):
+            for role in b.get("roles", []):
+                role_position[role] = i
+
         for role, deps in dependency_rules.items():
-            if role in role_batch_map:
-                role_batch = role_batch_map[role]
-                # 至少一个依赖角色必须在更早或同批出现
-                dep_satisfied = False
-                for dep in deps:
-                    if dep in role_batch_map and role_batch_map[dep] <= role_batch:
-                        dep_satisfied = True
-                        break
-                # 特殊：coder 没有硬依赖（可基于用户需求直接写）
-                if not dep_satisfied and role != "coder":
-                    violations.append((role, deps))
-
-        # 如果有违反，重建为经典串行流程
-        if violations:
-            return self._fallback_plan()
+            if role not in role_position:
+                continue
+            dep_satisfied = any(
+                d in role_position and role_position[d] < role_position[role]
+                for d in deps
+            )
+            # 特殊：coder 没有硬依赖（可基于用户需求直接写）
+            if not dep_satisfied and role != "coder":
+                return self._fallback_plan()
 
         plan["batches"] = batches
         return plan
@@ -879,21 +941,22 @@ class AgentOrchestrator:
             ]
         }
 
-    async def _generate_outline(self, user_input: str) -> list[dict]:
-        """主编生成论文大纲（IMRaD 结构 + 各节字数预算）
+    async def _generate_outline(self, user_input: str, paper_type: str = "research") -> list[dict]:
+        """主编生成论文大纲（按论文类型采用相应结构 + 各节字数预算）
 
-        LLM 失败或解析失败时回退到 DEFAULT_OUTLINE，保证流程不中断。
+        LLM 失败或解析失败时回退到该类型的默认大纲，保证流程不中断。
         """
-        system_prompt = """你是论文写作主编。根据用户需求生成论文大纲。
+        fallback = get_outline_for_type(paper_type)
+        type_label = _PAPER_TYPE_LABELS.get(paper_type, "研究论文")
+        system_prompt = f"""你是论文写作主编。根据用户需求生成{type_label}的大纲。
 
 要求:
-1. 采用学术论文标准结构（摘要/引言/相关工作/方法/实验/讨论/结论/参考文献），
-   可根据论文类型增删章节
+1. 采用{type_label}的标准章节结构，可根据具体方向增删章节
 2. 每个章节给出: key（英文稳定标识）、title（中文标题）、target_words（目标字数）
 3. 总字数控制在 8000-15000 字（期刊论文典型篇幅）
 
 必须输出 JSON（不要其他内容）:
-{"sections": [{"key": "introduction", "title": "引言", "target_words": 800}, ...]}"""
+{{"sections": [{{"key": "introduction", "title": "引言", "target_words": 800}}, ...]}}"""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -905,10 +968,10 @@ class AgentOrchestrator:
                 tools=[],
                 max_tokens=800,
             )
-            return _parse_outline_response(response.content or "")
+            return _parse_outline_response(response.content or "", fallback)
         except Exception as e:
-            logger.warning("大纲生成失败，回退默认 IMRaD 大纲: %s", e)
-            return list(DEFAULT_OUTLINE)
+            logger.warning("大纲生成失败，回退 %s 默认大纲: %s", paper_type, e)
+            return list(fallback)
 
     async def _revise_round(self, report) -> str:
         """让修订员（debugger）根据质量门报告修订当前草稿，返回修订后全文。
@@ -990,6 +1053,7 @@ class AgentOrchestrator:
         user_input: str,
         batch_results: dict,
         project: Optional[PaperProject] = None,
+        dep_roles: Optional[list[str]] = None,
     ) -> AsyncIterator[CollaborationEvent]:
         """并行运行多个 worker，实时 yield 各 worker 的事件
 
@@ -998,18 +1062,21 @@ class AgentOrchestrator:
             user_input: 用户原始需求
             batch_results: 前序批次的产出 {role: result_text}
             project: 共享草稿文档（P0），worker 产出写入、下游读全文
+            dep_roles: 本批次依赖的前序角色列表（由计划 depends_on 推导，方案A）
 
         Yields:
             CollaborationEvent: 各 worker 产生的事件（交错yield）
         """
+        dep_roles = list(dep_roles or [])
+
         # 为每个角色构建 prompt（用户需求 + 依赖全文 + 大纲 + 角色引导）
         async def run_single(role_name: str) -> tuple[str, list[CollaborationEvent], str]:
             """运行单个 worker，收集事件和文本输出"""
             events = []
             results = []
 
-            # P0 修复：传递依赖角色的完整产出（不再 [:2000] 截断）
-            dep_context = _build_dependency_context(role_name, batch_results)
+            # 依赖上下文由 LLM 的 depends_on 决定（方案A），传递完整产出
+            dep_context = _build_dependency_context(dep_roles, batch_results)
             prompt = _build_worker_prompt(
                 user_input=user_input,
                 role_name=role_name,
@@ -1102,6 +1169,14 @@ class AgentOrchestrator:
                 content=event.content,
                 metadata=event.tool_args or {},
             )
+        # context_usage 事件直接透传（上下文用量指示）
+        if event.type == "context_usage":
+            return CollaborationEvent(
+                type="context_usage",
+                role=role,
+                content=event.content,
+                metadata=event.tool_args or {},
+            )
         mapping = {
             "tool_start": "worker_start",
             "tool_result": "worker_start",
@@ -1126,15 +1201,6 @@ def create_orchestrator(workspace: Optional[Path] = None) -> AgentOrchestrator:
 
 # ── 协作上下文构建（P0 修复：全文传递，替换旧的 [:2000] 截断）──
 
-_DEPENDENCY_MAP: dict[str, list[str]] = {
-    "planner": ["literature"],
-    "coder": ["literature", "planner"],
-    "consolidator": ["coder"],
-    "citation": ["coder", "consolidator"],
-    "reviewer": ["coder", "consolidator", "citation"],
-    "debugger": ["reviewer"],
-}
-
 _ROLE_PROMPTS: dict[str, str] = {
     "literature": "请针对以下论文写作需求进行文献调研。输出格式: 1) 研究背景与发展脉络 2) 主要研究流派 3) 研究空白与机会 4) 关键参考文献列表（含DOI/URL）",
     "planner": "请基于以下材料设计研究方法。输出格式: 1) 研究问题与假设 2) 研究方法选型与理由 3) 实验/研究设计 4) 数据分析方法 5) 论证框架",
@@ -1156,10 +1222,56 @@ _REVISION_ACTIONABLE_CODES = {"cite_marker_left", "section_missing"}
 # 断点续写触发词：命中且存在已有草稿时，续写未完成章节
 _CONTINUATION_KEYWORDS = ("继续写", "续写", "接着写", "接着", "往下写", "补充", "完善", "继续")
 
+# 论文局部写作："论文的摘要/目录/引言/第N章..." → 局部撰写，而非完整论文
+_PARTIAL_OF_PAPER_RE = re.compile(
+    r"(论文|文章|paper|报告)\s*的?\s*"
+    r"(摘要|目录|引言|绪论|前言|结论|大纲|正文|标题|第[一二三四五六七八九十\d]+章)"
+)
+
+# 论文类型中文标签（大纲 prompt 提示用）
+_PAPER_TYPE_LABELS = {
+    "review": "综述论文",
+    "empirical": "实证研究论文",
+    "theoretical": "理论研究论文",
+    "case": "案例研究论文",
+    "research": "研究论文",
+}
+
 
 def _is_continuation(text: str) -> bool:
     """判断用户意图是否为"续写/完善已有草稿"。"""
     return any(k in text for k in _CONTINUATION_KEYWORDS)
+
+
+def _detect_paper_type(text: str) -> str:
+    """识别论文类型：review/empirical/theoretical/case，默认 research。"""
+    lower = text.lower()
+    if any(k in lower for k in ("综述", "survey", "review paper", "文献综述")):
+        return "review"
+    if any(k in lower for k in ("实证", "empirical", "量化", "实验研究")):
+        return "empirical"
+    if any(k in lower for k in ("理论", "theoretical", "模型推导", "纯理论")):
+        return "theoretical"
+    if any(k in lower for k in ("案例", "case study", "案例分析")):
+        return "case"
+    return "research"
+
+
+def _needs_clarification(text: str, has_draft: bool = False) -> bool:
+    """信息严重不足时返回 True，触发澄清回路。
+
+    保守策略：仅在明显模糊（极短、或"写论文"这类无主题的裸请求）时触发，
+    避免打断正常请求。
+    """
+    if has_draft:
+        return False
+    t = (text or "").strip()
+    if len(t) < 4:
+        return True
+    # 裸请求："写论文" / "帮我写论文" / "写一篇论文" / "生成文章" 等无主题词
+    if re.fullmatch(r"(帮我|请|想|要|麻烦)?\s*(写|生成|撰写)\s*(一篇|一个|个)?\s*(论文|文章|paper)?", t):
+        return True
+    return False
 
 
 def _fit_context(text: str, max_tokens: int) -> str:
@@ -1181,15 +1293,14 @@ def _fit_context(text: str, max_tokens: int) -> str:
     )
 
 
-def _build_dependency_context(role_name: str, batch_results: dict, max_tokens: int = 45000) -> str:
-    """构建下游 worker 的依赖上下文 — 传递前序角色的【完整】产出。
+def _build_dependency_context(dep_roles: list[str], batch_results: dict, max_tokens: int = 45000) -> str:
+    """构建下游 worker 的依赖上下文 — 传递【dep_roles 指定角色】的完整产出。
 
-    不再使用旧的 [:2000] 字符截断；仅当总 token 数超过 max_tokens 时才按预算
-    保留头尾（安全阀，防止极端超长材料撑爆模型上下文）。
+    依赖角色由 LLM 生成计划的 depends_on 推导（方案 A：depends_on 真正驱动上下文），
+    不再使用硬编码角色依赖表。仅当总 token 数超过 max_tokens 时才按预算保留头尾。
     """
-    deps = _DEPENDENCY_MAP.get(role_name, [])
     parts = []
-    for dep in deps:
+    for dep in dep_roles:
         content = batch_results.get(dep) or ""
         if content:
             parts.append(f"## {dep} 的完整产出\n{content}")
@@ -1223,13 +1334,30 @@ def _build_worker_prompt(
     return "\n\n".join(parts)
 
 
-def _parse_outline_response(content: str) -> list[dict]:
-    """解析大纲 LLM 响应为 sections 列表；失败返回默认 IMRaD 大纲。"""
+def _build_simple_prompt(role_name: str, user_input: str, project: Optional[PaperProject] = None) -> str:
+    """组装简单任务 prompt：对撰写/修订类角色注入当前草稿全文（若存在）。
+
+    让简单任务（如"写结论"/"润色这段"）能看到已有草稿，与复杂任务的共享草稿打通。
+    """
+    draft = project.read_draft() if project is not None else ""
+    if role_name in ("coder", "debugger") and draft.strip():
+        return (
+            f"## 当前论文草稿\n{draft}\n\n"
+            f"## 用户请求\n{user_input}\n\n"
+            "请基于草稿处理上述请求（撰写缺失内容或按需修改），"
+            "输出 markdown（保留 '## 章节标题' 结构）。"
+        )
+    return user_input
+
+
+def _parse_outline_response(content: str, fallback: Optional[list[dict]] = None) -> list[dict]:
+    """解析大纲 LLM 响应为 sections 列表；失败返回 fallback（默认 IMRaD）。"""
     import re as _re
 
+    fb = fallback or DEFAULT_OUTLINE
     text = (content or "").strip()
     if not text:
-        return list(DEFAULT_OUTLINE)
+        return list(fb)
     if "```" in text:
         m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
         if m:
@@ -1254,4 +1382,4 @@ def _parse_outline_response(content: str) -> list[dict]:
                 return normalized
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
-    return list(DEFAULT_OUTLINE)
+    return list(fb)

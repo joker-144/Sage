@@ -272,8 +272,9 @@ def _restore_agent_context(agent, conversation_id: str):
         if not msgs:
             return
 
-        cfg = get_config()
-        budget = int(cfg.summary_trigger_tokens or 45000)
+        # 预算使用 Agent 已按当前模型动态计算的压缩触发阈值，
+        # 与后续压缩触发逻辑保持一致，避免不同来源导致历史恢复上限漂移。
+        budget = int(agent.context.history.summary_trigger_tokens or 45000)
 
         # 从最新往前选，控制总 token 数在预算内
         selected: list[dict] = []
@@ -318,6 +319,15 @@ def _restore_agent_context(agent, conversation_id: str):
                     tool_name=tool_name or "",
                     result=content,
                 )
+
+        # 恢复上次持久化的压缩统计（已压缩轮数 / 累计节省），
+        # 使切换对话回来时环形指示器能继续显示历史压缩情况。
+        try:
+            stats = store.get_context_stats(conversation_id)
+            agent.context.compression_stats["rounds"] = stats.get("compressed_rounds", 0)
+            agent.context.compression_stats["saved_tokens"] = stats.get("saved_tokens", 0)
+        except Exception as e:
+            logger.warning("恢复上下文压缩统计失败 conversation_id=%s: %s", conversation_id, e)
     except Exception as e:
         # 恢复失败不影响核心功能，但必须留痕
         logger.warning("恢复对话上下文失败 conversation_id=%s: %s", conversation_id, e)
@@ -331,6 +341,7 @@ class ChatRequest(BaseModel):
     settings: dict | None = Field(None, description="前端设置覆盖（已弃用，配置从 .env 读取）")
     mode: str = Field("single", description="运行模式: single=单Agent, writing=写作模式(智能选择流程)")
     pool_mode: bool = Field(False, description="全选池模式：True 时检索覆盖所有工作空间")
+    force_role: str | None = Field(None, description="写作模式下强制指定处理角色（如 literature/coder/reviewer/debugger），跳过意图分析")
 
 
 class HealthResponse(BaseModel):
@@ -542,6 +553,9 @@ async def chat_stream(req: ChatRequest):
                     elif event.type == "retry":
                         # LLM 调用重试通知 — 前端展示 "重试中 (1/3)..."
                         yield f"event: retry\ndata: {json.dumps({'content': event.content, 'attempt': (event.tool_args or {}).get('attempt', 0), 'max_retries': (event.tool_args or {}).get('max_retries', 0), 'delay': (event.tool_args or {}).get('delay', 0), 'error': (event.tool_args or {}).get('error', '')}, ensure_ascii=False)}\n\n"
+                    elif event.type == "context_usage":
+                        # 上下文用量通知 — 前端环形指示器展示
+                        yield f"event: context_usage\ndata: {json.dumps(event.tool_args or {}, ensure_ascii=False)}\n\n"
                     elif event.type == "error":
                         yield f"event: error\ndata: {json.dumps({'content': event.content, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
                     elif event.type == "done":
@@ -592,7 +606,7 @@ async def _collaborate_stream(req: ChatRequest):
         _conv_busy.add(conv_id)
 
         try:
-            async for event in orchestrator.collaborate(req.message):
+            async for event in orchestrator.collaborate(req.message, force_role=req.force_role):
                 if event.type == "task_created":
                     yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'plan', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n")
                 elif event.type == "worker_start":
@@ -613,6 +627,9 @@ async def _collaborate_stream(req: ChatRequest):
                     # LLM 调用重试通知 — 前端展示 "重试中 (1/3)..."
                     meta = event.metadata or {}
                     yield ("event", f"event: retry\ndata: {json.dumps({'content': event.content, 'role': event.role, 'attempt': meta.get('attempt', 0), 'max_retries': meta.get('max_retries', 0), 'delay': meta.get('delay', 0), 'error': meta.get('error', '')}, ensure_ascii=False)}\n\n")
+                elif event.type == "context_usage":
+                    # 上下文用量通知 — 前端环形指示器展示（多智能体模式下带角色）
+                    yield ("event", f"event: context_usage\ndata: {json.dumps({**(event.metadata or {}), 'role': event.role}, ensure_ascii=False)}\n\n")
                 elif event.type == "done":
                     yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
                     yield ("done", None)
@@ -698,6 +715,56 @@ async def get_messages(conversation_id: str, limit: int = 100):
     store = get_store()
     messages = store.get_messages(conversation_id, limit=limit)
     return {"conversation_id": conversation_id, "messages": messages}
+
+
+def _context_usage_payload(agent) -> dict:
+    """构建上下文用量查询响应（当前占用 / 触发阈值 / 完整窗口 / 压缩统计）"""
+    from sage.context.model_limits import COMPRESSION_TRIGGER_RATIO, get_context_window
+
+    trigger = agent.context.history.summary_trigger_tokens or 1
+    window = get_context_window(agent.context.history.model) or int(trigger / COMPRESSION_TRIGGER_RATIO)
+    stats = getattr(agent.context, "compression_stats", {}) or {}
+    current = agent.context.token_count()
+    return {
+        "current_tokens": current,
+        "trigger_tokens": agent.context.history.summary_trigger_tokens,
+        "max_tokens": window,
+        "percent": round(current * 100 / window, 1) if window else 0,
+        "compressed_rounds": stats.get("rounds", 0),
+        "saved_tokens": stats.get("saved_tokens", 0),
+    }
+
+
+@app.get("/api/conversation/{conversation_id}/context-usage")
+async def get_context_usage(conversation_id: str):
+    """查询当前对话的上下文用量与压缩统计（切换对话时恢复环形指示器）"""
+    agent, _ = _get_or_create_agent(conversation_id)
+    return _context_usage_payload(agent)
+
+
+@app.post("/api/conversation/{conversation_id}/recheck-context")
+async def recheck_context(conversation_id: str):
+    """模型切换后重新检查上下文是否超限，超限则立即压缩并持久化统计"""
+    from sage.memory.store import get_store
+
+    agent, _ = _get_or_create_agent(conversation_id)
+    stats = getattr(agent.context, "compression_stats", {}) or {}
+    rounds_before = stats.get("rounds", 0)
+    await agent.context.maybe_compress(agent.llm)
+    just_compressed = stats.get("rounds", 0) > rounds_before
+    # 压缩后立即持久化最新统计（与对话记录关联）
+    try:
+        get_store().update_context_stats(
+            conversation_id,
+            stats.get("rounds", 0),
+            stats.get("saved_tokens", 0),
+        )
+    except Exception as e:
+        logger.warning("持久化上下文压缩统计失败: %s", e)
+
+    payload = _context_usage_payload(agent)
+    payload["just_compressed"] = just_compressed
+    return payload
 
 
 @app.delete("/conversations/{conversation_id}")

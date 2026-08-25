@@ -2,7 +2,7 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
-**当前版本：1.1.9** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+**当前版本：1.2.1** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
 
 ---
 
@@ -41,6 +41,7 @@
 - **LLM 重试可视化**：LLM 调用重试过程通过 SSE 事件实时反馈，状态栏显示"重试中 (1/3)..."，工具区展示橙色重试卡片（含尝试次数、重试原因、延迟），用户全程可见。
 - **思考内容输出**：自动捕获推理模型（如 DeepSeek-R1）的思考链（reasoning_content），以独立卡片展示，默认折叠，支持点击展开查看完整推理过程。
 - **token 消耗透明**：工具调用、智能体调用、技能调用卡片后方实时显示该轮消耗的 token 总数，便于成本监控。
+- **上下文使用情况指示器**：聊天输入框所选模型后内置环形指示器，实时展示当前对话的上下文占用占比、最大上下文窗口与压缩阈值刻度线（80% 处）。悬停浮窗显示当前占用 / 模型最大窗口、压缩触发阈值、已压缩轮数与累计节省 token。压缩阈值随所选模型自动动态计算（模型窗口 × 80%），切换模型后若已占用超出新模型窗口将自动压缩并在压缩时给出提示；各对话的上下文占用与压缩统计独立记录（`compressed_rounds` / `saved_tokens` 持久化到 SQLite，删除该对话才清空）。
 - **会话并发保护**：同一会话同一时刻只允许一个 SSE 请求，冲突时返回 `busy` 事件并提示"上一条消息仍在处理中"；Agent 缓存采用 LRU 淘汰，跳过运行中会话避免误删。
 - **配置原子写**：`.env` 采用临时文件 + `os.replace()` 原子替换 + 写锁，API Key 日志脱敏，写失败显式返回 500 而非静默。
 - **本地文献索引（可选）**：基于 `sentence-transformers`（all-MiniLM-L6-v2，384 维）构建向量化索引，语义检索已上传文献库。`sentence-transformers` 已从核心依赖移出为 `embed` 可选依赖，未安装时对话功能不受影响，仅向量索引相关功能提示安装。
@@ -490,8 +491,8 @@ Sage 支持多工作空间，按"时间戳_领域标签"命名（如 `20260721_1
 |----------|------|--------|
 | `MEMORY_SQLITE_PATH` | 全局记忆数据库路径 | `data/memory.db` |
 | `DEV_AGENT_WORKSPACE` | 默认工作空间（留空使用当前目录） | `.` |
-| `DEV_AGENT_MAX_CONTEXT_TOKENS` | 上下文窗口 token 上限 | `60000` |
-| `DEV_AGENT_SUMMARY_TRIGGER_TOKENS` | 触发摘要压缩的阈值 | `45000` |
+| `DEV_AGENT_MAX_CONTEXT_TOKENS` | 上下文窗口 token 上限（未命中模型映射表的兜底值） | `60000` |
+| `DEV_AGENT_SUMMARY_TRIGGER_TOKENS` | 触发摘要压缩的阈值（动态模式下按模型窗口 × 80% 计算，此为未命中映射表时的兜底值） | `45000` |
 
 ### 可选外部检索
 
@@ -683,6 +684,8 @@ python scripts/bump_version.py set 1.2.3
 | POST | `/api/model/preload` | 预加载模型 |
 | GET | `/api/model/download-progress` | 模型下载进度 |
 | GET | `/api/token-stats` | Token 使用统计 |
+| GET | `/api/conversation/{id}/context-usage` | 查询指定对话的上下文用量与压缩统计（当前占用/最大窗口/压缩阈值/已压缩轮数/累计节省） |
+| POST | `/api/conversation/{id}/recheck-context` | 模型切换后重新检查上下文是否超限，超限则立即压缩并返回最新用量 |
 | GET | `/api/version/check` | 检查版本更新 |
 | POST | `/api/version/download` | 下载新版本（SSE 流式进度） |
 | POST | `/api/version/install` | 安装新版本 |

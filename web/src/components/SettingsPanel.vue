@@ -228,6 +228,16 @@ function clearProviderConfig(providerId) {
 // 是否存在已配置 API Key 的供应商（保留用于潜在的判断逻辑）
 // 注意：清除按钮现在放在模型管理 Tab 的供应商分组卡片右侧
 
+// API Key 脱敏显示：前 5 位 + 后 5 位明文，其余用 * 加密
+// 过短的 Key（≤10 位）前后段会重叠，只显示前 5 位 + 固定星号
+function maskApiKey(key) {
+  if (!key) return ''
+  if (key.length <= 10) {
+    return key.slice(0, 5) + '*****'
+  }
+  return key.slice(0, 5) + '*'.repeat(key.length - 10) + key.slice(-5)
+}
+
 function loadAllProviderModels() {
   try {
     const cached = localStorage.getItem('sage-models-cache')
@@ -813,6 +823,16 @@ function closeDownloadModal() {
             </button>
           </div>
 
+          <!-- 已配置的供应商显示脱敏 API Key（前5位 + 后5位，中间 * 加密）-->
+          <div
+            v-if="settings.apiKeys[p.id]"
+            class="pmg-api-key"
+            title="已配置的 API Key（脱敏显示）"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" stroke-width="2"/><path d="M7 11V7a5 5 0 0110 0v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <span class="pmg-api-key-text">{{ maskApiKey(settings.apiKeys[p.id]) }}</span>
+          </div>
+
           <div
             v-if="allProviderModels[p.id]?.length"
             class="pmg-models"
@@ -1255,6 +1275,25 @@ select:focus { outline: none; border-color: var(--accent-border); box-shadow: 0 
 .pmg-clear-btn:hover {
   border-color: var(--error); color: var(--error);
   background: var(--error-soft);
+}
+
+/* ── 脱敏 API Key 显示 ── */
+.pmg-api-key {
+  display: flex; align-items: center; gap: 5px;
+  margin-bottom: 9px; padding: 4px 9px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  max-width: fit-content;
+}
+.pmg-api-key svg { flex-shrink: 0; }
+.pmg-api-key-text {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  word-break: break-all;
+  user-select: all;
 }
 
 .pmg-models { display: flex; flex-wrap: wrap; gap: 5px; }

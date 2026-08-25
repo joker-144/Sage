@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP
+    updated_at TIMESTAMP,
+    compressed_rounds INTEGER DEFAULT 0,
+    saved_tokens INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -158,6 +160,8 @@ class MemoryStore:
         self._migrate_embedding_dim()
         # 迁移：为旧数据库的 messages 表补充 reasoning 列（持久化模型思考内容）
         self._migrate_messages_reasoning()
+        # 迁移：为旧数据库的 conversations 表补充上下文压缩统计列
+        self._migrate_conversations_context_stats()
 
     def _migrate_embedding_dim(self):
         """检测并清理维度不匹配的旧向量数据
@@ -231,6 +235,26 @@ class MemoryStore:
             if "reasoning" not in cols:
                 self._conn.execute("ALTER TABLE messages ADD COLUMN reasoning TEXT")
                 self._conn.commit()
+        except Exception:
+            pass
+
+    def _migrate_conversations_context_stats(self):
+        """为旧数据库的 conversations 表补充上下文压缩统计列
+
+        持久化每个对话的「已压缩轮数 / 累计节省 token」，删除对话时随行清空。
+        旧数据库 conversations 表无这两列，此处通过 ALTER TABLE 自动补列，
+        保证已有用户数据平滑升级，不丢失历史对话。
+        """
+        try:
+            cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(conversations)").fetchall()}
+            new_cols = [
+                ("compressed_rounds", "INTEGER DEFAULT 0"),
+                ("saved_tokens", "INTEGER DEFAULT 0"),
+            ]
+            for name, ddl in new_cols:
+                if name not in cols:
+                    self._conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {ddl}")
+            self._conn.commit()
         except Exception:
             pass
 
@@ -326,6 +350,31 @@ class MemoryStore:
         )
         self._conn.commit()
         return True
+
+    def update_context_stats(self, conv_id: str, compressed_rounds: int, saved_tokens: int) -> None:
+        """持久化对话的上下文压缩统计（已压缩轮数 / 累计节省 token）
+
+        删除对话时 conversations 行被删除，统计随之清空，满足「只有删除
+        历史对话才清空上下文使用情况」的需求。
+        """
+        self._conn.execute(
+            "UPDATE conversations SET compressed_rounds = ?, saved_tokens = ? WHERE id = ?",
+            (compressed_rounds or 0, saved_tokens or 0, conv_id),
+        )
+        self._conn.commit()
+
+    def get_context_stats(self, conv_id: str) -> dict:
+        """读取对话的上下文压缩统计，无记录（或尚未压缩过）时返回默认值"""
+        row = self._conn.execute(
+            "SELECT compressed_rounds, saved_tokens FROM conversations WHERE id = ?",
+            (conv_id,),
+        ).fetchone()
+        if not row:
+            return {"compressed_rounds": 0, "saved_tokens": 0}
+        return {
+            "compressed_rounds": row["compressed_rounds"] or 0,
+            "saved_tokens": row["saved_tokens"] or 0,
+        }
 
     # ── 会话摘要（长期记忆）──
 

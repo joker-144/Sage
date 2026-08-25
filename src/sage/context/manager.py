@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from sage.config import get_config
 from sage.context.history import ChatHistory, Message
+from sage.context.model_limits import get_compression_trigger
 from sage.context.tokenizer import count_tokens
 
 
@@ -27,11 +28,19 @@ class ContextManager:
         config = get_config()
         self.workspace = workspace
         self.system_prompt = system_prompt
+        # 当前对话使用的模型：优先显式传入，否则取 .env 配置的对话模型
+        model_id = model or config.llm_chat_model
+        # 压缩触发阈值随模型动态化：按模型上下文窗口 × 80% 计算，
+        # 未命中映射表时回退配置默认值；显式传入的 summary_trigger_tokens 仍优先。
+        dynamic_trigger = get_compression_trigger(model_id, config.summary_trigger_tokens)
         self.history = ChatHistory(
             max_tokens=max_tokens or config.max_context_tokens,
-            summary_trigger_tokens=summary_trigger_tokens or config.summary_trigger_tokens,
-            model=model or config.llm_chat_model,
+            summary_trigger_tokens=summary_trigger_tokens or dynamic_trigger,
+            model=model_id,
         )
+        # 压缩统计（供前端上下文使用指示器展示）
+        # rounds: 累计压缩轮数; saved_tokens: 累计节省 token; last_saved: 最近一次压缩节省量
+        self.compression_stats = {"rounds": 0, "saved_tokens": 0, "last_saved": 0}
 
     def add_user_message(self, content: str):
         """添加用户输入"""
@@ -56,7 +65,15 @@ class ContextManager:
         （含技能/记忆注入）导致实际上下文超限却未触发压缩。
         """
         if self._total_token_count() > self.history.summary_trigger_tokens:
+            before = self._total_token_count()
             await self.history.compress(llm_client)
+            after = self._total_token_count()
+            # 压缩有效（token 减少）时更新统计；失败时保持原值下次重试
+            if after < before:
+                saved = max(before - after, 0)
+                self.compression_stats["rounds"] += 1
+                self.compression_stats["saved_tokens"] += saved
+                self.compression_stats["last_saved"] = saved
 
     def _system_prompt_tokens(self) -> int:
         """system prompt 的 token 数"""

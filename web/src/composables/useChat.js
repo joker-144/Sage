@@ -23,6 +23,9 @@ export function useChat() {
   const messageSentCount = ref(0)  // 每发一条消息+1，父组件 watch 后刷新侧栏
   const writingMode = ref(false)  // 写作模式开关（智能选择流程：简单任务单Agent，复杂任务多智能体）
 
+  // 上下文用量（环形指示器数据）：{ current_tokens, trigger_tokens, percent, compressed_rounds, saved_tokens, just_compressed, role }
+  const contextUsage = ref(null)
+
   // 当前正在调用的智能体 role 集合（用于侧边栏圆圈高亮）
   // 写作模式：collaborate 事件的 role；单 Agent 模式：load_skill 触发 'general'
   const activeAgentRoles = reactive(new Set())
@@ -42,6 +45,7 @@ export function useChat() {
     messages.value = []
     conversationId.value = null
     saveConvId(null)
+    contextUsage.value = null  // 新对话上下文清零，环形指示器归位
     // 新建对话时同样重置模块级引用 + 中断残留 SSE
     currentAssistant = null
     sseTimedOut = false
@@ -71,6 +75,7 @@ export function useChat() {
       const data = await res.json()
       conversationId.value = convId
       saveConvId(convId)
+      contextUsage.value = null  // 切换对话时重置上下文用量，避免旧对话的环形指示器残留
       // 策略：将所有相同 user/assistant 轮的工具调用合并到同一条消息中
       // 注意：使用独立局部变量 buildingAssistant，避免与模块级 currentAssistant 重名混淆
       const loaded = []
@@ -181,9 +186,62 @@ export function useChat() {
         abortController.abort()
         abortController = null
       }
+      // 恢复该对话的上下文用量与持久化的压缩统计
+      await refreshContextUsage(convId)
       scrollToBottom()
     } catch {
       // 静默失败
+    }
+  }
+
+  // 切换对话后恢复上下文用量（环形指示器）：从后端读取当前占用与持久化的压缩统计
+  async function refreshContextUsage(convId) {
+    if (!convId) return
+    try {
+      const res = await fetch(`/api/conversation/${convId}/context-usage`)
+      if (res.ok) {
+        const data = await res.json()
+        contextUsage.value = {
+          currentTokens: data.current_tokens || 0,
+          triggerTokens: data.trigger_tokens || 0,
+          maxTokens: data.max_tokens || 0,
+          percent: data.percent || 0,
+          compressedRounds: data.compressed_rounds || 0,
+          savedTokens: data.saved_tokens || 0,
+          justCompressed: false,
+          role: '',
+        }
+      }
+    } catch (e) {
+      console.error('刷新上下文用量失败:', e)
+    }
+  }
+
+  // 模型切换后重新检查上下文：超限则后端立即压缩并返回最新用量
+  async function recheckContextOnModelSwitch(convId) {
+    if (!convId) return
+    statusText.value = '上下文压缩检查中，请稍候…'
+    try {
+      const res = await fetch(`/api/conversation/${convId}/recheck-context`, { method: 'POST' })
+      if (res.ok) {
+        const data = await res.json()
+        contextUsage.value = {
+          currentTokens: data.current_tokens || 0,
+          triggerTokens: data.trigger_tokens || 0,
+          maxTokens: data.max_tokens || 0,
+          percent: data.percent || 0,
+          compressedRounds: data.compressed_rounds || 0,
+          savedTokens: data.saved_tokens || 0,
+          justCompressed: !!data.just_compressed,
+          role: '',
+        }
+      }
+    } catch (e) {
+      console.error('模型切换后检查上下文失败:', e)
+    } finally {
+      if (statusText.value === '上下文压缩检查中，请稍候…') {
+        statusText.value = '系统就绪'
+      }
     }
   }
 
@@ -486,6 +544,20 @@ export function useChat() {
         statusText.value = '上一条消息仍在处理中'
         break
 
+      case 'context_usage':
+        // 上下文用量更新 — 驱动输入框环形指示器
+        contextUsage.value = {
+          currentTokens: data.current_tokens || 0,
+          triggerTokens: data.trigger_tokens || 0,
+          maxTokens: data.max_tokens || 0,
+          percent: data.percent || 0,
+          compressedRounds: data.compressed_rounds || 0,
+          savedTokens: data.saved_tokens || 0,
+          justCompressed: !!data.just_compressed,
+          role: data.role || '',
+        }
+        break
+
       case 'progress': {
         // 长任务进度通知（索引/OCR/查重等）— 更新状态栏 + 进行中工具卡片
         const roleLabels = {
@@ -639,6 +711,7 @@ export function useChat() {
     messagesRef,
     messageSentCount,
     writingMode,
+    contextUsage,
     activeAgentRoles,
     sendMessage,
     cancel,
@@ -646,5 +719,7 @@ export function useChat() {
     loadConversation,
     deleteConversation,
     scrollToBottom,
+    refreshContextUsage,
+    recheckContextOnModelSwitch,
   }
 }

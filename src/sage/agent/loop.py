@@ -33,6 +33,7 @@ from sage.agent.system_prompt import get_system_prompt
 from sage.agents.reflection import ReflectionEngine, ReflectionContext, create_reflection_engine
 from sage.config import get_config
 from sage.context.manager import ContextManager
+from sage.context.model_limits import COMPRESSION_TRIGGER_RATIO, get_context_window
 from sage.core.observability import get_observability
 from sage.core.resilience import (
     CircuitBreaker,
@@ -167,6 +168,53 @@ class AgentLoop:
             # 持久化失败不影响核心功能
             logger.warning("初始化对话记录失败: %s", e)
 
+    def _context_usage_event(self, just_compressed: bool = False) -> LoopEvent:
+        """构建上下文用量事件（供前端环形指示器展示）
+
+        负载通过 tool_args 字典携带（不改变 LoopEvent 结构）：
+          current_tokens: 当前上下文 token 数（含 system prompt）
+          trigger_tokens: 压缩触发阈值
+          max_tokens: 当前模型的完整上下文窗口（环形以满窗口为满环）
+          percent: 使用百分比 0-100（按完整窗口计算）
+          compressed_rounds: 累计压缩轮数
+          saved_tokens: 累计节省 token
+          just_compressed: 本次是否刚发生压缩
+        """
+        current = self.context.token_count()
+        trigger = self.context.history.summary_trigger_tokens or 1
+        stats = getattr(self.context, "compression_stats", {}) or {}
+        # 完整窗口优先取模型映射表，未命中时按阈值/0.8 反推
+        window = get_context_window(self.context.history.model) or int(trigger / COMPRESSION_TRIGGER_RATIO)
+        percent = round(current * 100 / window, 1) if window else 0
+        return LoopEvent(
+            type="context_usage",
+            content="上下文用量更新",
+            tool_args={
+                "current_tokens": current,
+                "trigger_tokens": self.context.history.summary_trigger_tokens,
+                "max_tokens": window,
+                "percent": percent,
+                "compressed_rounds": stats.get("rounds", 0),
+                "saved_tokens": stats.get("saved_tokens", 0),
+                "just_compressed": just_compressed,
+            },
+        )
+
+    def _persist_context_usage(self):
+        """持久化上下文压缩统计到 SQLite（与对话记录关联）
+
+        删除对话时 conversations 行随 delete_conversation 删除，统计一并清空。
+        """
+        try:
+            stats = getattr(self.context, "compression_stats", {}) or {}
+            get_store().update_context_stats(
+                self.conversation_id,
+                stats.get("rounds", 0),
+                stats.get("saved_tokens", 0),
+            )
+        except Exception as e:
+            logger.warning("持久化上下文压缩统计失败: %s", e)
+
     async def run(self, user_input: str) -> AsyncIterator[LoopEvent]:
         """运行 Agent 循环，流式输出事件 (v0.5.0 增强)
 
@@ -203,6 +251,12 @@ class AgentLoop:
             except Exception as e:
                 logger.warning("语义记忆召回失败: %s", e)
 
+        # 上下文用量上报（首条消息即展示当前对话的上下文占用）
+        try:
+            yield self._context_usage_event()
+        except Exception:
+            pass
+
         # 重置反思状态（新任务开始）
         if self.reflection_engine:
             self.reflection_engine.reset()
@@ -217,7 +271,15 @@ class AgentLoop:
             rounds += 1
 
             # 1. 检查 token 预算，必要时压缩
+            _rounds_before = self.context.compression_stats.get("rounds", 0)
             await self.context.maybe_compress(self.llm)
+            # 压缩检查后上报上下文用量（压缩发生时环形会明显回落）
+            try:
+                yield self._context_usage_event(
+                    just_compressed=self.context.compression_stats.get("rounds", 0) > _rounds_before
+                )
+            except Exception:
+                pass
 
             # 2. 构建 LLM 输入
             messages = self.context.build_messages()
@@ -441,6 +503,13 @@ class AgentLoop:
                 # 避免 done 事件后流关闭导致收尾任务被取消）
                 self._save_session_memory()
 
+                # 最终上下文用量上报（含本轮助手回复）
+                try:
+                    yield self._context_usage_event()
+                except Exception:
+                    pass
+
+                self._persist_context_usage()
                 yield LoopEvent(type="done")
                 return
 
@@ -464,6 +533,13 @@ class AgentLoop:
             self.observability.record_request(session_id, time.time() - request_start)
         self._save_session_memory()
 
+        # 最终上下文用量上报（超轮数总结路径）
+        try:
+            yield self._context_usage_event()
+        except Exception:
+            pass
+
+        self._persist_context_usage()
         yield LoopEvent(type="done")
 
     async def _generate_limit_summary(self, session_id: str, request_start: float) -> str:
