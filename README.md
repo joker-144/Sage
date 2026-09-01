@@ -2,7 +2,7 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
-**当前版本：1.2.1** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+**当前版本：1.2.2** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
 
 ---
 
@@ -12,6 +12,7 @@
 - [快速开始](#快速开始)
 - [系统架构](#系统架构)
 - [写作模式](#写作模式)
+- [成稿审阅（一对一写作工作台）](#成稿审阅一对一写作工作台)
 - [多智能体角色](#多智能体角色)
 - [技能包（Skill Packages）](#技能包skill-packages)
 - [工具集](#工具集)
@@ -42,6 +43,9 @@
 - **思考内容输出**：自动捕获推理模型（如 DeepSeek-R1）的思考链（reasoning_content），以独立卡片展示，默认折叠，支持点击展开查看完整推理过程。
 - **token 消耗透明**：工具调用、智能体调用、技能调用卡片后方实时显示该轮消耗的 token 总数，便于成本监控。
 - **上下文使用情况指示器**：聊天输入框所选模型后内置环形指示器，实时展示当前对话的上下文占用占比、最大上下文窗口与压缩阈值刻度线（80% 处）。悬停浮窗显示当前占用 / 模型最大窗口、压缩触发阈值、已压缩轮数与累计节省 token。压缩阈值随所选模型自动动态计算（模型窗口 × 80%），切换模型后若已占用超出新模型窗口将自动压缩并在压缩时给出提示；各对话的上下文占用与压缩统计独立记录（`compressed_rounds` / `saved_tokens` 持久化到 SQLite，删除该对话才清空）。
+- **成稿审阅视图**：写作模式成稿后进入独立审阅工作台，支持章节树导航、字数进度跟踪（章节目标字数 / 当前字数）、AI 痕迹检测、LLM 深度改写、`【数据】`占位回填（内联提交后自动重写对应段落）、章节锁定与定向修订。多对话各自生成的论文互相隔离（按对话 ID 存储于 `.sage/papers/{对话ID}/`），审阅列表页展示每篇草稿的主题、字数进度与更新时间，可随时返回切换。
+- **修订保留率校验**：多轮修订闭环中若 LLM 产出大幅缩水（字数 < 修订前原文 70%），判定为截断/遗漏并拒绝覆盖旧草稿，给出告警而非静默丢内容。
+- **可靠性加固（多轮代码审查修复）**：上下文压缩采用滚动摘要（历史摘要并入新摘要，不丢失早期决策）；工具去重缓存随写操作失效（`write_file`/`edit_file`/`delete_file` 后清缓存，杜绝读到过期内容）；并行批次单队列 FIFO 真流式转发、异常自动取消剩余任务；阻塞操作（搜索、版本安装、会话记忆保存）全部移出事件循环；SQLite 单例加写锁 + WAL 并发安全；工具执行按类型超时（检索 30s / 解析 120s，超时返回错误让 LLM 换路径）；网络抓取带 SSRF 防护与 2MB 限量读取；LLM 错误分类边界匹配（状态码不再误命中拼接数字）。
 - **会话并发保护**：同一会话同一时刻只允许一个 SSE 请求，冲突时返回 `busy` 事件并提示"上一条消息仍在处理中"；Agent 缓存采用 LRU 淘汰，跳过运行中会话避免误删。
 - **配置原子写**：`.env` 采用临时文件 + `os.replace()` 原子替换 + 写锁，API Key 日志脱敏，写失败显式返回 500 而非静默。
 - **本地文献索引（可选）**：基于 `sentence-transformers`（all-MiniLM-L6-v2，384 维）构建向量化索引，语义检索已上传文献库。`sentence-transformers` 已从核心依赖移出为 `embed` 可选依赖，未安装时对话功能不受影响，仅向量索引相关功能提示安装。
@@ -259,9 +263,10 @@ Sage 采用 6 层架构，自底向上：
 ```
 
 **关键设计**：
-- 同一批次内的子智能体通过 [`_run_parallel_workers`](src/sage/agents/orchestrator.py) 并行执行，使用 `asyncio.as_completed()` 实时收集事件
+- 同一批次内的子智能体通过 [`_run_parallel_workers`](src/sage/agents/orchestrator.py) 并行执行，各 worker 事件边产边写入共享 `asyncio.Queue` 由主循环按 FIFO 实时转发（真流式交错输出，不丢事件），任一 worker 异常时自动取消剩余任务
 - 后续批次可依赖前置批次的产出（通过 `batch_results` 字典累积传递上下文）
-- 依赖规则校验（如 citation 依赖 coder/consolidator，reviewer 依赖 coder/citation 等）确保执行顺序合理
+- 执行计划校验前先做批次 id 归一化（字符串/数字统一转 int），并用规则校验依赖合理性（citation 依赖 coder/consolidator、reviewer 依赖 coder/citation 等），避免类型不匹配导致误回退
+- 意图分析 / 计划生成 / 大纲生成等编排环节的 LLM 调用统一带重试，失败仍回退到各自兜底（经典流水线 / 默认大纲 / 通用助手）
 - 共享草稿 [`PaperProject`](src/sage/paper_project.py)：各角色完整产出写入草稿，下游读全文（仅超 45000 token 预算才安全阀截断），解决"前序产出只剩 2000 字符残片"的全文一致性瓶颈
 - 确定性质量门与二次复核：[`paper_quality.py`](src/sage/paper_quality.py) 硬校验触发"审校→修订→再查"闭环（上限 2 轮），修订后 LLM 软复核二次验证
 - 多轮修订路由：修订类指令（"把结论改保守"）读已有草稿修改并写回；新论文任务清空旧稿
@@ -359,6 +364,30 @@ ToolCall.vue (渲染橙色 llm_retry 卡片：↻ 图标 + 尝试次数 + 错误
 
 ---
 
+## 成稿审阅（一对一写作工作台）
+
+成稿后在「成稿审阅」视图中对论文进行逐章精加工，支持一份草稿的完整审阅闭环：
+
+### 入口与多对话隔离
+
+- 侧栏「成稿审阅」进入**草稿列表页**：展示所有已生成论文的对话（对话标题、论文主题、字数进度、更新时间），每篇草稿按对话 ID 隔离存储在 `.sage/papers/{对话ID}/`，互不覆盖
+- 点击进入**审阅页**：按章节树导航，顶部显示总字数进度（已写 / 目标）；顶部返回按钮回到列表页，可随时切换其它对话的论文
+- 删除对话时同步清理其对应草稿目录，不留残留数据
+
+### 审阅操作
+
+| 操作 | 说明 |
+|------|------|
+| AI 痕迹检测 | 规则库扫描章节，标注疑似 AI 生成痕迹的位置与原因 |
+| 深度改写 | 对检测结果人工确认后调用 LLM 降 AI 味改写，保留原意与引用 |
+| 数据回填 | 扫描 `【数据】` 占位，内联填写数据后自动重写对应结果描述段落 |
+| 章节锁定 | 锁定指定章节，后续 AI 修改不再触碰（保护已定稿内容） |
+| 定向修订 | 指令式修订指定章节；修订全文若字数缩水超 30% 判定为截断，拒绝覆盖并告警 |
+
+所有审阅操作均携带 `conversation_id`，确保只作用于当前对话的草稿。
+
+---
+
 ## 多智能体角色
 
 8 个智能体定义在 [`src/sage/agents/`](src/sage/agents/) 下，每个角色有独立的 `agent.json` 与可选的专属技能。写作模式下还会动态使用通用助手（不绑定角色 prompt）处理无匹配角色的简单任务：
@@ -425,9 +454,11 @@ ToolCall.vue (渲染橙色 llm_retry 卡片：↻ 图标 + 尝试次数 + 错误
 ### 通用技能与网络（[`tools/skill_ops.py`](src/sage/tools/skill_ops.py), [`tools/web.py`](src/sage/tools/web.py)）
 
 - `list_skills` / `load_skill` / `install_skill` — 技能管理
-- `web_search` — DuckDuckGo 搜索（免费免配置，优先使用）
+- `web_search` — DuckDuckGo 搜索（免费免配置，优先使用，线程池执行 + 25s 超时不阻塞事件循环）
 - `web_search_pro` — Tavily AI 高质量搜索（当 `web_search` 结果质量不高时使用，需配置 `TAVILY_API_KEY`）
-- `web_fetch` — 抓取指定 URL 网页正文
+- `web_fetch` — 抓取指定 URL 网页正文（含 SSRF 防护：拒绝解析到私网/环回/保留网段的目标；流式限量 2MB）
+
+部分工具在引擎层配有执行超时（检索类 30s、解析/写作类 120s、其余 60s），超时会返回明确错误让 LLM 换路径，避免单工具卡死整轮循环。
 
 工具返回值统一为 [`ToolResult`](src/sage/tools/types.py) 数据类，含 `success` / `output` / `data` / `error` / `metadata` 字段。
 
@@ -695,6 +726,18 @@ python scripts/bump_version.py set 1.2.3
 | GET | `/memory/summaries` | 列出对话摘要 |
 | GET | `/health` | 健康检查 |
 
+### 成稿审阅 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/review/drafts` | 草稿列表页：所有含成稿的对话（标题、主题、字数进度、更新时间） |
+| GET | `/api/review/draft?conversation_id=xxx` | 获取指定对话的草稿全文与章节结构（未传 ID 时读取工作区根目录兼容旧稿） |
+| POST | `/api/review/detect-ai` | AI 痕迹检测（需 `conversation_id`） |
+| POST | `/api/review/rewrite` | 深度改写（需 `conversation_id`，携带改写范围/要求） |
+| POST | `/api/review/data-fill` | `【数据】`回填重写（需 `conversation_id`，携带章节与填写的数值） |
+| POST | `/api/review/revise` | 定向修订章节（需 `conversation_id`，带保留率校验防缩水） |
+| POST | `/api/review/lock` | 锁定/解锁章节（需 `conversation_id`） |
+
 ---
 
 ## 开发与测试
@@ -717,6 +760,7 @@ python tests/test_paper_quality.py      # 质量门边界测试
 python tests/test_paper_export.py       # LaTeX/Word 导出测试
 python tests/test_paper_data.py         # 数据占位扫描测试
 python tests/test_orchestrator_context.py  # 编排器端到端测试
+python tests/test_intent.py             # 意图分析测试
 
 # macOS / Linux
 PYTHONPATH=src python tests/test_paper_project.py
@@ -731,6 +775,7 @@ PYTHONPATH=src python tests/test_paper_project.py
 | `test_paper_export.py` | LaTeX/Word 导出（标题/加粗/列表/引用转义、空草稿、特殊字符、`.docx` 真实生成） |
 | `test_paper_data.py` | `【数据】` 占位扫描（位置定位、上下文截取、章节推断） |
 | `test_orchestrator_context.py` | 编排器端到端（意图→计划→大纲→成本预估→批次→质量门→修订→软复核→数据建议→导出，含 LLM mock） |
+| `test_intent.py` | 意图分析（规则快速判断 + 动词宾语模式匹配路由） |
 
 ### 测试隔离设计
 

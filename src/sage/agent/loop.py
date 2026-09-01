@@ -49,6 +49,21 @@ from sage.tools.engine import ToolEngine
 
 logger = logging.getLogger(__name__)
 
+# 模块级断路器注册表：按 LLM base_url 共享
+# 同一服务商的一个 Agent 抖动 = 该服务商所有 Agent 都被限流保护，
+# 避免实例级断路器互不感知导致的级联失败（每个实例各记 5 次失败才熔断）。
+_CIRCUIT_BREAKERS: dict[str, CircuitBreaker] = {}
+
+
+def _get_shared_circuit_breaker(base_url: str = "") -> CircuitBreaker:
+    """按 base_url 获取共享断路器（不存在则创建）"""
+    key = base_url or "default"
+    cb = _CIRCUIT_BREAKERS.get(key)
+    if cb is None:
+        cb = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+        _CIRCUIT_BREAKERS[key] = cb
+    return cb
+
 
 @dataclass
 class LoopEvent:
@@ -91,7 +106,15 @@ class AgentLoop:
         enable_reflection: bool = True,
         enable_observability: bool = True,
         writing_mode: bool = False,
+        persist: bool = True,
     ):
+        """AgentLoop
+
+        Args:
+            persist: 是否持久化对话到 SQLite。写作模式内部的 worker 子 Agent
+                设置为 False，避免产生一堆无意义的历史对话记录污染对话列表。
+        """
+        self.persist = persist
         config = get_config()
         self.workspace = workspace or config.workspace
         self.llm = llm or LLMClient()
@@ -149,7 +172,11 @@ class AgentLoop:
         self.observability = get_observability() if enable_observability else None
 
         # v0.5.0 新增：弹性重试
-        self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+        # 断路器按 LLM base_url 共享（模块级注册表）：同一服务商的所有 Agent
+        # 共用一个断路器，避免实例级断路器互不感知导致的级联失败
+        self.circuit_breaker = _get_shared_circuit_breaker(
+            getattr(self.llm, "_base_url", "") or ""
+        )
         self.resilience_tracker = get_resilience_tracker()
 
         # 初始化对话持久化
@@ -157,6 +184,11 @@ class AgentLoop:
 
     def _init_conversation(self):
         """初始化对话记录到 SQLite"""
+        if not self.persist:
+            # 内部 worker：不产生独立的对话记录，避免污染对话列表
+            if not self.conversation_id:
+                self.conversation_id = str(uuid.uuid4())
+            return
         try:
             store = get_store()
             # 防御：conversation_id 可能为 None 或空字符串（如测试入口传入 ""）
@@ -205,6 +237,8 @@ class AgentLoop:
 
         删除对话时 conversations 行随 delete_conversation 删除，统计一并清空。
         """
+        if not self.persist:
+            return
         try:
             stats = getattr(self.context, "compression_stats", {}) or {}
             get_store().update_context_stats(
@@ -457,7 +491,12 @@ class AgentLoop:
 
                     # 缓存成功的工具调用结果（使用完整 output，非截断 summary）
                     if result.success:
-                        _dedup_cache[dedup_key] = result.output
+                        # 写类工具（写/编辑/删除文件）会改变后续读取结果：
+                        # 成功后清空整个去重缓存，避免后续 read_file 等命中过期内容
+                        if call.name in ("write_file", "edit_file", "delete_file"):
+                            _dedup_cache.clear()
+                        else:
+                            _dedup_cache[dedup_key] = result.output
 
                     # 将完整结果加入 LLM 上下文（summary 会截断到 200 字符，导致 LLM 只能看到部分结果）
                     tool_output = result.output if result.success else f"错误: {result.error}"
@@ -501,7 +540,11 @@ class AgentLoop:
 
                 # v0.6.0 对话结束，保存会话摘要到长期记忆（在 done 之前完成，
                 # 避免 done 事件后流关闭导致收尾任务被取消）
-                self._save_session_memory()
+                # 会话摘要含 LLM 调用与向量化，放线程池避免阻塞事件循环
+                try:
+                    await asyncio.to_thread(self._save_session_memory)
+                except Exception as e:
+                    logger.warning("保存会话记忆失败: %s", e)
 
                 # 最终上下文用量上报（含本轮助手回复）
                 try:
@@ -531,7 +574,11 @@ class AgentLoop:
         # 可观测性 + 记忆保存（在 done 之前完成，确保 done 后流可立即关闭）
         if self.observability:
             self.observability.record_request(session_id, time.time() - request_start)
-        self._save_session_memory()
+        # 会话摘要含 LLM 调用与向量化，放线程池避免阻塞事件循环
+        try:
+            await asyncio.to_thread(self._save_session_memory)
+        except Exception as e:
+            logger.warning("保存会话记忆失败: %s", e)
 
         # 最终上下文用量上报（超轮数总结路径）
         try:
@@ -547,29 +594,39 @@ class AgentLoop:
 
         让 AI 基于已完成的工具调用结果，给用户一个阶段性总结，
         而不是直接抛出"已达最大轮数"的报错。
+
+        轻量重试 2 次（临时性错误如网络抖动时不至于直接降级为固定提示）。
         """
-        try:
-            messages = self.context.build_messages()
-            # 追加一条提示，引导 LLM 收尾
-            messages.append({
-                "role": "user",
-                "content": (
-                    "（系统提示：已达到工具调用轮数上限，无法再调用工具。）"
-                    "请基于已完成的操作和已获取的信息，给出当前阶段的总结与下一步建议。"
-                ),
-            })
-            response = await self.llm.achat_with_tools(messages=messages, tools=[])
-            # 持久化这次总结调用的 token
-            if response.usage:
-                self._persist_token_usage(response.usage, session_id)
-            return response.content or ""
-        except Exception as e:
-            logger.warning("生成轮数上限总结失败: %s", e)
-            return ""
+        messages = None
+        last_error = None
+        for attempt in range(1, 4):  # 首次 + 2 次重试
+            try:
+                if messages is None:
+                    messages = self.context.build_messages()
+                    # 追加一条提示，引导 LLM 收尾
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "（系统提示：已达到工具调用轮数上限，无法再调用工具。）"
+                            "请基于已完成的操作和已获取的信息，给出当前阶段的总结与下一步建议。"
+                        ),
+                    })
+                response = await self.llm.achat_with_tools(messages=messages, tools=[])
+                # 持久化这次总结调用的 token
+                if response.usage:
+                    self._persist_token_usage(response.usage, session_id)
+                return response.content or ""
+            except Exception as e:
+                last_error = e
+                logger.warning("生成轮数上限总结失败（第 %d 次尝试）: %s", attempt, e)
+                if attempt < 3:
+                    await asyncio.sleep(1.0 * (2 ** (attempt - 1)))
+        logger.warning("生成轮数上限总结重试耗尽: %s", last_error)
+        return ""
 
     def _persist_token_usage(self, usage: dict, session_id: str):
         """持久化 LLM 调用的 token 用量到 SQLite"""
-        if not usage:
+        if not self.persist or not usage:
             return
         try:
             store = get_store()
@@ -585,7 +642,7 @@ class AgentLoop:
 
     def _save_session_memory(self):
         """保存当前对话到长期记忆（会话摘要 + 语义索引）"""
-        if not self._memory_orch:
+        if not self.persist or not self._memory_orch:
             return
         try:
             msgs = []
@@ -602,50 +659,6 @@ class AgentLoop:
         except Exception as e:
             logger.warning("保存会话记忆失败: %s", e)
 
-    async def _call_llm_with_retry(self, messages: list, tools: list, session_id: str):
-        """带弹性重试的 LLM 调用
-
-        使用 resilience.py 统一的 RetryConfig + CircuitBreaker 组合，
-        指数退避公式和断路器逻辑与 retry_with_backoff 装饰器保持一致。
-        """
-        retry_cfg = RetryConfig(max_retries=3, base_delay=1.0, max_delay=30.0)
-        last_error = None
-
-        for attempt in range(retry_cfg.max_retries + 1):
-            if self.circuit_breaker.is_open:
-                raise RetryExhaustedError("断路器开启，拒绝 LLM 调用")
-
-            try:
-                response = await self.llm.achat_with_tools(
-                    messages=messages,
-                    tools=tools,
-                )
-                self.circuit_breaker.record_success()
-                self.resilience_tracker.record("llm_call", success=True)
-                return response
-
-            except Exception as e:
-                last_error = e
-                severity = classify_error(e)
-                self.circuit_breaker.record_failure()
-                self.resilience_tracker.record("llm_call", success=False)
-
-                if attempt >= retry_cfg.max_retries or severity in (ErrorSeverity.PERMANENT, ErrorSeverity.FATAL):
-                    raise RetryExhaustedError(
-                        f"LLM 调用重试 {retry_cfg.max_retries} 次后仍失败: {e}"
-                    ) from e
-
-                delay = min(
-                    retry_cfg.base_delay * (retry_cfg.backoff_multiplier ** attempt),
-                    retry_cfg.max_delay,
-                )
-                if retry_cfg.jitter:
-                    import random
-                    delay *= (0.5 + random.random())
-                await asyncio.sleep(delay)
-
-        raise RetryExhaustedError(f"LLM 调用异常: {last_error}") from last_error
-
     async def _call_llm_stream_with_retry(
         self,
         messages: list,
@@ -654,7 +667,7 @@ class AgentLoop:
     ):
         """带弹性重试的流式 LLM 调用
 
-        与 _call_llm_with_retry 对应，但使用流式接口：
+        流式路径是 run() 中唯一的 LLM 调用入口：
           - 连接建立阶段（尚未产出任何 chunk）失败 → 指数退避重试
           - 已开始流式输出后失败 → 不重试（已 yield 的内容无法收回），直接抛出
 
@@ -688,15 +701,19 @@ class AgentLoop:
 
             except Exception as e:
                 last_error = e
-                self.circuit_breaker.record_failure()
-                self.resilience_tracker.record("llm_call", success=False)
 
-                # 已开始流式输出 → 无法重试（内容已发往客户端）
+                # 已开始流式输出 → 无法重试（内容已发往客户端），记一次失败并抛出
                 if started_streaming:
+                    self.circuit_breaker.record_failure()
+                    self.resilience_tracker.record("llm_call", success=False)
                     raise
 
                 severity = classify_error(e)
+                # 一次完整调用只在最终失败时记一次失败（而非每次重试尝试都记），
+                # 避免单次调用内的 3 次重试就把断路器计数打满导致过早熔断
                 if attempt >= retry_cfg.max_retries or severity in (ErrorSeverity.PERMANENT, ErrorSeverity.FATAL):
+                    self.circuit_breaker.record_failure()
+                    self.resilience_tracker.record("llm_call", success=False)
                     raise RetryExhaustedError(
                         f"LLM 调用重试 {retry_cfg.max_retries} 次后仍失败: {e}"
                     ) from e
@@ -814,6 +831,8 @@ class AgentLoop:
             reasoning: 模型思考内容（reasoning_content），完整持久化 agent 回复
             tokens: 该消息对应的 token 用量（prompt+completion 总和）
         """
+        if not self.persist:
+            return
         try:
             store = get_store()
             tool_args = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else ""

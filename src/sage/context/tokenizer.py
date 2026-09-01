@@ -1,4 +1,4 @@
-﻿"""
+"""
 Token 计数器 — 基于 tiktoken 精确计数
 
 不同模型使用不同的 tokenizer:
@@ -30,15 +30,20 @@ def _get_encoder(model: str):
 def count_tokens(text: str, model: str = "deepseek-chat") -> int:
     """精确计算文本的 token 数
 
-    优先使用 tiktoken，不可用时降级为字符数估算（4 字符 ≈ 1 token）
+    优先使用 tiktoken，不可用时降级为字符数估算。
+    降级估算对中文加权：纯中文在 cl100k 中每字约 0.6~0.7 token，
+    统一按 len//4 会严重低估中文文本（导致压缩触发过晚、真实上下文撞上限），
+    因此按 CJK 字符 0.7 token/字、其余字符 0.25 token/字符（4 字符≈1 token）估算。
     """
     if not text:
         return 0
     encoder = _get_encoder(model)
     if encoder is not None:
         return len(encoder.encode(text))
-    # 降级估算
-    return max(1, len(text) // 4)
+    # 降级估算（中文加权）
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    non_cjk = len(text) - cjk
+    return max(1, int(cjk * 0.7 + non_cjk * 0.25))
 
 
 def count_messages_tokens(messages: list[dict], model: str = "deepseek-chat") -> int:

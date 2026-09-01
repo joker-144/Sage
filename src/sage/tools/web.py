@@ -1,4 +1,4 @@
-﻿"""
+"""
 联网工具集 — Web 搜索 + 网页抓取
 
 提供三种联网能力，AI 可根据场景自行选择:
@@ -14,11 +14,46 @@
 """
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import re
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from sage.tools.types import ToolResult
+
+
+def _is_private_host(url: str) -> bool:
+    """SSRF 防护检测：目标主机是否指向私网/环回/保留网段
+
+    - 明显本地地址（localhost / .local）直接拒绝
+    - 其余解析 DNS，任一解析结果落在私网等非公网网段即拒绝
+    - 解析失败保守拒绝（不可达目标没有抓取价值，且可能指向内网主机名）
+    """
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return True
+    if not host:
+        return True
+    lower = host.lower()
+    if lower == "localhost" or lower.endswith(".local"):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return True
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
 
 
 class WebSearchTool:
@@ -43,7 +78,18 @@ class WebSearchTool:
             )
 
         try:
-            results_raw = DDGS().text(query, max_results=max_results)
+            # DDGS().text() 是同步阻塞调用，放入线程池并加超时，避免阻塞事件循环
+            import asyncio
+
+            def _search():
+                return DDGS().text(query, max_results=max_results)
+
+            results_raw = await asyncio.wait_for(
+                asyncio.to_thread(_search),
+                timeout=25,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(success=False, error="DuckDuckGo 搜索超时（25秒），请稍后重试")
         except Exception as e:
             return ToolResult(success=False, error=f"DuckDuckGo 搜索失败: {e}")
 
@@ -165,15 +211,37 @@ class WebFetchTool:
         except ImportError:
             return ToolResult(success=False, error="httpx 未安装")
 
+        # SSRF 防护：拒绝解析到私网/环回/保留网段的地址，避免抓取内网资产
+        # （DNS 解析为阻塞调用，放线程池避免阻塞事件循环）
         try:
+            is_private = await asyncio.to_thread(_is_private_host, url)
+        except Exception:
+            is_private = True
+        if is_private:
+            return ToolResult(
+                success=False,
+                error="目标地址解析到私网/保留网段（或无法解析），已拒绝抓取以防范 SSRF",
+            )
+
+        try:
+            # 流式限量读取：响应超过上限立即停止下载，避免超大响应占用内存
+            max_bytes = 2 * 1024 * 1024  # 2MB
             async with httpx.AsyncClient(
                 timeout=20,
                 follow_redirects=True,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; Sage/1.0)"},
             ) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                html = resp.text
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    chunks = []
+                    size = 0
+                    async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            break
+                        chunks.append(chunk)
+                    html = b"".join(chunks).decode("utf-8", errors="ignore")
+            truncated_body = size > max_bytes
         except httpx.HTTPStatusError as e:
             return ToolResult(
                 success=False,
@@ -213,9 +281,12 @@ class WebFetchTool:
         if not text:
             return ToolResult(success=False, error="无法从网页提取正文内容")
 
-        # 截断（不标记"已截断"以避免 LLM 重复抓取同一 URL）
+        # 截断：明确标记"已截断"，让 LLM 知道内容不完整而非误以为全文只有这些，
+        # 并由此决定是否需要换工具(如再抓一次)获取剩余内容（注释与行为保持一致）
         if len(text) > max_length:
             text = text[:max_length] + f"\n\n(共 {len(text)} 字符，已返回前 {max_length} 字符)"
+        elif truncated_body:
+            text = text + f"\n\n(原始页面超过 2MB，已停止下载并返回已获取部分)"
 
         result = f"## 网页内容: {title}\nURL: {url}\n\n{text}"
         return ToolResult(success=True, data=result)

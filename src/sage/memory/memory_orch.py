@@ -1,4 +1,4 @@
-﻿"""
+"""
 三层记忆编排器 — MemoryOrchestrator
 
 统一管理三层记忆系统，提供 AgentLoop 使用的单点接口：
@@ -117,6 +117,9 @@ class MemoryOrchestrator:
                 else:
                     items = val if isinstance(val, list) else []
                 for item in items[:5]:
+                    # 长度过滤：过短碎片 / 过长赘述不入库，避免语义库噪声
+                    if not (10 <= len(item.strip()) <= 500):
+                        continue
                     mem_type = "lesson" if key == "lessons" else "preference"
                     memories.append({
                         "content": item,
@@ -178,8 +181,12 @@ class MemoryOrchestrator:
                 if any(kw in content for kw in ["决定", "选择", "采用", "最终方案", "我建议"]):
                     decision_points.append(content[:200])
 
-                # 提取经验教训
-                if any(kw in content for kw in ["发现", "注意", "重要", "建议", "最佳实践"]):
+                # 提取经验教训（收窄关键词，避免普通叙述/正文被当作经验渗入语义库，
+                # 并限制长度 15~300 字，碎片/赘述不入库）
+                if any(kw in content for kw in [
+                    "经验", "教训", "踩坑", "切记", "务必", "需要特别注意",
+                    "最佳实践", "后来发现", "注意避免", "不要直接", "千万别",
+                ]) and 15 <= len(content) <= 300:
                     lessons.append(content[:200])
 
             elif role == "tool" and tool_name:

@@ -163,6 +163,8 @@ class AgentOrchestrator:
         """获取或创建 Worker Agent
 
         system prompt 从 agents/{role}/agent.json 加载，并自动注入专属技能。
+        worker 是编排器内部角色，persist=False：不写入历史对话列表，
+        避免多个 worker 产生大量无意义对话记录污染对话历史。
         """
         if role not in self._workers:
             prompt = self._loader.get_system_prompt(role.value)
@@ -173,6 +175,7 @@ class AgentOrchestrator:
                 workspace=self.workspace,
                 system_prompt=prompt,
                 writing_mode=True,
+                persist=False,
             )
         return self._workers[role]
 
@@ -183,7 +186,7 @@ class AgentOrchestrator:
         """
         if self._general_worker is None:
             # 不传 system_prompt，AgentLoop 会使用默认的通用 system prompt
-            self._general_worker = AgentLoop(workspace=self.workspace, writing_mode=True)
+            self._general_worker = AgentLoop(workspace=self.workspace, writing_mode=True, persist=False)
         return self._general_worker
 
     def _get_worker_by_role_name(self, role_name: str) -> Optional[AgentLoop]:
@@ -467,6 +470,22 @@ class AgentOrchestrator:
                 revised = await self._revise_round(report)
                 if not revised.strip():
                     break
+                # 保留率校验：修订全文若大幅缩水（< 旧版 70%），拒绝覆盖并告警，
+                # 避免 LLM 输出被截断/遗漏时的静默丢内容
+                draft_before_revise = self.project.read_draft()
+                old_len = len(draft_before_revise.strip())
+                new_len = len(revised.strip())
+                if old_len > 0 and new_len < old_len * 0.7:
+                    logger.warning(
+                        "修订产出疑似缩水：%d 字 → %d 字，拒绝覆盖本轮草稿",
+                        old_len, new_len,
+                    )
+                    yield CollaborationEvent(
+                        type="reflection",
+                        role="supervisor",
+                        content=f"第 {round_no} 轮修订产出疑似不完整（{new_len} 字 < 修订前 {old_len} 字的 70%），已保留原草稿",
+                    )
+                    break
                 self.project.parse_draft_to_sections(revised)
                 self.project.store_material("debugger", revised)
                 self.project.finalize()
@@ -724,6 +743,30 @@ class AgentOrchestrator:
         # 无匹配 — 通用 Agent
         return "general"
 
+    # ── 统一 LLM 调用（带轻量重试）──
+
+    async def _llm_call(self, messages: list, max_tokens: int = 500):
+        """统一的 LLM 调用入口（无工具），带轻量指数退避重试
+
+        编排器的意图分析 / 计划生成 / 大纲生成等环节此前直连 self._llm 无重试，
+        网络抖动等瞬时错误会导致整个流程直接降级。这里统一做 3 次尝试，
+        重试耗尽后抛出原异常，由各调用方既有的降级逻辑接管（行为不变）。
+        """
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                return await self._llm.achat_with_tools(
+                    messages=messages,
+                    tools=[],
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                last_error = e
+                logger.warning("编排 LLM 调用失败（第 %d 次尝试）: %s", attempt, e)
+                if attempt < 3:
+                    await asyncio.sleep(1.0 * (2 ** (attempt - 1)))
+        raise last_error
+
     async def _analyze_intent_with_llm(self, user_input: str) -> IntentResult:
         """使用 LLM 进行精细意图分析
 
@@ -760,25 +803,16 @@ class AgentOrchestrator:
         ]
 
         # 限制 max_tokens 避免浪费（意图分析结果很短）
-        response = await self._llm.achat_with_tools(
-            messages=messages,
-            tools=[],
-            max_tokens=200,
-        )
+        response = await self._llm_call(messages, max_tokens=200)
 
-        content = (response.content or "").strip()
-        # 容错：提取 JSON（LLM 可能包裹在 ```json ... ``` 中）
-        if "```" in content:
-            import re
-            m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-            if m:
-                content = m.group(1)
-        # 尝试从原文中提取 JSON
-        if not content.startswith("{"):
-            import re
-            m = re.search(r"\{[^{}]*\}", content, re.DOTALL)
-            if m:
-                content = m.group(0)
+        content = _extract_json(response.content or "") or ""
+        if not content:
+            # JSON 提取失败 — 降级为简单任务通用 Agent
+            return IntentResult(
+                complexity="simple",
+                role="general",
+                reason="意图分析结果解析失败，由通用助手处理",
+            )
 
         try:
             data = json.loads(content)
@@ -857,24 +891,10 @@ class AgentOrchestrator:
         ]
 
         try:
-            response = await self._llm.achat_with_tools(
-                messages=messages,
-                tools=[],
-                max_tokens=500,
-            )
-            content = (response.content or "").strip()
-            # 容错：提取 JSON
-            if "```" in content:
-                import re
-                m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-                if m:
-                    content = m.group(1)
-            if not content.startswith("{"):
-                import re
-                m = re.search(r"\{.*\}", content, re.DOTALL)
-                if m:
-                    content = m.group(0)
-
+            response = await self._llm_call(messages, max_tokens=500)
+            content = _extract_json(response.content or "") or ""
+            if not content:
+                raise ValueError("执行计划未包含有效 JSON")
             plan = json.loads(content)
             # 规则校验并修正
             plan = self._validate_plan(plan)
@@ -903,7 +923,29 @@ class AgentOrchestrator:
         if not batches:
             return self._fallback_plan()
 
-        # 1) 收集所有已分配角色（去重，重复的只保留第一个）
+        # 1) id 类型归一化：LLM 可能输出字符串 id（如 "1"）而 depends_on 用 int（如 1），
+        #    类型不匹配会导致下方 depends_on 校验误判并整体回退全角色流水线。
+        #    这里统一将 id / depends_on 转 int；id 无法解析时直接回退（无有效批次）。
+        normalized_batches = []
+        for batch in batches:
+            try:
+                bid = int(batch.get("id"))
+            except (TypeError, ValueError):
+                return self._fallback_plan()
+            nb = dict(batch)
+            nb["id"] = bid
+            deps = []
+            for d in (batch.get("depends_on") or []):
+                try:
+                    deps.append(int(d))
+                except (TypeError, ValueError, AttributeError):
+                    continue  # 无法解析的依赖忽略
+            nb["depends_on"] = deps
+            normalized_batches.append(nb)
+        plan["batches"] = normalized_batches
+        batches = normalized_batches
+
+        # 2) 收集所有已分配角色（去重，重复的只保留第一个）
         seen_roles = set()
         cleaned_batches = []
         for batch in batches:
@@ -982,11 +1024,7 @@ class AgentOrchestrator:
             {"role": "user", "content": f"用户需求: {user_input}\n\n请生成论文大纲。"},
         ]
         try:
-            response = await self._llm.achat_with_tools(
-                messages=messages,
-                tools=[],
-                max_tokens=800,
-            )
+            response = await self._llm_call(messages, max_tokens=800)
             return _parse_outline_response(response.content or "", fallback)
         except Exception as e:
             logger.warning("大纲生成失败，回退 %s 默认大纲: %s", paper_type, e)
@@ -1058,9 +1096,7 @@ class AgentOrchestrator:
             {"role": "user", "content": user_content},
         ]
         try:
-            response = await self._llm.achat_with_tools(
-                messages=messages, tools=[], max_tokens=1500
-            )
+            response = await self._llm_call(messages, max_tokens=1500)
             return (response.content or "").strip()
         except Exception as e:
             logger.warning("数据建议生成失败: %s", e)
@@ -1084,16 +1120,16 @@ class AgentOrchestrator:
             dep_roles: 本批次依赖的前序角色列表（由计划 depends_on 推导，方案A）
 
         Yields:
-            CollaborationEvent: 各 worker 产生的事件（交错yield）
+            CollaborationEvent: 各 worker 产生的事件（边产边转，实时交错的真流式）
         """
         dep_roles = list(dep_roles or [])
+        # 共享事件队列：worker 每产出一个事件立即入队，主循环按 FIFO 逐一转发；
+        # worker 完成信号 (role_name, text_output, ok) 也走同一队列，
+        # 保证「worker_start → 过程事件 → 完成信号」的相对顺序不丢（单队列无竞态）
+        event_queue: asyncio.Queue = asyncio.Queue()
 
-        # 为每个角色构建 prompt（用户需求 + 依赖全文 + 大纲 + 角色引导）
-        async def run_single(role_name: str) -> tuple[str, list[CollaborationEvent], str]:
-            """运行单个 worker，收集事件和文本输出"""
-            events = []
-            results = []
-
+        async def run_single(role_name: str):
+            """运行单个 worker，事件边产边入队（不再等完整结束才 yield）"""
             # 依赖上下文由 LLM 的 depends_on 决定（方案A），传递完整产出
             dep_context = _build_dependency_context(dep_roles, batch_results)
             prompt = _build_worker_prompt(
@@ -1104,54 +1140,93 @@ class AgentOrchestrator:
             )
 
             role_label = _ROLE_LABELS.get(role_name, role_name)
-            events.append(CollaborationEvent(
-                type="worker_start",
-                role=role_name,
-                content=f"{role_label}开始工作...",
-            ))
+            text_parts: list[str] = []
+            ok = False
+            try:
+                # 获取 worker 并运行
+                worker = self._get_worker_by_role_name(role_name)
+                if worker is None:
+                    await event_queue.put(CollaborationEvent(
+                        type="worker_done",
+                        role=role_name,
+                        content=f"{role_label}角色不存在，跳过",
+                    ))
+                    return
 
-            # 获取 worker 并运行
-            worker = self._get_worker_by_role_name(role_name)
-            if worker is None:
-                events.append(CollaborationEvent(
+                await event_queue.put(CollaborationEvent(
+                    type="worker_start",
+                    role=role_name,
+                    content=f"{role_label}开始工作...",
+                ))
+
+                async for event in worker.run(prompt):
+                    mapped = self._map_event(event, role_name)
+                    if mapped:
+                        # 实时转发给前端（不等 worker 结束）
+                        await event_queue.put(mapped)
+                        if mapped.type == "text":
+                            text_parts.append(mapped.content)
+                ok = True  # 正常产出完毕
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("worker %s 异常: %s", role_name, e)
+                await event_queue.put(CollaborationEvent(
                     type="worker_done",
                     role=role_name,
-                    content=f"{role_label}角色不存在，跳过",
+                    content=f"{role_label}异常终止: {e}",
                 ))
-                return role_name, events, ""
+            finally:
+                # 完成信号：跑完（无论成败）都会入队，供主循环收尾
+                await event_queue.put((role_name, "\n".join(text_parts) if text_parts else "", ok))
 
-            async for event in worker.run(prompt):
-                mapped = self._map_event(event, role_name)
-                if mapped:
-                    events.append(mapped)
-                    if mapped.type == "text":
-                        results.append(mapped.content)
-
-            text_output = "\n".join(results) if results else ""
-            events.append(CollaborationEvent(
-                type="worker_done",
-                role=role_name,
-                content=f"{role_label}完成工作",
-            ))
-            return role_name, events, text_output
-
-        # 并行执行所有 worker
+        # 并行启动所有 worker
         tasks = [asyncio.create_task(run_single(r)) for r in roles]
-        # 实时 yield 已完成 worker 的事件
-        for coro in asyncio.as_completed(tasks):
-            role_name, events, text_output = await coro
-            for event in events:
-                yield event
-            # 存储完整结果供后续批次使用
-            batch_results[role_name] = text_output
-            # 写入共享草稿：素材全文 + 正文分节结构化（供下游读全文）
-            if project is not None and text_output:
-                project.store_material(role_name, text_output)
-                if role_name in ("coder", "consolidator", "debugger"):
-                    project.parse_draft_to_sections(text_output)
-                # 引用管理员完成后：把产出中的「引用说明对照清单」落盘为 citations.md
-                if role_name == "citation":
-                    self._persist_citation_manifest(text_output, project)
+        finished = 0
+        try:
+            # 主循环：单队列 FIFO 逐项消费（事件与完成信号统一处理），
+            # worker 极快完成时也不会出现事件被跳过/顺序错乱
+            while finished < len(tasks):
+                item = await event_queue.get()
+                if isinstance(item, CollaborationEvent):
+                    yield item
+                    continue
+                role_name, text_output, ok = item
+                finished += 1
+                if ok:
+                    # 正常完成补发汇总事件（异常/缺角色分支已由 run_single 入队，不重复）
+                    yield CollaborationEvent(
+                        type="worker_done",
+                        role=role_name,
+                        content=f"{_ROLE_LABELS.get(role_name, role_name)}完成",
+                    )
+                # 存储完整结果供后续批次使用
+                batch_results[role_name] = text_output
+                # 写入共享草稿：素材全文 + 正文分节结构化（供下游读全文）
+                if project is not None and text_output:
+                    project.store_material(role_name, text_output)
+                    if role_name in ("coder", "consolidator", "debugger"):
+                        project.parse_draft_to_sections(text_output)
+                    # 引用管理员完成后：落盘「引用说明对照清单」为 citations.md
+                    if role_name == "citation":
+                        self._persist_citation_manifest(text_output, project)
+        except asyncio.CancelledError:
+            # 客户端断开：取消所有仍在运行的 worker，避免后台残留任务
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise
+        except Exception:
+            # 主循环异常：取消剩余 worker，避免任务悬挂
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            raise
 
     def _has_file_changes(self, agent: AgentLoop) -> bool:
         """检查 Agent 是否进行了实际文件修改（Sage 不依赖 git）"""
@@ -1408,22 +1483,36 @@ def _build_simple_prompt(role_name: str, user_input: str, project: Optional[Pape
     return user_input
 
 
-def _parse_outline_response(content: str, fallback: Optional[list[dict]] = None) -> list[dict]:
-    """解析大纲 LLM 响应为 sections 列表；失败返回 fallback（默认 IMRaD）。"""
-    import re as _re
+def _extract_json(content: str) -> Optional[str]:
+    """从 LLM 输出中提取 JSON 文本（容错处理）
 
-    fb = fallback or DEFAULT_OUTLINE
+    覆盖三种常见噪声：
+    1. Markdown 代码块包裹：```json { ... } ```
+    2. 前后缀说明文字：XX 结果如下 { ... } XX
+    3. 内容里出现多个对象时优先取第一个完整 JSON 对象（贪婪匹配支持嵌套）
+
+    提取失败返回 None。本函数统一替代各环节散落的 JSON 提取逻辑。
+    """
     text = (content or "").strip()
     if not text:
-        return list(fb)
+        return None
     if "```" in text:
-        m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if m:
-            text = m.group(1)
-    if not text.startswith("{"):
-        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+            return m.group(1)
+    for pat in (r"\{.*\}", r"\[.*\]"):
+        m = re.search(pat, text, re.DOTALL)
         if m:
-            text = m.group(0)
+            return m.group(0)
+    return None
+
+
+def _parse_outline_response(content: str, fallback: Optional[list[dict]] = None) -> list[dict]:
+    """解析大纲 LLM 响应为 sections 列表；失败返回 fallback（默认 IMRaD）。"""
+    fb = fallback or DEFAULT_OUTLINE
+    text = _extract_json(content)
+    if not text:
+        return list(fb)
     try:
         data = json.loads(text)
         sections = data.get("sections") or data.get("outline") or []

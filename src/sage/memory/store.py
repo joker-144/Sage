@@ -127,6 +127,60 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at);
 """
 
 
+class _ThreadSafeConnection:
+    """线程安全 SQLite 连接代理 — 所有调用包裹实例级 RLock
+
+    SQLite 默认单连接不支持并发操作（check_same_thread=False 只是跳过程序
+    层面的线程检查，底层仍非线程安全）。本代理将 execute/commit 等全部
+    串行化，避免多线程读写同一连接时的 "database is locked" 与数据竞争。
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+        self._conn = conn
+        self._lock = lock
+
+    def execute(self, sql, parameters=()):
+        with self._lock:
+            return self._conn.execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        with self._lock:
+            return self._conn.executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script):
+        with self._lock:
+            return self._conn.executescript(sql_script)
+
+    def commit(self):
+        with self._lock:
+            return self._conn.commit()
+
+    def rollback(self):
+        with self._lock:
+            return self._conn.rollback()
+
+    def close(self):
+        with self._lock:
+            return self._conn.close()
+
+    def cursor(self):
+        with self._lock:
+            return self._conn.cursor()
+
+    # row_factory 需透传到底层连接（sqlite3.Row 必须设置在原生连接上）
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._conn.row_factory = value
+
+    # 属性透传（total_changes 等只读属性）
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 class MemoryStore:
     """SQLite 统一存储 — 线程安全的单例
 
@@ -151,7 +205,13 @@ class MemoryStore:
         self.db_path = db_path or config.memory_sqlite_path
         # 确保目录存在
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # 实例级写锁：包裹所有连接调用，保证跨线程并发安全
+        self._conn_lock = threading.RLock()
+        # WAL 模式提升并发读写（读不阻塞写）；busy_timeout 缓解写锁等待
+        raw_conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=15)
+        raw_conn.execute("PRAGMA journal_mode=WAL")
+        raw_conn.execute("PRAGMA busy_timeout=15000")
+        self._conn = _ThreadSafeConnection(raw_conn, self._conn_lock)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
         self._conn.commit()

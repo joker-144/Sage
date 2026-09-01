@@ -32,6 +32,30 @@ from sage.tools.agent_ops import AgentOps
 from sage.tools.web import WebSearchTool, WebSearchProTool, WebFetchTool
 
 
+# 工具执行超时（秒）：网络检索类限制更严（30s），文档解析 / 写作辅助类耗时长（120s），其余默认 60s
+_SEARCH_TIMEOUT_TOOLS = {
+    "web_search", "web_search_pro", "web_fetch",
+    "search_scholar", "search_arxiv", "search_crossref",
+    "search_semantic_scholar", "search_cnki",
+}
+_PARSE_TIMEOUT_TOOLS = {
+    "parse_pdf", "parse_docx", "parse_latex", "extract_metadata", "ocr_document",
+    "index_papers", "check_plagiarism",
+    "generate_outline", "write_paragraph", "polish_academic",
+    "check_logic", "reduce_ai_pattern", "extract_references",
+    "insert_citation", "format_references",
+}
+
+
+def _tool_timeout(name: str) -> float:
+    """按工具类型确定执行超时（秒）"""
+    if name in _SEARCH_TIMEOUT_TOOLS:
+        return 30.0
+    if name in _PARSE_TIMEOUT_TOOLS:
+        return 120.0
+    return 60.0
+
+
 @dataclass
 class ToolDef:
     """工具定义 — 函数 + JSON schema"""
@@ -165,6 +189,7 @@ class ToolEngine:
             return ToolResult(success=False, error=f"未知工具: {name}")
 
         tool = self._tools[name]
+        timeout = _tool_timeout(name)
         try:
             kwargs = dict(arguments)
             # 进度注入：工具函数声明了 progress 参数且当前有进度队列时，
@@ -176,7 +201,15 @@ class ToolEngine:
                     params = {}
                 if "progress" in params:
                     kwargs["progress"] = self._make_progress_reporter(name)
-            return await tool.func(**kwargs)
+            # 执行超时：避免单个工具无限 hang 卡死整轮 LLM 循环；
+            # 超时返回 ToolResult 错误，让 LLM 换路径重试
+            result = await asyncio.wait_for(tool.func(**kwargs), timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            return ToolResult(
+                success=False,
+                error=f"工具 {name} 执行超时（{timeout:.0f}秒），请缩小请求范围或换一种方式重试",
+            )
         except TypeError as e:
             return ToolResult(success=False, error=f"参数错误: {e}")
         except Exception as e:

@@ -427,7 +427,13 @@ async def check_update():
 
 @app.get("/debug/webfiles")
 async def debug_web_files():
-    """调试接口：列出 WEB_DIR 路径和文件"""
+    """调试接口：列出 WEB_DIR 路径和文件（仅开发环境可用）
+
+    打包（生产）环境直接禁用：该接口暴露本地 WEB 路径与文件清单，
+    仅在源码运行（开发调试）时提供诊断能力。
+    """
+    if getattr(sys, "frozen", False):
+        raise HTTPException(status_code=404, detail="Not Found")
     web_path = str(WEB_DIR)
     exists = WEB_DIR.exists()
     index_exists = (WEB_DIR / "index.html").exists()
@@ -2104,7 +2110,9 @@ async def version_check():
             result["source"] = "gitcode"
             # gitcode 成功则跳过后续 GitHub 回退逻辑
             if result["has_update"] and result["latest"] != current:
-                commits_changelog = _fetch_commits_between_versions(current, result["latest"])
+                commits_changelog = await asyncio.to_thread(
+                    _fetch_commits_between_versions, current, result["latest"]
+                )
                 if commits_changelog:
                     result["changelog"] = commits_changelog
             _version_cache = {"ts": now, "data": result, "current": current, "ttl": 3600}
@@ -2247,7 +2255,9 @@ async def version_check():
     # 调用 GitHub Compare API 获取 v{current}...v{latest} 之间的所有 commit message，
     # 比手动填写的 Release body 更准确、更及时。获取失败时保留原 Release body。
     if result["has_update"] and result["latest"] != current:
-        commits_changelog = _fetch_commits_between_versions(current, result["latest"])
+        commits_changelog = await asyncio.to_thread(
+            _fetch_commits_between_versions, current, result["latest"]
+        )
         if commits_changelog:
             result["changelog"] = commits_changelog
 
@@ -2484,12 +2494,24 @@ async def version_install(request: Request):
     改进点：
     - 安装后等待 3 秒检查进程状态，若已退出则返回退出码
     - 卸载操作增加错误信息收集
+    - 同步子进程操作放入线程池执行，避免阻塞事件循环（SSE 全局卡顿）
+    """
+
+    body = await request.json()
+
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(_version_install_sync, body)
+
+
+def _version_install_sync(body: dict) -> dict:
+    """版本安装的同步实现（卸载旧版 + 启动新版安装程序）
+
+    因含 subprocess 阻塞调用与 sleep，统一由 async 入口放入线程池执行。
     """
     import subprocess
     import winreg
     import time
 
-    body = await request.json()
     file_path = body.get("file_path", "")
 
     if not file_path or not Path(file_path).exists():

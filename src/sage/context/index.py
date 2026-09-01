@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -33,6 +34,24 @@ import numpy as np
 from sage.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _temp_hf_offline():
+    """临时设置 HF_HUB_OFFLINE=1，退出时恢复环境变量原值
+
+    模型加载期间阻止 HuggingFace Hub 的联网 HEAD 检查（大幅加快加载），
+    但要避免把离线标记永久写入全局环境，影响后续其他模型的在线下载。
+    """
+    prev = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        yield
+    finally:
+        if prev is not None:
+            os.environ["HF_HUB_OFFLINE"] = prev
+        else:
+            os.environ.pop("HF_HUB_OFFLINE", None)
 
 
 def _import_sentence_transformers():
@@ -159,35 +178,36 @@ class LocalEmbedder:
             # 优先从打包内置路径加载（桌面端，无需联网）
             bundled_path = self._get_bundled_model_path(model_name)
             if bundled_path:
-                os.environ["HF_HUB_OFFLINE"] = "1"
                 if progress_callback:
                     progress_callback("loading", 50, "正在加载内置模型...")
-                try:
-                    st = _import_sentence_transformers()
-                    LocalEmbedder._model = st.SentenceTransformer(bundled_path)
-                    if progress_callback:
-                        progress_callback("ready", 100, "模型就绪")
-                    return LocalEmbedder._model
-                except Exception as e:
-                    if progress_callback:
-                        progress_callback("error", 0, f"内置模型加载失败: {e}")
-                    raise
+                # 临时离线模式：跳过 HEAD 更新检查加速加载，退出后恢复环境变量
+                with _temp_hf_offline():
+                    try:
+                        st = _import_sentence_transformers()
+                        LocalEmbedder._model = st.SentenceTransformer(bundled_path)
+                        if progress_callback:
+                            progress_callback("ready", 100, "模型就绪")
+                        return LocalEmbedder._model
+                    except Exception as e:
+                        if progress_callback:
+                            progress_callback("error", 0, f"内置模型加载失败: {e}")
+                        raise
 
-            # 已缓存 → 直接加载（设置离线模式，跳过 HEAD 更新检查，避免网络请求阻塞）
+            # 已缓存 → 直接加载（临时离线模式，跳过 HEAD 更新检查，避免网络请求阻塞）
             if self._is_model_cached(model_name):
-                os.environ["HF_HUB_OFFLINE"] = "1"
                 if progress_callback:
                     progress_callback("loading", 50, "正在加载模型到内存...")
-                try:
-                    st = _import_sentence_transformers()
-                    LocalEmbedder._model = st.SentenceTransformer(model_name)
-                    if progress_callback:
-                        progress_callback("ready", 100, "模型就绪")
-                    return LocalEmbedder._model
-                except Exception as e:
-                    if progress_callback:
-                        progress_callback("error", 0, f"加载失败: {e}")
-                    raise
+                with _temp_hf_offline():
+                    try:
+                        st = _import_sentence_transformers()
+                        LocalEmbedder._model = st.SentenceTransformer(model_name)
+                        if progress_callback:
+                            progress_callback("ready", 100, "模型就绪")
+                        return LocalEmbedder._model
+                    except Exception as e:
+                        if progress_callback:
+                            progress_callback("error", 0, f"加载失败: {e}")
+                        raise
 
             # 需要下载 → 流式下载并报告进度（清除离线标记以允许联网下载）
             os.environ.pop("HF_HUB_OFFLINE", None)

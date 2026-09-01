@@ -1,4 +1,4 @@
-﻿"""
+"""
 弹性重试与错误处理 — Retry & Resilience
 
 参考生产级系统设计，提供:
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -110,8 +111,19 @@ def classify_error(error: Exception) -> ErrorSeverity:
     """分类错误严重级别"""
     error_str = str(error).lower()
 
+    def _has_status(codes: tuple) -> bool:
+        # 纯数字状态码用「非数字包围」边界匹配，避免 "400" 误命中 "10400" 等拼接数字
+        return any(re.search(rf"(?<!\d){code}(?!\d)", error_str) for code in codes)
+
+    # 上下文超长：可恢复类（压缩上下文后重试），避免被归入 PERMANENT 直接放弃
+    if any(kw in error_str for kw in (
+        "context length", "context window", "maximum context",
+        "token limit", "too many tokens", "上下文",
+    )):
+        return ErrorSeverity.RETRYABLE
+
     # 速率限制
-    if any(kw in error_str for kw in ("rate limit", "too many requests", "429")):
+    if any(kw in error_str for kw in ("rate limit", "too many requests")) or _has_status(("429",)):
         return ErrorSeverity.TRANSIENT
 
     # 网络/超时错误
@@ -119,15 +131,15 @@ def classify_error(error: Exception) -> ErrorSeverity:
         return ErrorSeverity.RETRYABLE
 
     # 服务暂时不可用
-    if any(kw in error_str for kw in ("503", "502", "unavailable", "overloaded")):
+    if _has_status(("503", "502")) or any(kw in error_str for kw in ("unavailable", "overloaded")):
         return ErrorSeverity.RETRYABLE
 
     # 认证/权限
-    if any(kw in error_str for kw in ("401", "403", "unauthorized", "invalid api key", "authentication")):
+    if _has_status(("401", "403")) or any(kw in error_str for kw in ("unauthorized", "invalid api key", "authentication")):
         return ErrorSeverity.FATAL
 
     # 参数错误
-    if any(kw in error_str for kw in ("400", "invalid", "参数")):
+    if _has_status(("400",)) or any(kw in error_str for kw in ("invalid", "参数")):
         return ErrorSeverity.PERMANENT
 
     return ErrorSeverity.RETRYABLE  # 默认可重试
@@ -201,7 +213,7 @@ def retry_with_backoff(
 
                     await asyncio.sleep(delay)
 
-            raise last_error  # pygame: should never reach
+            raise last_error
 
         return wrapper  # type: ignore[return-value]
     return decorator

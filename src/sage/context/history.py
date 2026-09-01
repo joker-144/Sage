@@ -50,14 +50,23 @@ class ChatHistory:
         self.model = model
         self._messages: list[Message] = []
         self._summary: str = ""  # 压缩后的历史摘要
+        # token 增量计数缓存：#add 时累加新消息的 token，token_count() 免每轮全量重算
+        # （长对话全量重算为 O(全部消息长度)，每轮循环多次调用时开销明显）
+        self._cached_msg_tokens: Optional[int] = 0
 
     @property
     def messages(self) -> list[Message]:
         return self._messages
 
     def add(self, message: Message):
-        """添加消息"""
+        """添加消息（增量累计 token 计数）"""
         self._messages.append(message)
+        try:
+            self._cached_msg_tokens += count_messages_tokens(
+                [message.to_openai_dict()], self.model
+            )
+        except Exception:
+            self._cached_msg_tokens = None  # 计数异常 → 后续 token_count 走全量兜底
 
     def add_user(self, content: str):
         """添加用户消息"""
@@ -77,12 +86,18 @@ class ChatHistory:
         ))
 
     def token_count(self) -> int:
-        """当前历史的总 token 数（含摘要）"""
+        """当前历史的总 token 数（含摘要）
+
+        优先使用增量缓存（O(1)）；缓存失效（计数异常/压缩后）时全量重算兜底。
+        """
         summary_tokens = count_tokens(self._summary, self.model) if self._summary else 0
+        if self._cached_msg_tokens is not None:
+            return summary_tokens + self._cached_msg_tokens
         msg_tokens = count_messages_tokens(
             [m.to_openai_dict() for m in self._messages],
             self.model,
         )
+        self._cached_msg_tokens = msg_tokens
         return summary_tokens + msg_tokens
 
     def needs_compression(self) -> bool:
@@ -103,7 +118,10 @@ class ChatHistory:
         to_compress = self._messages[:-10]
         to_keep = self._messages[-10:]
 
-        # 构建摘要请求
+        # 压缩后重新计算消息列表 token 计数（全量重算一次，避免缓存累积误差）
+        self._cached_msg_tokens = None
+
+        # 构建摘要请求（滚动摘要：纳入上一次摘要，避免历史摘要被永久覆盖丢失）
         history_text = "\n\n".join(
             f"[{m.role}] {m.content[:500]}"
             for m in to_compress
@@ -116,8 +134,15 @@ class ChatHistory:
             "- 已经做出的决策和原因\n"
             "- 已经完成的操作和结果\n"
             "- 待解决的问题\n\n"
-            f"对话历史:\n{history_text}"
         )
+        # 已有历史摘要时合并更新，保证跨多次压缩的信息不丢失
+        existing_summary = (self._summary or "").strip()
+        if existing_summary:
+            summary_prompt += (
+                f"以下是之前对话的摘要（请与其合并更新，保留其中的关键信息，"
+                f"而不是丢弃）：\n{existing_summary}\n\n"
+            )
+        summary_prompt += f"本次新增对话历史:\n{history_text}"
 
         try:
             # 使用 asyncio.to_thread 包装同步调用，避免阻塞事件循环
