@@ -1,0 +1,24 @@
+{
+  "outline": [
+    {
+      "key": "abstract",
+      "title": "摘要",
+      "target_words": 300,
+      "content": "毫无疑问，本研究的【数据】结果具有重要意义。值得注意的是，上述方法在某种程度上展现出多样性。综上所述，本文方法有效。"
+    },
+    {
+      "key": "introduction",
+      "title": "引言",
+      "target_words": 800,
+      "content": "首先，本研究具有重要意义。其次，现有方法存在复杂性。最后，本文提出新方法。"
+    },
+    {
+      "key": "results",
+      "title": "结果",
+      "target_words": 600,
+      "content": "实验结果显示，【数据】。不难看出，该方法优于基线。"
+    }
+  ],
+  "material": {},
+  "locked_sections": []
+}

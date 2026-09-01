@@ -16,6 +16,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -592,8 +593,8 @@ async def _collaborate_stream(req: ChatRequest):
     """
     from sage.agents.orchestrator import create_orchestrator
 
-    orchestrator = create_orchestrator(workspace=_current_workspace())
     conv_id = req.conversation_id or str(uuid.uuid4())
+    orchestrator = create_orchestrator(workspace=_current_workspace(), conversation_id=conv_id)
 
     async def event_stream():
         """实际的事件生成器，由 producer task 驱动"""
@@ -767,6 +768,308 @@ async def recheck_context(conversation_id: str):
     return payload
 
 
+@app.get("/api/review/draft")
+async def review_draft(conversation_id: Optional[str] = None):
+    """成稿审阅 — 返回指定对话（或当前工作区）论文草稿的章节树
+
+    每节包含：key/title/content/实际字数/目标字数/锁定状态/【数据】占位符列表，
+    供前端「成稿审阅」视图展示字数进度、占位填写与逐段审阅。
+    conversation_id 指定对话时审阅该对话隔离的草稿；缺省时回退工作区根目录旧稿。
+    """
+    from sage.paper_project import PaperProject
+
+    ws = _current_workspace()
+    project = _review_project(conversation_id)
+    try:
+        project.load()
+    except Exception as e:
+        logger.warning("审阅草稿加载失败: %s", e)
+    tree = project.review_tree()
+    return {
+        "workspace": str(ws),
+        "conversation_id": conversation_id,
+        "total_words": project.draft_word_count(),
+        "sections": tree,
+        "draft_path": str(project._draft_path),
+    }
+
+
+def _review_project(conversation_id: Optional[str] = None) -> "PaperProject":
+    """按对话 ID 定位审阅草稿；无对话 ID 时回退工作区根目录旧稿
+
+    与 orchestrator._create_project 一致：对话草稿存储在
+    <workspace>/.sage/papers/{conversation_id}/ 下，互不覆盖。
+    """
+    from sage.paper_project import PaperProject
+
+    ws = _current_workspace()
+    if conversation_id:
+        papers_dir = ws / ".sage" / "papers" / str(conversation_id)
+        return PaperProject(
+            workspace=ws,
+            meta_path=papers_dir / "paper_project.json",
+            draft_path=papers_dir / "paper.md",
+        )
+    return PaperProject(ws)
+
+
+class DetectAIRequest(BaseModel):
+    text: str = Field(..., description="要检测 AI 痕迹的文本")
+
+
+@app.post("/api/review/detect-ai")
+async def review_detect_ai(req: DetectAIRequest):
+    """降AI味 — 规则检测指定文本的 AI 生成痕迹，返回问题点清单
+
+    仅做检测（不改写）；前端展示问题点供用户确认后，再调用改写接口。
+    """
+    from sage.tools.paper_ops import PaperOps
+    from sage.config import get_config
+
+    ops = PaperOps(workspace=_current_workspace())
+    result = await ops.reduce_ai_pattern(req.text)
+    return {
+        "success": result.success,
+        "issues": result.data.get("patterns", []),
+        "output": result.output,
+    }
+
+
+class RewriteRequest(BaseModel):
+    section_key: str = Field(..., description="章节 key（审阅章节树中的 key）")
+    issues: list[str] = Field(default_factory=list, description="检测到的 AI 痕迹问题点")
+    conversation_id: Optional[str] = None
+
+
+@app.post("/api/review/rewrite")
+async def review_rewrite(req: RewriteRequest):
+    """降AI味 — 对指定章节做 LLM 深度改写（句式多样化、逻辑重写、术语具体化）
+
+    锁定章节拒绝改写。改写结果写回章节并落盘 paper.md。
+    """
+    from sage.paper_project import PaperProject
+    import asyncio as _asyncio
+
+    ws = _current_workspace()
+    project = _review_project(req.conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    if project.is_locked(req.section_key):
+        raise HTTPException(status_code=409, detail="该章节已锁定，请先解锁再改写")
+
+    section = next((s for s in project.outline if s.key == req.section_key), None)
+    if section is None or not section.content.strip():
+        raise HTTPException(status_code=404, detail=f"章节不存在或为空: {req.section_key}")
+
+    agent, _ = _get_or_create_agent()
+    issues_text = "\n".join(f"- {i}" for i in req.issues) if req.issues else "（由模型自行识别）"
+    prompt = (
+        "你是学术论文润色专家。请对给定章节做深度改写以去除 AI 生成痕迹，要求：\n"
+        "1. 变换句式结构，避免机械排比与模板化开头\n"
+        "2. 打散过长整句，控制句子长度变化\n"
+        "3. 用更具体、学术化的表达替换空泛套话\n"
+        "4. 保持原意、事实、引用编号与章节结构不变\n"
+        "5. 只输出改写后的正文，不含标题、不解释\n\n"
+        f"检测到的 AI 痕迹：\n{issues_text}\n\n"
+        f"原文：\n{section.content}"
+    )
+    messages = [
+        {"role": "system", "content": "你是严谨的学术论文润色专家，只输出改写结果。"},
+        {"role": "user", "content": prompt},
+    ]
+    rewritten = await _asyncio.to_thread(
+        lambda: agent.llm.chat(messages, temperature=0.4, max_tokens=min(agent.llm.max_tokens or 8192, 8192))
+    )
+    rewritten = (rewritten or "").strip()
+    if not rewritten:
+        raise HTTPException(status_code=502, detail="LLM 改写无返回，请重试")
+
+    section.content = rewritten
+    project.finalize()
+    return {
+        "success": True,
+        "section_key": req.section_key,
+        "content": rewritten,
+        "word_count": len(rewritten),
+    }
+
+
+class DataFillRequest(BaseModel):
+    section_key: str = Field(..., description="章节 key")
+    placeholder_index: int = Field(..., ge=0, description="该章节内【数据】占位的序号（第几个）")
+    value: str = Field(..., min_length=1, description="用户填写的真实数据/数值")
+    conversation_id: Optional[str] = None
+
+
+@app.post("/api/review/data-fill")
+async def review_data_fill(req: DataFillRequest):
+    """数据回填 — 将章节内某处【数据】占位替换为真实数据，并调用 LLM 重生成结果描述
+
+    锁定章节拒绝回填。改写后写回章节并落盘。
+    """
+    from sage.paper_project import PaperProject
+    from sage.paper_data import find_data_placeholders
+    import asyncio as _asyncio
+
+    ws = _current_workspace()
+    project = _review_project(req.conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    if project.is_locked(req.section_key):
+        raise HTTPException(status_code=409, detail="该章节已锁定，请先解锁再填写数据")
+
+    section = next((s for s in project.outline if s.key == req.section_key), None)
+    if section is None or not section.content.strip():
+        raise HTTPException(status_code=404, detail=f"章节不存在或为空: {req.section_key}")
+
+    placeholders = list(find_data_placeholders(section.content))
+    if req.placeholder_index >= len(placeholders):
+        raise HTTPException(status_code=404, detail=f"章节内没有第 {req.placeholder_index + 1} 处【数据】占位")
+    ph = placeholders[req.placeholder_index]
+
+    agent, _ = _get_or_create_agent()
+    prompt = (
+        "你是学术论文写作助手。原文某处使用了【数据】占位（因为写作时真实数据未知）。"
+        "现在用户提供了真实数据，请重写数据所在的整个段落（或最接近的完整句子群），"
+        "把【数据】替换为真实数据，并相应改写结果描述/讨论，使其与数据一致、表述学术规范。\n\n"
+        "要求：\n"
+        "1. 不改变段落之外的上下文与引用编号\n"
+        "2. 只输出改写后的段落文本\n\n"
+        f"占位上下文：\n{ph.context}\n\n"
+        f"用户提供的真实数据：\n{req.value}"
+    )
+    messages = [
+        {"role": "system", "content": "你是严谨的学术论文写作助手，只输出改写后的段落。"},
+        {"role": "user", "content": prompt},
+    ]
+    new_para = await _asyncio.to_thread(
+        lambda: agent.llm.chat(messages, temperature=0.3, max_tokens=min(agent.llm.max_tokens or 8192, 4096))
+    )
+    new_para = (new_para or "").strip()
+    if not new_para:
+        raise HTTPException(status_code=502, detail="LLM 重写无返回，请重试")
+
+    # 在原文中替换占位所在段落
+    replaced = False
+    paragraphs = section.content.split("\n\n")
+    for i, para in enumerate(paragraphs):
+        if "[数据]" in para or "【数据】" in para:
+            paragraphs[i] = new_para
+            replaced = True
+            break
+    if not replaced:
+        raise HTTPException(status_code=500, detail="未在原文中找到可替换的占位段落")
+    section.content = "\n\n".join(paragraphs)
+    project.finalize()
+    return {
+        "success": True,
+        "section_key": req.section_key,
+        "content": section.content,
+        "word_count": len(section.content),
+    }
+
+
+class ReviseRequest(BaseModel):
+    section_key: str = Field(..., description="章节 key")
+    content: str = Field(..., description="修订后的完整章节内容")
+    conversation_id: Optional[str] = None
+
+
+@app.post("/api/review/revise")
+async def review_revise(req: ReviseRequest):
+    """成稿审阅 — 用户直接修订章节内容（锁定章节拒绝）"""
+    from sage.paper_project import PaperProject
+
+    ws = _current_workspace()
+    project = _review_project(req.conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    if project.is_locked(req.section_key):
+        raise HTTPException(status_code=409, detail="该章节已锁定，请先解锁再修订")
+
+    section = next((s for s in project.outline if s.key == req.section_key), None)
+    if section is None:
+        raise HTTPException(status_code=404, detail=f"章节不存在: {req.section_key}")
+    section.content = req.content or ""
+    project.finalize()
+    return {"success": True, "section_key": req.section_key, "word_count": len(section.content)}
+
+
+class LockRequest(BaseModel):
+    section_key: str = Field(..., description="章节 key")
+    locked: bool = Field(..., description="true=锁定，false=解锁")
+    conversation_id: Optional[str] = None
+
+
+@app.post("/api/review/lock")
+async def review_lock(req: LockRequest):
+    """成稿审阅 — 锁定/解锁章节（锁定后 AI 改写/数据回填/自动修订不再覆盖）"""
+    from sage.paper_project import PaperProject
+
+    ws = _current_workspace()
+    project = _review_project(req.conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    if req.locked:
+        ok = project.lock_section(req.section_key)
+    else:
+        ok = project.unlock_section(req.section_key)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"章节不存在: {req.section_key}")
+    return {"success": True, "section_key": req.section_key, "locked": req.locked}
+
+
+@app.get("/api/review/drafts")
+async def review_drafts():
+    """成稿审阅 — 列出工作区内所有有草稿的对话清单（草稿列表页）
+
+    每条包含：conversation_id、对话标题、论文主题（首条 user 消息截断）、
+    已写/目标字数、更新时间、成稿路径。供前端「草稿列表页」展示与跳转。
+    """
+    from sage.memory.store import get_store
+    from sage.paper_project import PaperProject
+
+    ws = _current_workspace()
+    store = get_store()
+    convs = {c["id"]: c for c in store.list_conversations(limit=10000)}
+    papers_dir = ws / ".sage" / "papers"
+    items = []
+    if papers_dir.exists():
+        for d in papers_dir.iterdir():
+            if not d.is_dir():
+                continue
+            conv_id = d.name
+            project = PaperProject(
+                workspace=ws,
+                meta_path=d / "paper_project.json",
+                draft_path=d / "paper.md",
+            )
+            try:
+                has = project.load()
+            except Exception:
+                has = False
+            if not has or not project.outline:
+                continue
+            conv = convs.get(conv_id) or {}
+            # 论文主题：该对话中第一条 user 消息（前 80 字）
+            topic = ""
+            for m in store.get_messages(conv_id, limit=200):
+                if m.get("role") == "user" and (m.get("content") or "").strip():
+                    topic = m["content"].strip().replace("\n", " ")[:80]
+                    break
+            items.append({
+                "conversation_id": conv_id,
+                "conversation_title": conv.get("title") or "（未命名对话）",
+                "topic": topic,
+                "total_words": project.draft_word_count(),
+                "target_words": sum(s.target_words for s in project.outline),
+                "updated_at": conv.get("updated_at"),
+                "draft_path": str(d / "paper.md"),
+            })
+    items.sort(key=lambda x: x["updated_at"] or "", reverse=True)
+    return {"drafts": items}
+
+
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
     """删除对话及其所有消息"""
@@ -774,6 +1077,14 @@ async def delete_conversation(conversation_id: str):
 
     store = get_store()
     store.delete_conversation(conversation_id)
+    # 清理该对话隔离的草稿目录（.sage/papers/{conversation_id}/）
+    try:
+        drafts_dir = _current_workspace() / ".sage" / "papers" / str(conversation_id)
+        if drafts_dir.exists():
+            import shutil
+            shutil.rmtree(drafts_dir, ignore_errors=True)
+    except Exception as e:
+        logger.warning("删除对话草稿目录失败: %s", e)
     # 清理 Agent 缓存
     if conversation_id in _agents:
         del _agents[conversation_id]

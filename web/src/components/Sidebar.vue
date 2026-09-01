@@ -18,7 +18,7 @@ const activityTopRef = ref(null)
 const indicatorOffsetY = ref(0)
 
 // Activity Bar 顶部视图按钮的顺序（与模板一致）
-const VIEW_ORDER = ['chat', 'dashboard', 'agents', 'custom-agents', 'skills', 'workspace', 'settings']
+const VIEW_ORDER = ['chat', 'dashboard', 'agents', 'custom-agents', 'skills', 'workspace', 'review', 'settings']
 
 function updateIndicator() {
   const container = activityTopRef.value
@@ -143,6 +143,10 @@ watch(() => props.refreshKey, () => {
         <button class="activity-btn" :class="{ active: activeView === 'workspace' }" title="工作区" @click="emit('navigate', 'workspace')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
           <span v-if="sidebarExpanded" class="btn-label">工作区</span>
+        </button>
+        <button class="activity-btn" :class="{ active: activeView === 'review' }" title="成稿审阅" @click="emit('navigate', 'review')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M9 12h6M9 16h4M7 3h10a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M9 7l1.5 1L13 5.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span v-if="sidebarExpanded" class="btn-label">成稿审阅</span>
         </button>
         <button class="activity-btn" :class="{ active: activeView === 'settings' }" title="设置" @click="emit('navigate', 'settings')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.6"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>

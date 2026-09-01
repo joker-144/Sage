@@ -11,6 +11,8 @@ import AgentsView from './components/AgentsView.vue'
 import CustomAgentsView from './components/CustomAgentsView.vue'
 import SkillsView from './components/SkillsView.vue'
 import WorkspaceView from './components/WorkspaceView.vue'
+import ReviewList from './components/ReviewList.vue'
+import ReviewView from './components/ReviewView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import StatsModal from './components/StatsModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
@@ -25,6 +27,7 @@ const {
 } = useChat()
 
 const activeView = ref('chat')
+const reviewConvId = ref(null)  // 成稿审阅当前打开的对话草稿 ID（null=草稿列表页）
 const showStats = ref(false)
 const sidebarExpanded = ref(false)
 const historyPanelVisible = ref(true)
@@ -34,6 +37,8 @@ const confirmDelete = ref({ show: false, convId: null })
 
 function handleNavigate(view) {
   activeView.value = view
+  // 切到/切离成稿审阅时重置到草稿列表页
+  if (view === 'review') reviewConvId.value = null
 }
 
 function handleToggleSidebar() {
@@ -154,6 +159,14 @@ onMounted(() => { reset() })
         </Transition>
         <Transition name="view" appear>
           <WorkspaceView v-show="activeView === 'workspace'" />
+        </Transition>
+        <Transition name="view" appear>
+          <ReviewList v-if="activeView === 'review' && !reviewConvId" @open-draft="reviewConvId = $event" />
+          <ReviewView
+            v-else-if="activeView === 'review'"
+            :conversation-id="reviewConvId"
+            @back="reviewConvId = null"
+          />
         </Transition>
         <Transition name="view" appear>
           <SettingsPanel v-show="activeView === 'settings'" :update-trigger="updateTrigger" />

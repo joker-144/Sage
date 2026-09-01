@@ -573,38 +573,103 @@ class PaperOps:
             return ToolResult(success=False, error=f"逻辑检查失败: {e}")
 
     async def reduce_ai_pattern(self, text: str) -> ToolResult:
-        """降低 AI 生成痕迹的建议"""
+        """降低 AI 生成痕迹的检测（规则库）— 返回问题点清单，不改写
+
+        检测维度：
+          1. 高频 AI 套话与模板化转场
+          2. 句式开头重复（连续多句同开头）
+          3. 连接词过度堆砌
+          4. 绝对化/无依据强断言（"显然"/"不难看出"等）
+          5. 空泛抽象词（"多样性"/"重要作用"等无信息量表达）
+        """
         try:
             patterns = []
-            # 检查 AI 常见模式
+            # 1. AI 常见套话/模板化转场词
             ai_phrases = [
                 "值得注意的是", "需要指出的是", "综上所述", "总而言之",
                 "首先", "其次", "再次", "最后",
                 "在某种程度上", "从某种意义上说",
+                "总而言之，", "总的来说，", "不可否认", "毋庸置疑",
+                "众所周知", "事实上，", "实际上，", "更重要的是",
             ]
             for phrase in ai_phrases:
                 if phrase in text:
-                    patterns.append(f"AI 痕迹: '{phrase}' → 建议替换为更自然的表述")
+                    patterns.append(f"AI 套话: '{phrase}' → 建议替换为更自然的表述或删除")
 
-            # 检查句式重复
-            sentences = re.split(r"[。.!?]", text)
-            sentence_starts = [s.strip()[:4] for s in sentences if s.strip()]
+            # 2. 句式开头重复
+            sentences = [s.strip() for s in re.split(r"[。.!?]", text) if s.strip()]
             from collections import Counter
-            start_counts = Counter(sentence_starts)
+            start_counts = Counter(s[:4] for s in sentences)
             for start, count in start_counts.items():
-                if count > 2:
+                if count > 2 and len(start) >= 2:
                     patterns.append(f"句式重复: '{start}...' 开头出现 {count} 次，建议变化句式")
 
-            # 检查过度使用连接词
-            connectors = ["因此", "然而", "此外", "另外", "同时"]
+            # 3. 过度使用连接词
+            connectors = ["因此", "然而", "此外", "另外", "同时", "进而", "从而"]
             connector_count = sum(text.count(c) for c in connectors)
-            if connector_count > len(sentences) * 0.3:
-                patterns.append(f"连接词使用过多（{connector_count}次），建议减少")
+            if sentences and connector_count > len(sentences) * 0.3:
+                patterns.append(f"连接词使用过多（{connector_count} 次），建议减少或拆分句子")
 
-            result = "降AI味建议:\n" + "\n".join(patterns) if patterns else "文本自然度良好，无明显AI痕迹"
+            # 4. 绝对化/无依据强断言
+            absolutes = ["显然", "毫无疑问", "不难看出", "显而易见", "必然", "一定能"]
+            for w in absolutes:
+                if w in text:
+                    patterns.append(f"绝对化断言: '{w}' → 建议弱化为'通常/往往/在一定条件下'等")
+
+            # 5. 空泛抽象词（AI 常见的高频但无信息量词汇）
+            vague_words = ["多样性", "复杂性", "重要作用", "深远影响", "具有重要意义",
+                           "广泛关注", "亟待解决", "日益凸显", "不断深入"]
+            vague_hits = [w for w in vague_words if w in text]
+            if vague_hits:
+                patterns.append(f"空泛抽象词: {', '.join(vague_hits)} → 建议替换为具体事实/数据/机制描述")
+
+            # 6. 机械排比（连续 >2 个以同一 verb 开头的分句）
+            clause_starts = [c.strip()[:2] for c in re.split(r"[，,]", text) if c.strip()]
+            same_start = Counter(clause_starts).most_common(1)
+            if same_start and same_start[0][1] >= 3:
+                patterns.append(f"机械排比: 分句以'{same_start[0][0]}...'连续开头 {same_start[0][1]} 次，建议打散")
+
+            result = "降AI味检测报告:\n" + "\n".join(patterns) if patterns else "文本自然度良好，无明显AI痕迹"
             return ToolResult(success=True, output=result, data={"patterns": patterns})
         except Exception as e:
             return ToolResult(success=False, error=f"降AI味分析失败: {e}")
+
+    async def rewrite_deai(self, text: str, issues: Optional[list[str]] = None) -> ToolResult:
+        """降AI味 — LLM 深度改写指定文本
+
+        基于 reduce_ai_pattern 的检测结果（可选），调用 LLM 做深度改写：
+        句式多样化、逻辑连词重写、术语具体化，去除 AI 生成痕迹。
+        """
+        try:
+            from sage.llm.client import LLMClient
+
+            issues_text = "\n".join(f"- {i}" for i in issues) if issues else "（由模型自行识别）"
+            prompt = (
+                "你是学术论文润色专家。请对给定文本做深度改写以去除 AI 生成痕迹，要求：\n"
+                "1. 变换句式结构，避免机械排比与模板化开头\n"
+                "2. 打散过长整句，控制句子长度变化\n"
+                "3. 用更具体、学术化的表达替换空泛套话\n"
+                "4. 保持原意、事实、引用编号不变\n"
+                "5. 只输出改写后的文本，不解释\n\n"
+                f"检测到的 AI 痕迹：\n{issues_text}\n\n"
+                f"原文：\n{text}"
+            )
+            llm = LLMClient()
+            rewritten = await asyncio.to_thread(
+                lambda: llm.chat(
+                    [
+                        {"role": "system", "content": "你是严谨的学术论文润色专家，只输出改写结果。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.4,
+                )
+            )
+            rewritten = (rewritten or "").strip()
+            if not rewritten:
+                return ToolResult(success=False, error="LLM 改写无返回")
+            return ToolResult(success=True, output=rewritten, data={"rewritten": rewritten})
+        except Exception as e:
+            return ToolResult(success=False, error=f"降AI味改写失败: {e}")
 
     # ── 外部检索工具 ──
 

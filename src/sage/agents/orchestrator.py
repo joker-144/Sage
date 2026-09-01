@@ -127,18 +127,37 @@ class AgentOrchestrator:
         """获取所有 Agent 角色的信息（用于 API 动态展示）"""
         return get_agent_loader().get_all_role_info()
 
-    def __init__(self, workspace: Optional[Path] = None):
+    def __init__(self, workspace: Optional[Path] = None, conversation_id: Optional[str] = None):
         config = get_config()
         self.workspace = workspace or config.workspace
+        self.conversation_id = conversation_id
         self._workers: dict[AgentRole, AgentLoop] = {}
         self._general_worker: Optional[AgentLoop] = None  # 通用 Agent（不绑定角色）
         self._history: list[SubTask] = []
         self._loader = get_agent_loader()
         self._llm = LLMClient()  # 用于意图分析（不带工具的快速调用）
         # 共享草稿文档：多智能体协作的全文事实来源（不再用 2000 字符残片传递）
-        self.project = PaperProject(workspace=self.workspace)
+        # 按对话隔离草稿：不同对话的论文写到 .sage/papers/{conversation_id}/ 下，
+        # 互不覆盖；无 conversation_id 时回退工作区根目录旧稿（兼容旧版本单草稿）。
+        self.project = self._create_project()
         # 跨会话持久草稿：加载上次的 paper_project.json / paper.md
         self.project.load()
+
+    def _create_project(self) -> PaperProject:
+        """按对话创建隔离的 PaperProject
+
+        - 传了 conversation_id：草稿落在 <workspace>/.sage/papers/{conversation_id}/，
+          不同对话各自一篇论文，互不干扰。
+        - 未传 conversation_id：沿用工作区根目录的 paper.md（旧版单草稿兼容）。
+        """
+        if self.conversation_id:
+            papers_dir = self.workspace / ".sage" / "papers" / str(self.conversation_id)
+            return PaperProject(
+                workspace=self.workspace,
+                meta_path=papers_dir / "paper_project.json",
+                draft_path=papers_dir / "paper.md",
+            )
+        return PaperProject(workspace=self.workspace)
 
     def _get_worker(self, role: AgentRole) -> AgentLoop:
         """获取或创建 Worker Agent
@@ -1130,12 +1149,47 @@ class AgentOrchestrator:
                 project.store_material(role_name, text_output)
                 if role_name in ("coder", "consolidator", "debugger"):
                     project.parse_draft_to_sections(text_output)
+                # 引用管理员完成后：把产出中的「引用说明对照清单」落盘为 citations.md
+                if role_name == "citation":
+                    self._persist_citation_manifest(text_output, project)
 
     def _has_file_changes(self, agent: AgentLoop) -> bool:
         """检查 Agent 是否进行了实际文件修改（Sage 不依赖 git）"""
         # Sage 论文写作系统不使用 git 检测文件变更，
         # 简化实现：只要 Agent 调用了 write_file/edit_file 工具即视为有修改
         return True
+
+    def _persist_citation_manifest(self, citation_output: str, project: PaperProject):
+        """引用管理员产出中包含的「引用说明对照清单」落盘为 workspace/citations.md
+
+        从引用管理员输出中抽取以 "# 引用说明对照清单" 开头的（代码块）内容，
+        写入工作空间根目录 citations.md，便于用户逐处核对引用来源与理由。
+        抽取失败时给出提示性文件，不中断流程。
+        """
+        try:
+            output = citation_output or ""
+            manifest = ""
+            # 优先取代码块中的完整清单
+            for block in re.findall(r"```(?:markdown|md)?\s*(.*?)```", output, re.DOTALL):
+                if "引用" in block and ("文献" in block or "理由" in block):
+                    manifest = block.strip()
+                    break
+            if not manifest and "# 引用说明对照清单" in output:
+                start = output.index("# 引用说明对照清单")
+                manifest = output[start:].strip()
+            # 无显现成文的清单时，降级截取产出核心部分
+            if not manifest:
+                manifest = (
+                    "# 引用说明对照清单\n\n"
+                    "（引用管理员未输出结构化清单，以下为编辑处理原始产出节选，"
+                    "建议人工核对正文引用是否正确插入）\n\n" + output[:2000]
+                )
+            # 落盘位置随草稿隔离：对话草稿目录或工作区根目录（保持与 paper.md 同目录对照）
+            citations_path = self.project._draft_path.parent / "citations.md"
+            citations_path.write_text(manifest.rstrip() + "\n", encoding="utf-8")
+            logger.info("引用说明对照清单已落盘: %s", citations_path)
+        except Exception as e:
+            logger.warning("引用说明对照清单落盘失败: %s", e)
 
     def _map_event(self, event: LoopEvent, role: str) -> Optional[CollaborationEvent]:
         """将 AgentLoop 事件映射为 CollaborationEvent"""
@@ -1194,9 +1248,13 @@ class AgentOrchestrator:
         )
 
 
-def create_orchestrator(workspace: Optional[Path] = None) -> AgentOrchestrator:
-    """创建多 Agent 编排器（工厂函数）"""
-    return AgentOrchestrator(workspace=workspace)
+def create_orchestrator(workspace: Optional[Path] = None, conversation_id: Optional[str] = None) -> AgentOrchestrator:
+    """创建多 Agent 编排器（工厂函数）
+
+    conversation_id 用于按对话隔离论文草稿（不同对话各自一篇论文，
+    存储在 .sage/papers/{conversation_id}/ 下）。
+    """
+    return AgentOrchestrator(workspace=workspace, conversation_id=conversation_id)
 
 
 # ── 协作上下文构建（P0 修复：全文传递，替换旧的 [:2000] 截断）──
@@ -1206,7 +1264,7 @@ _ROLE_PROMPTS: dict[str, str] = {
     "planner": "请基于以下材料设计研究方法。输出格式: 1) 研究问题与假设 2) 研究方法选型与理由 3) 实验/研究设计 4) 数据分析方法 5) 论证框架",
     "coder": "请基于以下材料撰写论文内容。要求：1) 结构完整 2) 需要引用处用 [CITE: 关键词] 标注 3) 学术语言规范 4) 涉及实验数据/统计结果/具体数值处，一律用【数据】占位，严禁编造具体数据",
     "consolidator": "请整合以下产出，消除重复、调和矛盾、统一风格，输出连贯完整的论文内容。",
-    "citation": "请处理所有 [CITE: 关键词] 标记：1) 从文献库匹配相关文献 2) 插入规范引用 3) 格式化参考文献列表 4) 验证引用真实性 5) 标注存疑引用",
+    "citation": "请处理所有 [CITE: 关键词] 标记：1) 从文献库匹配相关文献 2) 插入规范引用 3) 格式化参考文献列表 4) 验证引用真实性 5) 标注存疑引用。\n处理完成后，额外输出一份「引用说明对照清单」（markdown，用代码块包裹），供用户逐处核对。格式要求：\n# 引用说明对照清单\n\n每一处引用一条记录，包含 4 个字段：\n- 位置：正文中该引用的章节/段落位置\n- 原文摘录：引用处的原文片段（≤60字）\n- 对应文献：文献标题 + 作者/年份 + DOI/URL（引用来源须为用户工作空间内的参考文献或联网检索到的真实文献）\n- 引用理由：为什么此处引用这篇文献（须用一句话说明该文献与上下文论证的关系）\n\n引用真正插入正文后，[CITE: 关键词] 标记必须被替换为规范引用标注（如 [1][2] 或作者年份），不得残留。",
     "reviewer": "请执行四重验证: 1) 文献库验证 2) 逻辑核查 3) 外部检索验证（存疑引用）4) 学术规范检查。输出审校报告。",
     "debugger": "请根据审校报告修订论文，处理存疑引用、修复逻辑问题、调整格式。",
 }

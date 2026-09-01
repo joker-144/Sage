@@ -142,6 +142,8 @@ class PaperProject:
         self.workspace = Path(workspace)
         self.outline: list[PaperSection] = []
         self.material: dict[str, str] = {}
+        # 已锁定章节的 key 集合（审阅视图中用户锁定后不再被修订/改写覆盖）
+        self.locked_sections: set[str] = set()
         # 元数据与成稿路径可注入（默认 .sage/paper_project.json 与 paper.md）
         self._meta_path = Path(meta_path) if meta_path else self.workspace / ".sage" / "paper_project.json"
         self._draft_path = Path(draft_path) if draft_path else self.workspace / "paper.md"
@@ -305,6 +307,50 @@ class PaperProject:
     def draft_word_count(self) -> int:
         return sum(s.word_count for s in self.outline)
 
+    # ── 章节锁定 / 字数统计 ──
+
+    def lock_section(self, key: str) -> bool:
+        """锁定章节：锁定后 AI 改写/数据回填/自动修订不再覆盖该节。"""
+        if not any(s.key == key for s in self.outline):
+            return False
+        self.locked_sections.add(key)
+        self.save()
+        return True
+
+    def unlock_section(self, key: str) -> bool:
+        """解锁章节。"""
+        if key in self.locked_sections:
+            self.locked_sections.discard(key)
+            self.save()
+            return True
+        return False
+
+    def is_locked(self, key: str) -> bool:
+        return key in self.locked_sections
+
+    def review_tree(self) -> list[dict]:
+        """审阅视图的章节树：key/title/content/字数/目标字数/锁定/占位符数。
+
+        供前端「成稿审阅」页面展示逐节字数进度与状态。
+        """
+        from sage.paper_data import find_data_placeholders  # 局部导入避免循环依赖
+        tree = []
+        for sec in self.outline:
+            placeholders = list(find_data_placeholders(sec.content)) if sec.content else []
+            tree.append({
+                "key": sec.key,
+                "title": sec.title,
+                "content": sec.content,
+                "word_count": sec.word_count,
+                "target_words": sec.target_words,
+                "locked": self.is_locked(sec.key),
+                "data_placeholders": [
+                    {"index": i, "context": p.context, "section_hint": p.section}
+                    for i, p in enumerate(placeholders)
+                ],
+            })
+        return tree
+
     # ── 持久化 ──
 
     def save(self):
@@ -314,6 +360,7 @@ class PaperProject:
             payload = {
                 "outline": [asdict(s) for s in self.outline],
                 "material": self.material,
+                "locked_sections": sorted(self.locked_sections),
             }
             self._meta_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -367,6 +414,7 @@ class PaperProject:
                     if isinstance(s, dict) and (s.get("key") or s.get("title"))
                 ]
                 self.material = dict(payload.get("material") or {})
+                self.locked_sections = set(payload.get("locked_sections") or [])
                 if self.outline or self.material:
                     return True
             except Exception as e:
