@@ -897,19 +897,29 @@ PYTHONPATH=src python tests/test_paper_project.py
 
 MIT License
 
----
+***
 
 ## 致谢
 
 Sage 系统基于以下开源项目构建：
 
 - [FastAPI](https://fastapi.tiangolo.com/) — Web 框架
+
 - [Pydantic](https://pydantic.dev/) — 数据校验
+
 - [Typer](https://typer.tiangolo.com/) — CLI 框架
+
 - [Rich](https://rich.readthedocs.io/) — 终端美化
+
 - [sentence-transformers](https://www.sbert.net/) — 本地 Embedding
+
 - [OpenAI Python SDK](https://github.com/openai/openai-python) — LLM 客户端
+
 - [PyMuPDF](https://pymupdf.readthedocs.io/) — PDF 解析
+
 - [python-docx](https://python-docx.readthedocs.io/) — Word 解析
+
 - [Electron](https://www.electronjs.org/) — 桌面端框架
+
 - [Vue 3](https://vuejs.org/) — 前端框架
+
