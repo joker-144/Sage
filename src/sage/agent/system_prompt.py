@@ -46,7 +46,7 @@ SYSTEM_PROMPT = """你是 Sage，一个严谨的学术论文写作智能体，�
 - reduce_ai_pattern: 降低 AI 生成痕迹，提升文本自然度
 
 ### 外部检索（Sage 专用）
-- search_scholar: 检索 Google Scholar 验证引用真实性
+- search_scholar: 检索学术文献验证引用真实性（定向检索 scholar/arxiv/doi 站内源）
 - search_arxiv: 检索 arXiv 最新预印本
 - search_crossref: 通过 DOI 验证引用文献是否存在
 - search_semantic_scholar: 检索 Semantic Scholar 学术数据库
@@ -129,3 +129,23 @@ Sage 采用"主控+平等协作+整理汇报+多重验证"的协作模式：
 def get_system_prompt() -> str:
     """获取 system prompt"""
     return SYSTEM_PROMPT
+
+
+def build_tools_catalog(tool_schemas) -> str:
+    """根据 ToolEngine 注册的工具 schema 生成「可用工具」清单 markdown。
+
+    消灭手工维护的工具清单与注册表不同步问题：新增/改名工具后自动跟进。
+    每个工具取 schema 描述的首行并截断，保持清单精炼不喧宾夺主。
+    """
+    lines = [
+        "## 可用工具（自动生成）",
+        "以下为当前可用的全部工具，按需调用：",
+    ]
+    for s in sorted(tool_schemas, key=lambda x: (x.get("function") or {}).get("name", "")):
+        fn = s.get("function") or {}
+        name = fn.get("name", "")
+        desc = (fn.get("description") or "").strip().replace("\n", " ").strip()
+        if desc:
+            desc = desc[:64] + ("…" if len(desc) > 64 else "")
+        lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+    return "\n".join(lines)

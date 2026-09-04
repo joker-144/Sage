@@ -75,7 +75,7 @@ onMounted(loadDrafts)
     <div v-if="loading" class="empty-state">加载草稿列表…</div>
     <div v-else-if="!drafts.length" class="empty-state">
       <p>当前还没有可审阅的论文草稿。</p>
-      <p class="muted">请先在对话中使用「写作模式」生成论文，再回到此处审阅。每个对话的论文会独立保存，互不影响。</p>
+      <p class="muted">请先在对话中生成论文，再回到此处审阅。每个对话的论文会独立保存，互不影响。</p>
     </div>
     <div v-else class="draft-grid">
       <div

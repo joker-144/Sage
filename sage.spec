@@ -151,8 +151,8 @@ if _update_cfg.exists():
 # index.py 的 LocalEmbedder/CrossEncoderReranker 通过 refs/main 定位 snapshot 并加载
 _hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
 _pretrained_models = [
-    "models--sentence-transformers--all-MiniLM-L6-v2",
-    "models--cross-encoder--ms-marco-MiniLM-L-6-v2",
+    "models--BAAI--bge-small-zh-v1.5",
+    "models--BAAI--bge-reranker-base",
 ]
 for _model_dir_name in _pretrained_models:
     _model_src = _hf_cache / _model_dir_name

@@ -37,9 +37,10 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import AsyncIterator, Optional
 
 from sage.agent.loop import AgentLoop, LoopEvent
+from sage.citation_verify import verify_references
 from sage.config import get_config
 from sage.agents.loader import get_agent_loader
 from sage.llm.client import LLMClient
@@ -87,7 +88,7 @@ class SubTask:
 @dataclass
 class CollaborationEvent:
     """协同事件（供 CLI/Web 展示）"""
-    type: str  # "task_created" | "worker_start" | "worker_done" | "reflection" | "text" | "reasoning" | "retry" | "progress" | "done"
+    type: str  # "task_created" | "worker_start" | "worker_done" | "reflection" | "text" | "reasoning" | "retry" | "progress" | "tool_start" | "tool_result" | "context_usage" | "done"
     role: str = ""
     content: str = ""
     metadata: dict = field(default_factory=dict)
@@ -127,10 +128,11 @@ class AgentOrchestrator:
         """获取所有 Agent 角色的信息（用于 API 动态展示）"""
         return get_agent_loader().get_all_role_info()
 
-    def __init__(self, workspace: Optional[Path] = None, conversation_id: Optional[str] = None):
+    def __init__(self, workspace: Optional[Path] = None, conversation_id: Optional[str] = None, pool_mode: bool = False):
         config = get_config()
         self.workspace = workspace or config.workspace
         self.conversation_id = conversation_id
+        self.pool_mode = pool_mode
         self._workers: dict[AgentRole, AgentLoop] = {}
         self._general_worker: Optional[AgentLoop] = None  # 通用 Agent（不绑定角色）
         self._history: list[SubTask] = []
@@ -142,6 +144,21 @@ class AgentOrchestrator:
         self.project = self._create_project()
         # 跨会话持久草稿：加载上次的 paper_project.json / paper.md
         self.project.load()
+
+    def _configure_worker(self, worker: AgentLoop) -> AgentLoop:
+        """统一配置 worker：恢复对话历史 + 应用池模式检索路由"""
+        # 恢复该对话的历史消息，保持多轮上下文（写作/单Agent 统一链路后所有对话可续聊）
+        if self.conversation_id:
+            try:
+                worker.restore_history_from_db()
+            except Exception:
+                pass
+        # 池模式：将 search_literature 替换为跨工作空间检索
+        if self.pool_mode:
+            from sage.tools.engine import SEARCH_LITERATURE_SCHEMA
+            from sage.tools.paper_ops import pool_search_literature
+            worker.tools.register("search_literature", pool_search_literature, SEARCH_LITERATURE_SCHEMA)
+        return worker
 
     def _create_project(self) -> PaperProject:
         """按对话创建隔离的 PaperProject
@@ -177,6 +194,7 @@ class AgentOrchestrator:
                 writing_mode=True,
                 persist=False,
             )
+            self._configure_worker(self._workers[role])
         return self._workers[role]
 
     def _get_general_worker(self) -> AgentLoop:
@@ -187,6 +205,7 @@ class AgentOrchestrator:
         if self._general_worker is None:
             # 不传 system_prompt，AgentLoop 会使用默认的通用 system prompt
             self._general_worker = AgentLoop(workspace=self.workspace, writing_mode=True, persist=False)
+            self._configure_worker(self._general_worker)
         return self._general_worker
 
     def _get_worker_by_role_name(self, role_name: str) -> Optional[AgentLoop]:
@@ -286,7 +305,7 @@ class AgentOrchestrator:
                     yield mapped
                 if event.type == "text":
                     continued_parts.append(event.content)
-            continued = "\n".join(continued_parts)
+            continued = _join_stream_text(continued_parts)
             if continued.strip():
                 self.project.parse_draft_to_sections(continued)
                 self.project.store_material("coder", continued)
@@ -332,7 +351,7 @@ class AgentOrchestrator:
 
             # 撰写/修订结果写回共享草稿并落盘
             if uses_draft and out_parts:
-                output = "\n".join(out_parts)
+                output = _join_stream_text(out_parts)
                 self.project.parse_draft_to_sections(output)
                 self.project.store_material(intent.role, output)
                 path = self.project.finalize()
@@ -470,22 +489,18 @@ class AgentOrchestrator:
                 revised = await self._revise_round(report)
                 if not revised.strip():
                     break
-                # 保留率校验：修订全文若大幅缩水（< 旧版 70%），拒绝覆盖并告警，
-                # 避免 LLM 输出被截断/遗漏时的静默丢内容
-                draft_before_revise = self.project.read_draft()
-                old_len = len(draft_before_revise.strip())
-                new_len = len(revised.strip())
-                if old_len > 0 and new_len < old_len * 0.7:
-                    logger.warning(
-                        "修订产出疑似缩水：%d 字 → %d 字，拒绝覆盖本轮草稿",
-                        old_len, new_len,
-                    )
+                # 定点修订有效性校验：自本轮起修订员只输出【被修改的章节】，
+                # 因此不再用"全文长度"判断是否缩水，改为校验输出能被解析出章节标题，
+                # 防止 LLM 输出被截断/遗漏成纯文本时静默丢内容。
+                if not re.search(r"(?m)^#{2,4}\s+", revised.strip()):
+                    logger.warning("修订产出未包含任何章节标题，判定为不完整，拒绝覆盖本轮草稿")
                     yield CollaborationEvent(
                         type="reflection",
                         role="supervisor",
-                        content=f"第 {round_no} 轮修订产出疑似不完整（{new_len} 字 < 修订前 {old_len} 字的 70%），已保留原草稿",
+                        content=f"第 {round_no} 轮修订产出未包含任何章节标题，判定为不完整，已保留原草稿",
                     )
                     break
+                # 定点覆盖：仅更新修订输出中出现的章节，其余章节保留原样
                 self.project.parse_draft_to_sections(revised)
                 self.project.store_material("debugger", revised)
                 self.project.finalize()
@@ -498,6 +513,38 @@ class AgentOrchestrator:
                     role="supervisor",
                     content=report.to_text(),
                 )
+
+            # 引用真实性硬校验：逐条 CrossRef/维普/万方验证参考文献（确定性步骤，不依赖 LLM）。
+            # 网络失败不阻塞成稿，仅标记 network_error；报告持久化到 paper_project.json
+            if references_expected:
+                yield CollaborationEvent(
+                    type="reflection",
+                    role="supervisor",
+                    content="引用管理员逐条验证参考文献真实性...",
+                )
+                try:
+                    cit_report = await asyncio.wait_for(
+                        verify_references(
+                            self.project.read_draft(),
+                            workspace=self.project.workspace,
+                        ),
+                        timeout=240.0,
+                    )
+                    self.project.citation_report = cit_report.to_dict()
+                    self.project.save()
+                    yield CollaborationEvent(
+                        type="reflection",
+                        role="citation",
+                        content=cit_report.to_text(),
+                        metadata={"citation_report": cit_report.to_dict()},
+                    )
+                except Exception as e:
+                    logger.warning("引用真实性验证失败（不影响成稿）: %s", e)
+                    yield CollaborationEvent(
+                        type="reflection",
+                        role="supervisor",
+                        content="引用真实性验证未完成（网络原因，不影响成稿，可稍后在审阅工作台重试）",
+                    )
 
             # 软复核二次跑：修订后再让审校核查员（LLM）验证一遍
             yield CollaborationEvent(
@@ -1031,9 +1078,11 @@ class AgentOrchestrator:
             return list(fallback)
 
     async def _revise_round(self, report) -> str:
-        """让修订员（debugger）根据质量门报告修订当前草稿，返回修订后全文。
+        """让修订员（debugger）根据质量门报告修订当前草稿，返回【修订章节】而非整篇。
 
-        读取共享草稿全文 + 质量门待改进项，产出修订后的完整 markdown。
+        读取共享草稿全文 + 质量门待改进项（报告已按章节定位问题），
+        只产出被修改的章节（保留 '## 章节标题' 结构）；未修改章节不输出，
+        主流程据此定点覆盖，避免整篇重建导致的 token 浪费。
         """
         worker = self._get_worker_by_role_name("debugger")
         if worker is None:
@@ -1041,8 +1090,11 @@ class AgentOrchestrator:
         draft = self.project.read_draft()
         prompt = (
             f"## 当前论文草稿\n{draft}\n\n"
-            f"## 质量门待改进项\n{report.to_text()}\n\n"
-            "请逐项修订草稿，输出修订后的完整论文（markdown，保留 '## 章节标题' 结构）。"
+            f"## 质量门待改进项（已定位到对应章节）\n{report.to_text()}\n\n"
+            "请逐项修订上述待改进项：\n"
+            "1. 只输出【需要修改的章节】，每个章节以 '## 章节标题' 开头；\n"
+            "2. 未需要修改的章节一律不要输出（会被保留原样）；\n"
+            "3. 若某问题需要新建章节，则新增对应的 '## 章节标题' 及内容。"
         )
         results = []
         async for event in worker.run(prompt):
@@ -1178,7 +1230,7 @@ class AgentOrchestrator:
                 ))
             finally:
                 # 完成信号：跑完（无论成败）都会入队，供主循环收尾
-                await event_queue.put((role_name, "\n".join(text_parts) if text_parts else "", ok))
+                await event_queue.put((role_name, _join_stream_text(text_parts), ok))
 
         # 并行启动所有 worker
         tasks = [asyncio.create_task(run_single(r)) for r in roles]
@@ -1210,6 +1262,9 @@ class AgentOrchestrator:
                     # 引用管理员完成后：落盘「引用说明对照清单」为 citations.md
                     if role_name == "citation":
                         self._persist_citation_manifest(text_output, project)
+                    # 边写边落盘：任一 agent 产生正文即持久化结构化状态，
+                    # 使「成稿审阅」实时可见过程版本，而非等全部生成完才出现。
+                    project.save()
         except asyncio.CancelledError:
             # 客户端断开：取消所有仍在运行的 worker，避免后台残留任务
             for t in tasks:
@@ -1306,14 +1361,26 @@ class AgentOrchestrator:
                 content=event.content,
                 metadata=event.tool_args or {},
             )
+        # 工具事件透传（统一链路：前端展示工具调用与结果，与单Agent路径一致）
+        if event.type == "tool_start":
+            return CollaborationEvent(
+                type="tool_start",
+                role=role,
+                content=event.content,
+                metadata={"tool": event.tool_name, "args": event.tool_args},
+                tokens=event.tokens or {},
+            )
+        if event.type == "tool_result":
+            return CollaborationEvent(
+                type="tool_result",
+                role=role,
+                content=event.content,
+                metadata={"tool": event.tool_name, "args": event.tool_args},
+            )
         mapping = {
-            "tool_start": "worker_start",
-            "tool_result": "worker_start",
             "error": "worker_done",
         }
         mapped_type = mapping.get(event.type, "worker_start")
-        if mapped_type == "worker_start" and event.type == "tool_result":
-            return None
         return CollaborationEvent(
             type=mapped_type,
             role=role,
@@ -1323,13 +1390,14 @@ class AgentOrchestrator:
         )
 
 
-def create_orchestrator(workspace: Optional[Path] = None, conversation_id: Optional[str] = None) -> AgentOrchestrator:
+def create_orchestrator(workspace: Optional[Path] = None, conversation_id: Optional[str] = None, pool_mode: bool = False) -> AgentOrchestrator:
     """创建多 Agent 编排器（工厂函数）
 
     conversation_id 用于按对话隔离论文草稿（不同对话各自一篇论文，
     存储在 .sage/papers/{conversation_id}/ 下）。
+    pool_mode 为 True 时 worker 的文献检索覆盖所有工作空间。
     """
-    return AgentOrchestrator(workspace=workspace, conversation_id=conversation_id)
+    return AgentOrchestrator(workspace=workspace, conversation_id=conversation_id, pool_mode=pool_mode)
 
 
 # ── 协作上下文构建（P0 修复：全文传递，替换旧的 [:2000] 截断）──
@@ -1399,12 +1467,40 @@ def _needs_clarification(text: str, has_draft: bool = False) -> bool:
     if has_draft:
         return False
     t = (text or "").strip()
-    if len(t) < 4:
+    if not t:
+        return True
+    # 统一链路：日常问候/闲聊等短消息交给意图分析路由，仅含写作意图的短消息触发澄清
+    if len(t) < 4 and re.search(r"写|论文|paper|文章|生成|撰写", t, re.IGNORECASE):
         return True
     # 裸请求："写论文" / "帮我写论文" / "写一篇论文" / "生成文章" 等无主题词
     if re.fullmatch(r"(帮我|请|想|要|麻烦)?\s*(写|生成|撰写)\s*(一篇|一个|个)?\s*(论文|文章|paper)?", t):
         return True
     return False
+
+
+def _join_stream_text(parts: list[str]) -> str:
+    """把 LLM 流式输出的 text 碎片拼接为连贯正文。
+
+    逐个 token 的流式碎片若用换行拼接会得到"每词一行"的竖排脏文本。
+    这里规则：
+      - 保留碎片内部自带的换行；
+      - 碎片边界处，仅当相邻都是 ASCII 字母/数字时补一个空格（防 "The"+"user"→"Theuser"），
+        中文与标点边界不增加空白，直接相接。
+    """
+    out = ""
+    for p in parts:
+        if not p:
+            continue
+        if out:
+            prev = out[-1]
+            cur = p[0]
+            if (
+                prev.isascii() and prev.isalnum()
+                and cur.isascii() and cur.isalnum()
+            ):
+                out += " "
+        out += p
+    return out
 
 
 def _fit_context(text: str, max_tokens: int) -> str:

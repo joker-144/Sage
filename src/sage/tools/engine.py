@@ -397,7 +397,7 @@ CHECK_PLAGIARISM_SCHEMA = {
     "type": "function",
     "function": {
         "name": "check_plagiarism",
-        "description": "查重检测，识别与已索引文献库的重复内容。返回重复率和重复段落详情。",
+        "description": "与本地文献库的重复比对，检测给定内容与已上传文献的重复段落和重复比例。注意：仅比对本地文献库，不联网、非全网查重，不等同于知网等权威查重。返回重复率与重复段落详情。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -574,7 +574,7 @@ SEARCH_SCHOLAR_SCHEMA = {
     "type": "function",
     "function": {
         "name": "search_scholar",
-        "description": "检索学术数据库验证引用真实性。通过 Google Scholar/arXiv/DOI 搜索学术文献。",
+        "description": "检索学术文献验证引用真实性。通过 DuckDuckGo 定向检索 scholar.google.com / arxiv.org / doi.org 站内结果，返回匹配的学术来源链接。",
         "parameters": {
             "type": "object",
             "properties": {

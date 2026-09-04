@@ -220,7 +220,7 @@ Sage 采用 6 层架构，自底向上：
         │                     │
         ▼                     ▼
 ┌─────────────────┐  ┌─────────────────────────────────────────────┐
-│ 匹配角色 Agent   │  │  Step 1: 主编生成执行计划（LLM）            │
+│ 匹配角色 Agent  │  │  Step 1: 主编生成执行计划（LLM）            │
 │ ┌─────────────┐ │  │  ┌───────────────────────────────────────┐  │
 │ │literature   │ │  │  │ {"batches": [                         │  │
 │ │planner      │ │  │  │   {"id":1,"roles":["literature",      │  │
@@ -509,7 +509,7 @@ ToolCall.vue (渲染橙色 llm_retry 卡片：↻ 图标 + 尝试次数 + 错误
 
 - `format_references` — 按目标期刊格式化参考文献
 
-- `check_plagiarism` — 查重检测
+- `check_plagiarism` — 与本地文献库的重复比对（仅比对上传文献，不联网、非全网查重）
 
 - `parse_pdf` / `parse_docx` / `parse_latex` — 文档解析（`parse_pdf` 自动通过维普/万方/CrossRef 认证元数据）
 
@@ -895,7 +895,9 @@ PYTHONPATH=src python tests/test_paper_project.py
 
 ## 许可协议
 
-MIT License
+[MIT License](LICENSE)
+
+本项目以随附的 MIT 许可证授权。你可以自由地使用、复制、修改、分发、商用本项目，但需保留原始版权与许可声明。第三方依赖（模型、图标、字体等）仍属其各自权利人，受其各自许可条款约束。
 
 ***
 

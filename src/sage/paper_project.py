@@ -19,11 +19,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, asdict, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# 版本快照保留数量上限（超过自动淘汰最旧）
+MAX_SNAPSHOTS = 20
 
 # 大纲章节 key 与展示标题的规范映射（缺省 IMRaD 结构）
 DEFAULT_OUTLINE = [
@@ -85,6 +90,19 @@ def get_outline_for_type(paper_type: str) -> list[dict]:
     """按论文类型返回默认大纲（未知类型回退 IMRaD）。"""
     return OUTLINES_BY_TYPE.get(paper_type, DEFAULT_OUTLINE)
 
+
+# 全部标准大纲（默认 + 各论文类型）的 key 集合：用于在未持久化大纲设计信息时
+# 识别正式论文章节（参考文献 target_words=0 也属于正式章节）。
+_STD_OUTLINE_KEYS: set[str] = {s["key"] for s in DEFAULT_OUTLINE}
+for _type_outline in OUTLINES_BY_TYPE.values():
+    _STD_OUTLINE_KEYS.update(s["key"] for s in _type_outline)
+
+# 过程性/元信息章节标题特征词：整理汇报员在整合时输出的「整合说明/交付说明/
+# 成稿结构核查/合规要点/与旧版差异」等叙述不属于论文正文，审阅与导出时据此过滤。
+_PROCEDURAL_TITLE_RE = re.compile(
+    r"(说明|核查|要点|差异|记录|汇报|清单|附注|备注|元数据|整合说明|工作日志|流程)"
+)
+
 # 角色产出 → 素材 key（全文保存，供下游 worker 读取）
 ROLE_MATERIAL_KEY = {
     "literature": "literature_review",
@@ -144,6 +162,8 @@ class PaperProject:
         self.material: dict[str, str] = {}
         # 已锁定章节的 key 集合（审阅视图中用户锁定后不再被修订/改写覆盖）
         self.locked_sections: set[str] = set()
+        # 最近一次参考文献真实性验证报告（citation_verify.to_dict() 的结果）
+        self.citation_report: dict = {}
         # 元数据与成稿路径可注入（默认 .sage/paper_project.json 与 paper.md）
         self._meta_path = Path(meta_path) if meta_path else self.workspace / ".sage" / "paper_project.json"
         self._draft_path = Path(draft_path) if draft_path else self.workspace / "paper.md"
@@ -283,7 +303,28 @@ class PaperProject:
                 return sec.key
             if sec.key and sec.key.lower() in t:
                 return sec.key
+        # 剥离标题序号/类型前缀后再匹配（如 "1 引言"、"一、引言"、"标题：xxx"），
+        # 使撰写员输出的序号章节能归并到大纲结构，避免生成若干无意义的数字章节。
+        stripped = self._strip_heading_prefix(t)
+        if stripped and stripped != t:
+            for sec in self.outline:
+                if sec.title and (sec.title.lower() in stripped or stripped in sec.title.lower()):
+                    return sec.key
+                if sec.key and sec.key.lower() in stripped:
+                    return sec.key
         return None
+
+    @staticmethod
+    def _strip_heading_prefix(text: str) -> str:
+        """剥离标题开头的序号/类型前缀，如 '1 '、'1.'、'一、'、'第X章'、'标题：'、'图1'、'表2'。"""
+        return re.sub(
+            r"^(?:\d{1,3}[.、．]?\s*"
+            r"|[一二三四五六七八九十]{1,4}[、.．]\s*"
+            r"|第\s*[一二三四五六七八九十\d]+\s*[章节]\s*"
+            r"|标题\s*[:：]\s*"
+            r"|(?:图|表)\s*\d{1,3}\s*)",
+            "", text, flags=re.IGNORECASE,
+        ).strip()
 
     @staticmethod
     def _slugify(title: str) -> str:
@@ -328,14 +369,32 @@ class PaperProject:
     def is_locked(self, key: str) -> bool:
         return key in self.locked_sections
 
+    def _is_non_academic_section(self, sec: "PaperSection") -> bool:
+        """判断章节是否属于非论文正文（审阅/导出时过滤）。
+
+        - _preamble 特殊保留（前端聚合到首章，导出时再处理）
+        - 标准大纲 key（默认 + 各论文类型）或设有字数预算的章节视为论文正文
+        - 其余动态追加章节，标题含过程性特征词（整合说明/核查/差异…）的过滤，
+          否则视为正文保留（避免误伤 worker 动态产出的正式章节）
+        """
+        if sec.key == "_preamble":
+            return False
+        if sec.key in _STD_OUTLINE_KEYS or (sec.target_words or 0) > 0:
+            return False
+        return bool(_PROCEDURAL_TITLE_RE.search(sec.title or ""))
+
     def review_tree(self) -> list[dict]:
         """审阅视图的章节树：key/title/content/字数/目标字数/锁定/占位符数。
 
         供前端「成稿审阅」页面展示逐节字数进度与状态。
+        只返回论文正文章节；动态追加的非论文章节（整理汇报员的「整合说明/
+        交付说明」等过程性叙述）不进入审阅与导出。
         """
         from sage.paper_data import find_data_placeholders  # 局部导入避免循环依赖
         tree = []
         for sec in self.outline:
+            if self._is_non_academic_section(sec):
+                continue
             placeholders = list(find_data_placeholders(sec.content)) if sec.content else []
             tree.append({
                 "key": sec.key,
@@ -361,6 +420,7 @@ class PaperProject:
                 "outline": [asdict(s) for s in self.outline],
                 "material": self.material,
                 "locked_sections": sorted(self.locked_sections),
+                "citation_report": self.citation_report,
             }
             self._meta_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -377,6 +437,108 @@ class PaperProject:
             logger.warning("paper.md 写入失败: %s", e)
         self.save()
         return self._draft_path
+
+    # ── 版本快照（修订/改写前自动存档，支持回滚） ──
+
+    def _versions_dir(self) -> Path:
+        """版本快照目录：与成稿同目录下的 versions/"""
+        return self._draft_path.parent / "versions"
+
+    def snapshot(self, reason: str = "") -> Optional[Path]:
+        """把当前草稿完整状态存为一份版本快照（修订/改写前自动调用）。
+
+        快照为结构化 JSON（含 outline 正文 / 素材 / 锁定 / 引用报告），
+        恢复时能完整还原而不只是替换正文。超过 MAX_SNAPSHOTS 自动淘汰最旧。
+
+        Returns:
+            快照文件路径；失败（通常为写权限问题）返回 None，不影响主流程。
+        """
+        try:
+            versions_dir = self._versions_dir()
+            versions_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            # 同一秒内可能多次快照（如连续修订），追加毫秒序避免覆盖
+            path = versions_dir / f"{ts}_{int(time.time() * 1000) % 1000}.json"
+            payload = {
+                "reason": reason,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "word_count": self.draft_word_count(),
+                "outline": [asdict(s) for s in self.outline],
+                "material": self.material,
+                "locked_sections": sorted(self.locked_sections),
+                "citation_report": self.citation_report,
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._prune_versions(versions_dir)
+            return path
+        except Exception as e:
+            logger.warning("保存版本快照失败: %s", e)
+            return None
+
+    def _prune_versions(self, versions_dir: Path, keep: int = MAX_SNAPSHOTS):
+        """保留最近 keep 个快照，淘汰更旧的"""
+        try:
+            files = sorted(versions_dir.glob("*.json"))
+            for f in files[:-keep]:
+                f.unlink()
+        except Exception as e:
+            logger.warning("清理旧版本快照失败: %s", e)
+
+    def list_snapshots(self) -> list[dict]:
+        """列出全部版本快照的元数据（新→旧），供「版本历史」面板展示。"""
+        versions_dir = self._versions_dir()
+        result: list[dict] = []
+        if not versions_dir.exists():
+            return result
+        for f in sorted(versions_dir.glob("*.json"), reverse=True):
+            try:
+                payload = json.loads(f.read_text(encoding="utf-8"))
+                result.append({
+                    "id": f.stem,
+                    "reason": payload.get("reason", ""),
+                    "created_at": payload.get("created_at", ""),
+                    "word_count": payload.get("word_count", 0),
+                })
+            except Exception:
+                continue
+        return result
+
+    def restore_snapshot(self, version_id: str) -> bool:
+        """恢复到指定版本快照（覆盖当前草稿并落盘）。
+
+        带路径穿越防护：version_id 只接受 versions/ 目录内的合法文件名。
+
+        Returns:
+            True 表示恢复成功，False 表示快照不存在或损坏。
+        """
+        if not version_id or "/" in version_id or "\\" in version_id or ".." in version_id:
+            return False
+        versions_dir = self._versions_dir()
+        path = versions_dir / f"{version_id}.json"
+        if not path.exists() or not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("读取版本快照失败: %s", e)
+            return False
+        outline_raw = payload.get("outline") or []
+        self.outline = [
+            PaperSection(
+                key=str(s.get("key", "")),
+                title=str(s.get("title", "")),
+                target_words=int(s.get("target_words", 0) or 0),
+                content=str(s.get("content", "") or ""),
+            )
+            for s in outline_raw
+            if isinstance(s, dict) and (s.get("key") or s.get("title"))
+        ]
+        self.material = dict(payload.get("material") or {})
+        self.locked_sections = set(payload.get("locked_sections") or [])
+        self.citation_report = dict(payload.get("citation_report") or {})
+        self.save()
+        self.finalize()
+        return True
 
     def export_latex(self, out_path=None, title: str = "") -> Path:
         """把当前草稿导出为 LaTeX 文件（默认 workspace/paper.tex），返回路径。"""
@@ -415,6 +577,7 @@ class PaperProject:
                 ]
                 self.material = dict(payload.get("material") or {})
                 self.locked_sections = set(payload.get("locked_sections") or [])
+                self.citation_report = dict(payload.get("citation_report") or {})
                 if self.outline or self.material:
                     return True
             except Exception as e:

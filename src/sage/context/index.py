@@ -89,12 +89,15 @@ class CodeChunk:
 # ── 本地 Embedder（sentence-transformers）──
 
 class LocalEmbedder:
-    """本地 Embedder — 基于 sentence-transformers 的 all-MiniLM-L6-v2
+    """本地 Embedder — 基于 sentence-transformers 的本地向量化模型
+
+    默认 BAAI/bge-small-zh-v1.5（512 维，中英双语，中文效果显著优于
+    all-MiniLM-L6-v2），可通过 .env 的 LLM_EMBEDDING_MODEL 切换。
 
     特点:
       - 纯本地推理，无 API 调用，无网络开销
-      - 模型约 80MB，首次使用通过 huggingface-hub 官方源下载
-      - 输出 384 维向量，适合语义搜索和记忆检索
+      - 模型约 95MB，首次使用通过 huggingface-hub 官方源下载
+      - 向量维度随模型变化（bge-small-zh-v1.5 为 512 维），检索与存储自动适配
       - 可在 .env 中设置 HF_ENDPOINT=https://hf-mirror.com 切换国内镜像
     """
 
@@ -303,7 +306,7 @@ class LocalEmbedder:
             pass
 
         if total_bytes == 0:
-            total_bytes = 90 * 1024 * 1024  # all-MiniLM-L6-v2 约 90MB
+            total_bytes = 100 * 1024 * 1024  # 兜底估算：bge-small 级别模型约 100MB
 
         total_mb = total_bytes / (1024 * 1024)
         if progress_callback:
@@ -406,7 +409,7 @@ class LocalEmbedder:
             texts: 待编码的文本列表
 
         Returns:
-            np.ndarray: shape=(len(texts), 384)，dtype=float32
+            np.ndarray: shape=(len(texts), 模型维度)，dtype=float32
         """
         if not texts:
             return np.array([], dtype=np.float32)
@@ -431,8 +434,10 @@ ZhipuEmbedder = LocalEmbedder
 class CrossEncoderReranker:
     """Cross-Encoder 重排器 — 对召回结果精排
 
+    默认 BAAI/bge-reranker-base（中英双语，约 1.1GB），可通过 .env 的
+    LLM_RERANKER_MODEL 切换；置空字符串禁用重排（仅 bi-encoder 召回）。
+
     特点:
-      - 基于 cross-encoder/ms-marco-MiniLM-L-6-v2（约 80MB）
       - 接受 (query, candidate) 对，输出相关性分数
       - 首次使用通过 hf-mirror.com 国内镜像下载，无需 VPN
       - 模型加载失败时优雅降级（跳过重排，返回原顺序）
@@ -454,7 +459,13 @@ class CrossEncoderReranker:
             return True
         if CrossEncoderReranker._load_failed:
             return False
-        model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        from sage.config import get_config
+        model_name = get_config().llm_reranker_model.strip()
+        if not model_name:
+            # 显式配置为空 → 禁用重排
+            CrossEncoderReranker._load_failed = True
+            logger.info("LLM_RERANKER_MODEL 为空，重排已禁用（仅 bi-encoder 召回）")
+            return False
         try:
             # 优先从打包内置路径加载（桌面端，无需联网）
             embedder_helper = LocalEmbedder()
@@ -508,7 +519,7 @@ class CrossEncoderReranker:
 # ── 索引级别配置 ──
 # 两种索引级别：标准索引 / 高精度索引
 # 区别在于分块粒度、召回 Top-K、是否启用 cross-encoder 重排
-# 向量维度相同（都用 all-MiniLM-L6-v2，384 维），不涉及模型切换
+# 级别切换不涉及 Embedding 模型变更（向量维度恒定，不触发索引重建）
 INDEX_LEVEL_STANDARD = "standard"  # 标准索引
 INDEX_LEVEL_PREMIUM = "premium"    # 高精度索引
 
@@ -818,10 +829,12 @@ class ProjectIndex:
         return ""
 
     def _extract_pdf_text(self, file_path: Path) -> str:
-        """使用 PyMuPDF (fitz) 提取 PDF 文本
+        """提取 PDF 文本
 
-        对于有文本层的原生 PDF 直接提取；
-        对于文本层为空的扫描版 PDF，自动调用 RapidOCR 识别图片文字。
+        优先使用 PyMuPDF (fitz)：有文本层的原生 PDF 直接提取，
+        扫描版 PDF 自动调用 RapidOCR 识别图片文字。
+        PyMuPDF 不可用时（如 Python 3.14 Windows 暂无 wheel），
+        降级使用纯 Python 的 pypdf 提取文本层（不支持扫描版 OCR）。
         """
         try:
             import fitz  # PyMuPDF
@@ -829,7 +842,11 @@ class ProjectIndex:
             try:
                 import pymupdf as fitz
             except ImportError:
-                return ""
+                fitz = None
+
+        if fitz is None:
+            return self._extract_pdf_text_pypdf(file_path)
+
         text_parts = []
         doc = fitz.open(str(file_path))
         try:
@@ -852,6 +869,24 @@ class ProjectIndex:
         finally:
             doc.close()
         return "\n\n".join(text_parts)
+
+    def _extract_pdf_text_pypdf(self, file_path: Path) -> str:
+        """使用 pypdf 提取 PDF 文本层（PyMuPDF 不可用时的兜底方案）
+
+        仅支持有文本层的原生 PDF；扫描版页面提取结果为空。
+        """
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return ""
+        try:
+            reader = PdfReader(str(file_path))
+            text_parts = []
+            for page in reader.pages:
+                text_parts.append(page.extract_text() or "")
+            return "\n\n".join(text_parts)
+        except Exception:
+            return ""
 
     def _get_ocr_engine(self):
         """延迟加载 RapidOCR 引擎（类级单例）
@@ -907,7 +942,7 @@ class ProjectIndex:
             try:
                 import pymupdf as fitz
             except ImportError:
-                return []
+                return self._build_pdf_page_map_pypdf(file_path)
         page_map: list[tuple[int, int]] = []
         line_offset = 1  # 全局行号从 1 开始
         try:
@@ -919,6 +954,25 @@ class ProjectIndex:
                 line_count = page_text.count("\n") + 1 + 2  # +2 为页间 "\n\n" 分隔
                 line_offset += line_count
             doc.close()
+        except Exception:
+            return []
+        return page_map
+
+    def _build_pdf_page_map_pypdf(self, file_path: Path) -> list[tuple[int, int]]:
+        """使用 pypdf 构建行号→页号映射（PyMuPDF 不可用时的兜底方案）"""
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return []
+        page_map: list[tuple[int, int]] = []
+        line_offset = 1
+        try:
+            reader = PdfReader(str(file_path))
+            for page_idx, page in enumerate(reader.pages, start=1):
+                page_map.append((line_offset, page_idx))
+                page_text = page.extract_text() or ""
+                line_count = page_text.count("\n") + 1 + 2
+                line_offset += line_count
         except Exception:
             return []
         return page_map
@@ -999,7 +1053,16 @@ class ProjectIndex:
         return clean.strip()
 
     def _walk_source_files(self):
-        """遍历工作空间中所有可索引的文档文件（文本+二进制）"""
+        """遍历工作空间中所有可索引的文献文件（仅扫描 papers/ 目录）
+
+        索引范围的唯一合法来源是知识库工作空间上传/导入的论文（均落在 papers/），
+        与前端论文列表（/papers）保持一致，保证每个被索引的文件用户都能看见。
+        根目录/其他子目录下的文件不会被索引，避免出现"已索引但前端不可见"的情况。
+        """
+        papers_dir = self.workspace / "papers"
+        if not papers_dir.exists():
+            return
+
         all_extensions = self.INDEXABLE_EXTENSIONS | self.BINARY_EXTENSIONS
         # 论文文档扩展名（放宽大小限制）
         doc_extensions = self.BINARY_EXTENSIONS | {".md", ".txt", ".rst", ".tex", ".bib", ".csv", ".tsv"}
@@ -1007,7 +1070,7 @@ class ProjectIndex:
         max_size_code = 5 * 1024 * 1024
         max_size_doc = 100 * 1024 * 1024
 
-        for root, dirs, files in os.walk(self.workspace):
+        for root, dirs, files in os.walk(papers_dir):
             # 过滤排除目录（原地修改 dirs 实现 prune）
             dirs[:] = [d for d in dirs if d not in self.EXCLUDE_DIRS]
             for fname in files:

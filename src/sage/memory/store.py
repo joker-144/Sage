@@ -226,11 +226,18 @@ class MemoryStore:
     def _migrate_embedding_dim(self):
         """检测并清理维度不匹配的旧向量数据
 
-        智谱 Embedding-3 为 1024 维，本地 all-MiniLM-L6-v2 为 384 维。
-        首次启动时自动检测并清空不兼容的向量，避免搜索时维度冲突。
+        更换 Embedding 模型（如 all-MiniLM-L6-v2 384 维 → bge-small-zh-v1.5 512 维）
+        后，旧向量与新模型维度不兼容。首次启动时根据 EMBEDDING_MODEL_DIMS
+        检测当前模型期望维度，不匹配时清空旧向量（下次索引自动重建），
+        避免搜索时维度冲突。当前模型未收录在维度表时不清理（保守策略，
+        检索阶段会自动跳过维度不匹配的行）。
         同时检测 file_index 表是否包含论文元数据字段，缺失时重建表（用户确认清空重建）。
         """
         try:
+            from sage.config import EMBEDDING_MODEL_DIMS, get_config
+
+            expected_dim = EMBEDDING_MODEL_DIMS.get(get_config().llm_embedding_model)
+
             # 检测 file_index 表是否含元数据字段（旧表升级时需重建）
             cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(file_index)").fetchall()}
             required_new_cols = {"title", "authors", "year", "doi", "page_start", "page_end"}
@@ -260,13 +267,16 @@ class MemoryStore:
                 )
                 self._conn.commit()
 
+            if expected_dim is None:
+                return
+
             # 检查 file_index 表
             row = self._conn.execute(
                 "SELECT embedding FROM file_index WHERE embedding IS NOT NULL LIMIT 1"
             ).fetchone()
             if row and row["embedding"] is not None:
                 dim = len(row["embedding"]) // 4  # float32 = 4 bytes
-                if dim != 384:
+                if dim != expected_dim:
                     self._conn.execute("UPDATE file_index SET embedding = NULL")
                     self._conn.execute("UPDATE file_index SET file_hash = NULL")
                     self._conn.commit()
@@ -277,7 +287,7 @@ class MemoryStore:
             ).fetchone()
             if row and row["embedding"] is not None:
                 dim = len(row["embedding"]) // 4
-                if dim != 384:
+                if dim != expected_dim:
                     self._conn.execute("UPDATE memory_embeddings SET embedding = NULL")
                     self._conn.commit()
         except Exception:
@@ -397,6 +407,15 @@ class MemoryStore:
             (conversation_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def update_message_content(self, message_id: int, content: str) -> bool:
+        """按消息 id 更新 content（用于历史消息修复，如竖排文本规整）"""
+        cur = self._conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (content, message_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """删除对话及其所有消息"""

@@ -8,11 +8,83 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from sage.tools.types import ToolResult
+
+logger = logging.getLogger(__name__)
+
+
+async def pool_search_literature(query: str, top_k: int | None = None) -> ToolResult:
+    """跨工作空间文献检索（池模式）
+
+    遍历所有工作空间的索引库，合并检索结果并按相关度排序。
+    每条结果标注来源工作空间，返回格式与 PaperOps.search_literature 一致。
+    """
+    from sage.workspace_manager import get_workspace_manager
+
+    manager = get_workspace_manager()
+    all_workspaces = manager.list_workspaces()
+    all_results = []
+    for ws in all_workspaces:
+        ws_id = ws.get("id")
+        if not ws_id:
+            continue
+        ws_path = manager.get_workspace_path(ws_id)
+        db_path = ws_path / ".sage" / "index.db"
+        if not db_path.exists():
+            continue
+        try:
+            ops = PaperOps(ws_path)
+            result = await ops.search_literature(query=query, top_k=top_k)
+            if result.success and result.data:
+                ws_tag = ws.get("domain_tag", ws_id)
+                for r in result.data:
+                    r["workspace_id"] = ws_id
+                    r["workspace_tag"] = ws_tag
+                    all_results.append(r)
+        except Exception as e:
+            logger.warning("池模式检索工作空间 %s 失败: %s", ws_id, e)
+            continue
+
+    if not all_results:
+        return ToolResult(
+            success=True,
+            output="未找到相关文献。池模式已遍历所有工作空间，可能尚未建立索引或相关度不足。",
+            data=[],
+        )
+
+    all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    limit = top_k or 10
+    all_results = all_results[:limit]
+
+    formatted = []
+    for i, r in enumerate(all_results, 1):
+        source_parts = []
+        if r.get("title"):
+            source_parts.append(f"标题: {r['title']}")
+        if r.get("authors"):
+            source_parts.append(f"作者: {r['authors']}")
+        if r.get("year"):
+            source_parts.append(f"年份: {r['year']}")
+        if r.get("doi"):
+            source_parts.append(f"DOI: {r['doi']}")
+        source_parts.append(f"工作空间: {r.get('workspace_tag', '')}")
+        source_line = " | ".join(source_parts)
+        formatted.append(
+            f"### 结果 {i}（相关度: {r.get('score', 0):.3f}）\n"
+            f"**来源**: {source_line}\n"
+            f"**文件**: {r.get('file', '')}\n"
+        )
+
+    return ToolResult(
+        success=True,
+        output="\n".join(formatted),
+        data=all_results,
+    )
 
 
 class PaperOps:
@@ -198,7 +270,11 @@ class PaperOps:
             return ToolResult(success=False, error=f"格式化失败: {e}")
 
     async def check_plagiarism(self, content: str, threshold: float = 0.8, progress: Optional[Callable[..., None]] = None) -> ToolResult:
-        """查重检测，识别与已索引文献的重复内容"""
+        """与本地文献库的重复比对，识别给定内容与已索引文献的重复段落
+
+        注意：仅比对用户上传到本地文献库中的文献，**不联网、非全网查重**，
+        不等同于知网/维普等权威查重工具，结果仅用于提示你可能重复的段落。
+        """
         try:
             from sage.context.index import ProjectIndex
             from sage.memory.store import MemoryStore
@@ -223,14 +299,14 @@ class PaperOps:
             return ToolResult(
                 success=True,
                 output=(
-                    f"查重完成: 检测 {len(paragraphs)} 段, "
-                    f"发现 {len(duplicates)} 段相似内容, "
-                    f"重复率: {duplicate_rate:.1f}%"
+                    f"与本地文献库的重复比对完成: 检测 {len(paragraphs)} 段, "
+                    f"发现 {len(duplicates)} 段与本地文献相似, "
+                    f"重复率: {duplicate_rate:.1f}%（仅限本地文献库，非全网查重）"
                 ),
                 data={"duplicate_rate": duplicate_rate, "duplicates": duplicates},
             )
         except Exception as e:
-            return ToolResult(success=False, error=f"查重失败: {e}")
+            return ToolResult(success=False, error=f"与本地文献库比对失败: {e}")
 
     # ── 文档处理工具 ──
 
@@ -674,9 +750,9 @@ class PaperOps:
     # ── 外部检索工具 ──
 
     async def search_scholar(self, query: str, max_results: int = 5) -> ToolResult:
-        """检索 Google Scholar 验证引用真实性"""
+        """检索学术文献验证引用真实性（定向检索 scholar/arxiv/doi 站内源）"""
         try:
-            # 使用 DuckDuckGo 搜索学术文献
+            # 使用 DuckDuckGo 定向检索学术站点，返回可核验的学术来源链接
             from sage.tools.web import WebSearchTool
             web_tool = WebSearchTool(self.workspace)
             enhanced_query = f"site:scholar.google.com OR site:arxiv.org OR site:doi.org {query}"

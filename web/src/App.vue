@@ -22,7 +22,7 @@ import UpdateNotification from './components/UpdateNotification.vue'
 
 const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
-  writingMode, contextUsage, activeAgentRoles, sendMessage, cancel, reset, loadConversation, deleteConversation,
+  contextUsage, activeAgentRoles, sendMessage, cancel, reset, loadConversation, deleteConversation,
   recheckContextOnModelSwitch,
 } = useChat()
 
@@ -124,22 +124,6 @@ onMounted(() => { reset() })
               </div>
             </div>
             <div class="input-section">
-              <div class="input-toolbar">
-                <button
-                  class="collab-toggle"
-                  :class="{ active: writingMode }"
-                  :title="writingMode ? '当前为写作模式（智能选择流程），点击切换单 Agent' : '点击切换到写作模式（智能选择流程）'"
-                  @click="writingMode = !writingMode"
-                >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-                    <circle cx="12" cy="6" r="2.5" stroke="currentColor" stroke-width="1.8"/>
-                    <circle cx="6" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
-                    <circle cx="18" cy="18" r="2.5" stroke="currentColor" stroke-width="1.8"/>
-                    <path d="M12 8.5v3M9.5 15.5l-2-1M14.5 15.5l2-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                  </svg>
-                  {{ writingMode ? '写作模式' : '单 Agent' }}
-                </button>
-              </div>
               <ChatInput :disabled="isProcessing" :context-usage="contextUsage" @send="sendMessage" @stop="cancel" @open-settings="activeView = 'settings'" @model-changed="handleModelChanged" />
             </div>
           </div>
@@ -212,31 +196,6 @@ onMounted(() => { reset() })
   position: relative; z-index: 10;
 }
 .input-section :deep(.input-area) { max-width: 760px; margin: 0 auto; }
-
-.input-toolbar {
-  max-width: 760px; margin: 0 auto 8px;
-  display: flex; align-items: center; gap: 8px;
-}
-.collab-toggle {
-  display: flex; align-items: center; gap: 5px;
-  font-size: 11px; font-weight: 500;
-  color: var(--text-muted);
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 4px 10px;
-  cursor: pointer;
-  transition: all 0.18s var(--ease-out-expo);
-}
-.collab-toggle:hover {
-  border-color: var(--accent-border);
-  color: var(--text-secondary);
-}
-.collab-toggle.active {
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-color: var(--accent-border);
-}
 
 @media (max-width: 1000px) {
   .messages { padding: 0 18px; }

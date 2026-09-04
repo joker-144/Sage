@@ -15,6 +15,7 @@ const sections = ref([])
 const activeKey = ref('')
 const busy = ref(false)
 const notice = ref('')
+const exportBusy = ref(false)
 
 // 每个章节的本地操作状态
 const opState = reactive({})  // key -> { outputs: [], detectIssues: [], aiBusy, detectBusy, dataInputs: [], revising, editing }
@@ -70,7 +71,22 @@ async function loadDraft() {
     workspace.value = data.workspace || ''
     draftPath.value = data.draft_path || ''
     totalWords.value = data.total_words || 0
-    sections.value = data.sections || []
+    // 归并无意义章节：_preamble 与纯数字标题不单独展示，
+    // 内容前置拼入首个章节，避免左栏出现 `_preamble`/`1` 等突兀标题且不丢内容。
+    const raw = data.sections || []
+    const useful = []
+    let carry = ''
+    for (const s of raw) {
+      if (s.key === '_preamble' || /^\d+$/.test(String(s.title || '').trim())) {
+        if (s.content) carry = (carry ? carry + '\n\n' : '') + s.content
+        continue
+      }
+      useful.push(s)
+    }
+    if (carry && useful.length) {
+      useful[0].content = carry + '\n\n' + (useful[0].content || '')
+    }
+    sections.value = useful
     if (!activeKey.value && sections.value.length) {
       activeKey.value = sections.value[0].key
     }
@@ -96,6 +112,48 @@ function withConv(payload) {
     return { ...payload, conversation_id: props.conversationId }
   }
   return payload
+}
+
+// ── 导出 Word ──
+async function exportDocx() {
+  exportBusy.value = true
+  notice.value = ''
+  try {
+    const res = await fetch('/api/review/export-docx', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(withConv({})),
+      signal: AbortSignal.timeout(60000),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || `HTTP ${res.status}`)
+    }
+    const blob = await res.blob()
+    const cd = res.headers.get('Content-Disposition') || ''
+    // 优先取 filename*= 的 UTF-8 中文名；兜底用成稿文件名
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(cd)
+    const plain = /filename="?([^";]+)"?/i.exec(cd)
+    let name = plain ? decodeURIComponent(plain[1] || '') : ''
+    const starName = star ? decodeURIComponent(star[1] || '') : ''
+    if (starName) name = starName
+    if (!/\.docx$/i.test(name)) name += '.docx'
+    if (!name || name === '.docx') name = (draftPath.value.split('/').pop() || '成稿').replace(/\.md$/i, '') + '.docx'
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    notice.value = '已导出 Word 文档'
+    setTimeout(() => (notice.value = ''), 2500)
+  } catch (e) {
+    notice.value = '导出失败: ' + e.message
+  } finally {
+    exportBusy.value = false
+  }
 }
 
 // ── AI 检测 + 改写 ──
@@ -257,24 +315,224 @@ async function toggleLock(sec) {
   }
 }
 
-function renderMarkdown(text) {
-  if (!text) return ''
-  let html = String(text)
-  html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  // 代码块
-  html = html.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-  // 粗体
-  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-  // 行内代码
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>')
-  // 引用标注 [1][2] 高亮
-  html = html.replace(/\[(\d+)\]|\[CITE:[^\]]+\]/g, '<span class="cite-mark">$&</span>')
-  // 数据占位高亮
-  html = html.replace(/【数据】|\[数据\]/g, '<span class="data-mark">$&</span>')
-  return html
+// ── 版本历史（修订/改写前自动存档，支持回滚） ──
+const showVersions = ref(false)
+const versions = ref([])
+const versionsBusy = ref(false)
+const restoreBusy = ref(false)
+
+async function loadVersions() {
+  versionsBusy.value = true
+  try {
+    const params = new URLSearchParams()
+    if (props.conversationId) params.set('conversation_id', props.conversationId)
+    const res = await fetch(`/api/review/versions?${params.toString()}`, { signal: AbortSignal.timeout(10000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    versions.value = data.versions || []
+  } catch (e) {
+    notice.value = '加载版本历史失败: ' + e.message
+  } finally {
+    versionsBusy.value = false
+  }
 }
 
-onMounted(loadDraft)
+function toggleVersions() {
+  showVersions.value = !showVersions.value
+  if (showVersions.value) loadVersions()
+}
+
+function fmtVersionTime(iso) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+async function restoreVersion(id) {
+  if (!confirm('确定恢复到该版本吗？当前未保存的草稿改动会被覆盖。')) return
+  restoreBusy.value = true
+  try {
+    const res = await fetch('/api/review/versions/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(withConv({ version_id: id })),
+      signal: AbortSignal.timeout(20000),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || `HTTP ${res.status}`)
+    }
+    notice.value = '已恢复到该版本'
+    setTimeout(() => (notice.value = ''), 2500)
+    showVersions.value = false
+    await loadDraft()
+  } catch (e) {
+    notice.value = '恢复失败: ' + e.message
+  } finally {
+    restoreBusy.value = false
+  }
+}
+
+// ── 引用真实性验证 ──
+const citationBusy = ref(false)
+const citationReport = ref(null)
+const showCitation = ref(false)
+
+const REF_STATUS_META = {
+  verified: { label: '已验证', cls: 's-verified' },
+  suspicious: { label: '存疑', cls: 's-suspicious' },
+  not_found: { label: '未找到', cls: 's-notfound' },
+  network_error: { label: '网络失败', cls: 's-network' },
+  unverified: { label: '未验证', cls: 's-unverified' },
+}
+
+function refStatusLabel(status) {
+  return (REF_STATUS_META[status] || REF_STATUS_META.unverified).label
+}
+function refStatusCls(status) {
+  return (REF_STATUS_META[status] || REF_STATUS_META.unverified).cls
+}
+
+async function verifyCitations() {
+  citationBusy.value = true
+  showCitation.value = true
+  try {
+    const res = await fetch('/api/review/verify-references', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(withConv({})),
+      signal: AbortSignal.timeout(120000),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || `HTTP ${res.status}`)
+    }
+    const data = await res.json()
+    citationReport.value = data
+    notice.value = '引用真实性验证完成'
+    setTimeout(() => (notice.value = ''), 2500)
+  } catch (e) {
+    notice.value = '引用验证失败: ' + e.message
+  } finally {
+    citationBusy.value = false
+  }
+}
+
+async function loadCitationReport() {
+  try {
+    const params = new URLSearchParams()
+    if (props.conversationId) params.set('conversation_id', props.conversationId)
+    const res = await fetch(`/api/review/citation-report?${params.toString()}`, { signal: AbortSignal.timeout(10000) })
+    if (!res.ok) return
+    const data = await res.json()
+    if (data.report) citationReport.value = data.report
+  } catch (e) {
+    // 忽略：无报告时正常
+  }
+}
+
+function renderMarkdown(text) {
+  if (!text) return ''
+  const lines = String(text).split('\n')
+  const out = []
+  let para = []
+  const flushPara = () => {
+    if (para.length) {
+      out.push('<p>' + renderInline(para.map(escHtml).join('<br/>')) + '</p>')
+      para = []
+    }
+  }
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i].trim()
+    // 代码块
+    if (/^```/.test(line)) {
+      flushPara()
+      const buf = []
+      i++
+      while (i < lines.length && !/^```/.test(lines[i].trim())) { buf.push(lines[i]); i++ }
+      i++ // 跳过结束 ```，不足时自动到末尾
+      out.push('<pre><code>' + escHtml(buf.join('\n')) + '</code></pre>')
+      continue
+    }
+    // 标题
+    const hm = line.match(/^(#{1,6})\s+(.*)$/)
+    if (hm) {
+      flushPara()
+      out.push(`<h${hm[1].length}>` + renderInline(escHtml(hm[2])) + `</h${hm[1].length}>`)
+      i++
+      continue
+    }
+    // 无序列表
+    if (/^[-*+]\s+/.test(line)) {
+      flushPara()
+      const buf = []
+      while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+        buf.push(lines[i].trim().replace(/^[-*+]\s+/, ''))
+        i++
+      }
+      out.push('<ul>' + buf.map(x => '<li>' + renderInline(escHtml(x)) + '</li>').join('') + '</ul>')
+      continue
+    }
+    // 有序列表
+    if (/^\d+\.\s+/.test(line)) {
+      flushPara()
+      const buf = []
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        buf.push(lines[i].trim().replace(/^\d+\.\s+/, ''))
+        i++
+      }
+      out.push('<ol>' + buf.map(x => '<li>' + renderInline(escHtml(x)) + '</li>').join('') + '</ol>')
+      continue
+    }
+    // 引用
+    if (/^>\s?/.test(line)) {
+      flushPara()
+      const buf = []
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+        buf.push(lines[i].trim().replace(/^>\s?/, ''))
+        i++
+      }
+      out.push('<blockquote>' + renderInline(escHtml(buf.join(' '))) + '</blockquote>')
+      continue
+    }
+    // 空行 → 段落结束
+    if (!line) { flushPara(); i++; continue }
+    // 普通行 → 累积为段落（多行用 <br/> 拼接，保证横向排版）
+    para.push(lines[i])
+    i++
+  }
+  flushPara()
+  return out.join('\n')
+}
+
+// HTML 转义（先转义再应用行内样式，防 XSS）
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// 行内 markdown 渲染（输入应为已转义的字符串）
+function renderInline(s) {
+  let h = s
+  // 行内代码
+  h = h.replace(/`([^`]+)`/g, '<code>$1</code>')
+  // 粗体 **text**
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  // 斜体 *text*（避免误匹配 **，内部不含 * 与换行）
+  h = h.replace(/\*([^*]+)\*/g, '<em>$1</em>')
+  // 引用标注 [1][2] / [CITE:...] 高亮
+  h = h.replace(/\[(\d+)\]|\[CITE:[^\]]+\]/g, '<span class="cite-mark">$&</span>')
+  // 数据占位高亮
+  h = h.replace(/【数据】|\[数据\]/g, '<span class="data-mark">$&</span>')
+  return h
+}
+
+onMounted(() => {
+  loadDraft()
+  loadCitationReport()
+})
 </script>
 
 <template>
@@ -294,17 +552,87 @@ onMounted(loadDraft)
           </p>
         </div>
         <div class="header-actions">
+          <button
+            class="action-btn btn-secondary"
+            :class="{ active: showCitation }"
+            :disabled="citationBusy"
+            @click="showCitation = !showCitation; if (showCitation && !citationReport) verifyCitations()"
+          >{{ citationBusy ? '验证中…' : '引用验证' }}</button>
+          <button class="action-btn btn-secondary" :class="{ active: showVersions }" @click="toggleVersions">版本历史</button>
           <button class="action-btn btn-secondary" @click="loadDraft">重新加载</button>
+          <button class="action-btn btn-primary" :disabled="exportBusy" @click="exportDocx">{{ exportBusy ? '导出中…' : '导出 Word' }}</button>
         </div>
       </div>
       <div v-if="notice" class="notice">{{ notice }}</div>
       <div v-if="error" class="alert alert-error">{{ error }}</div>
     </div>
 
+    <!-- 引用真实性验证面板 -->
+    <div v-if="showCitation && !loading" class="citation-panel">
+      <div class="citation-head">
+        <span class="citation-title">引用真实性验证</span>
+        <button
+          class="action-btn btn-secondary btn-small"
+          :disabled="citationBusy"
+          @click="verifyCitations"
+        >{{ citationBusy ? '验证中…' : '重新验证' }}</button>
+      </div>
+      <div v-if="!citationReport" class="citation-empty">
+        <span v-if="citationBusy">正在逐条对照 CrossRef / 维普 / 万方验证参考文献真实性…</span>
+        <span v-else>暂无验证报告。点击右上角「引用验证」对参考文献做真实性校验。</span>
+      </div>
+      <template v-else>
+        <div class="citation-stats">
+          <span class="cstat s-verified">已验证 {{ citationReport.verified ?? 0 }}</span>
+          <span class="cstat s-suspicious">存疑 {{ citationReport.suspicious ?? 0 }}</span>
+          <span class="cstat s-notfound">未找到 {{ citationReport.not_found ?? 0 }}</span>
+          <span v-if="citationReport.network_error" class="cstat s-network">网络失败 {{ citationReport.network_error }}</span>
+        </div>
+        <div v-if="!citationReport.entries || !citationReport.entries.length" class="citation-empty">
+          未提取到可验证的参考文献条目（请确认论文含「参考文献」章节）。
+        </div>
+        <ul v-else class="citation-list">
+          <li v-for="e in citationReport.entries" :key="e.index" class="citation-item">
+            <span class="cite-status" :class="refStatusCls(e.status)">{{ refStatusLabel(e.status) }}</span>
+            <div class="cite-body">
+              <div class="cite-raw">{{ (e.raw || '').slice(0, 120) }}</div>
+              <div v-if="e.matched_title && e.status !== 'verified'" class="cite-hint">匹配到相近文献：{{ e.matched_title }}</div>
+              <div v-if="e.message" class="cite-hint">{{ e.message }}</div>
+            </div>
+          </li>
+        </ul>
+      </template>
+    </div>
+
+    <!-- 版本历史面板 -->
+    <div v-if="showVersions && !loading" class="versions-panel">
+      <div class="versions-head">
+        <span class="versions-title">版本历史（修订/改写/数据回填前自动存档）</span>
+        <span v-if="versionsBusy" class="versions-hint">加载中…</span>
+        <span v-else class="versions-hint">{{ versions.length }} 份</span>
+      </div>
+      <div v-if="!versions.length && !versionsBusy" class="versions-empty">
+        暂无版本快照。修订、深度改写或数据回填后会自动在此留档。
+      </div>
+      <div v-else class="versions-list">
+        <div v-for="v in versions" :key="v.id" class="version-row">
+          <div class="version-main">
+            <span class="version-reason">{{ v.reason || '手动快照' }}</span>
+            <span class="version-meta">{{ fmtVersionTime(v.created_at) }} · {{ fmtWord(v.word_count) }} 字</span>
+          </div>
+          <button
+            class="action-btn btn-secondary btn-small"
+            :disabled="restoreBusy"
+            @click="restoreVersion(v.id)"
+          >恢复</button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="loading" class="empty-state">加载草稿中…</div>
     <div v-else-if="!sections.length" class="empty-state">
       <p>当前工作区还没有可审阅的论文草稿。</p>
-      <p class="muted">请先在对话中使用「写作模式」生成论文，再回到此处审阅；或在工作区上传/创建 paper.md。</p>
+      <p class="muted">请先在对话中生成论文，再回到此处审阅；或在工作区上传/创建 paper.md。</p>
     </div>
     <div v-else class="review-layout">
       <!-- 左：章节树 + 字数进度 -->
@@ -343,22 +671,22 @@ onMounted(loadDraft)
           <div class="detail-actions">
             <button
               class="action-btn btn-secondary"
-              :disabled="busy || activeSection.locked"
+              :disabled="busy || activeSection.locked || activeSection.key === '_misc'"
               @click="detectAI(activeSection)"
             >{{ getOp(activeSection.key).detectBusy ? '检测中…' : 'AI 痕迹检测' }}</button>
             <button
               class="action-btn btn-primary"
-              :disabled="busy || activeSection.locked || !getOp(activeSection.key).detectIssues.length"
+              :disabled="busy || activeSection.locked || activeSection.key === '_misc' || !getOp(activeSection.key).detectIssues.length"
               @click="rewriteAI(activeSection)"
             >{{ getOp(activeSection.key).rewriting ? '改写中…' : '深度改写' }}</button>
             <button
               class="action-btn btn-secondary"
-              :disabled="busy || activeSection.locked"
+              :disabled="busy || activeSection.locked || activeSection.key === '_misc'"
               @click="startRevise(activeSection)"
             >修订</button>
             <button
               class="action-btn btn-secondary"
-              :disabled="busy"
+              :disabled="busy || activeSection.key === '_misc'"
               @click="toggleLock(activeSection)"
             >{{ activeSection.locked ? '解锁' : '锁定' }}</button>
           </div>
@@ -398,12 +726,16 @@ onMounted(loadDraft)
           </div>
         </div>
 
-        <!-- 正文展示 / 修订编辑 -->
+        <!-- 正文展示 / 修订编辑（渲染预览 + 源码编辑） -->
         <div v-if="getOp(activeSection.key).revising" class="revise-box">
+          <div class="revise-label">预览（与正文排版一致）</div>
+          <div class="revise-preview" v-html="renderMarkdown(getOp(activeSection.key).editContent)"></div>
+          <div class="revise-label">源码编辑（Markdown）</div>
           <textarea
             v-model="getOp(activeSection.key).editContent"
             class="revise-textarea"
-            rows="16"
+            rows="12"
+            placeholder="在此编辑 Markdown 源码…"
           ></textarea>
           <div class="revise-actions">
             <button class="action-btn btn-secondary" @click="cancelRevise(activeSection)">取消</button>
@@ -447,7 +779,57 @@ onMounted(loadDraft)
 .btn-secondary { color: var(--text-secondary); background: var(--bg-surface); border: 1px solid var(--border); }
 .btn-secondary:hover { border-color: var(--accent-border); color: var(--text-primary); }
 .btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-secondary.active { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
 .btn-small { padding: 5px 10px; font-size: 11.5px; }
+
+.versions-panel {
+  margin-bottom: 20px; padding: 14px 16px;
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.versions-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.versions-title { font-size: 12.5px; font-weight: 600; color: var(--text-primary); }
+.versions-hint { font-size: 11px; color: var(--text-faint); }
+.versions-empty { font-size: 12.5px; color: var(--text-muted); }
+.versions-list { display: flex; flex-direction: column; gap: 6px; }
+.version-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 12px; background: var(--bg-input); border-radius: var(--radius-sm);
+}
+.version-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.version-reason { font-size: 12.5px; color: var(--text-secondary); font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.versions-meta { font-size: 11px; color: var(--text-faint); font-family: var(--font-mono); white-space: nowrap; }
+
+.citation-panel {
+  margin-bottom: 20px; padding: 14px 16px;
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.citation-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.citation-title { font-size: 12.5px; font-weight: 600; color: var(--text-primary); }
+.citation-empty { font-size: 12.5px; color: var(--text-muted); }
+.citation-stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.cstat {
+  padding: 3px 10px; border-radius: var(--radius-xs);
+  font-size: 11.5px; font-weight: 600; color: #fff;
+}
+.s-verified { background: #16a34a; }
+.s-suspicious { background: #f59e0b; }
+.s-notfound { background: #e74c3c; }
+.s-network { background: #94a3b8; }
+.s-unverified { background: #94a3b8; }
+.citation-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+.citation-item {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 8px 12px; background: var(--bg-input); border-radius: var(--radius-sm);
+}
+.cite-status {
+  flex-shrink: 0; padding: 2px 8px; border-radius: var(--radius-xs);
+  font-size: 10.5px; font-weight: 600; color: #fff; margin-top: 1px;
+}
+.cite-body { min-width: 0; }
+.cite-raw { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.cite-hint { font-size: 11px; color: var(--text-faint); margin-top: 3px; line-height: 1.4; }
 
 .notice {
   margin-top: 10px; padding: 8px 12px;
@@ -516,18 +898,43 @@ onMounted(loadDraft)
 .data-fill-input input:disabled { opacity: 0.5; }
 
 .revise-box { margin-top: 6px; }
+.revise-label {
+  font-size: 11px; font-weight: 600; color: var(--text-muted);
+  margin: 10px 0 4px;
+}
+.revise-preview {
+  line-height: 1.8; font-size: 13.5px; color: var(--text-primary);
+  padding: 12px 14px; background: var(--bg-surface);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
 .revise-textarea {
   width: 100%; padding: 12px; font-size: 13px; line-height: 1.7;
   background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text-primary); resize: vertical; outline: none; font-family: inherit;
+  white-space: pre-wrap; word-break: break-word;
 }
 .revise-textarea:focus { border-color: var(--accent); }
 .revise-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
-.draft-body { line-height: 1.8; font-size: 13.5px; color: var(--text-primary); }
-.draft-body :deep(p) { margin: 0 0 12px; }
-.draft-body :deep(pre) { background: var(--bg-input); padding: 10px 12px; border-radius: var(--radius-sm); overflow-x: auto; margin: 8px 0; }
-.draft-body :deep(code) { font-family: var(--font-mono); font-size: 12px; }
-.draft-body :deep(.cite-mark) { color: var(--accent); font-weight: 600; }
-.draft-body :deep(.data-mark) { background: rgba(245, 158, 11, 0.18); color: #f59e0b; font-weight: 600; padding: 1px 5px; border-radius: var(--radius-xs); }
+.draft-body, .revise-preview { line-height: 1.8; font-size: 13.5px; color: var(--text-primary); }
+.draft-body :deep(p), .revise-preview :deep(p) { margin: 0 0 12px; }
+.draft-body :deep(h1), .revise-preview :deep(h1) { font-size: 20px; font-weight: 700; margin: 18px 0 10px; }
+.draft-body :deep(h2), .revise-preview :deep(h2) { font-size: 17px; font-weight: 650; margin: 16px 0 8px; }
+.draft-body :deep(h3), .revise-preview :deep(h3) { font-size: 15px; font-weight: 650; margin: 14px 0 6px; }
+.draft-body :deep(h4), .revise-preview :deep(h4),
+.draft-body :deep(h5), .revise-preview :deep(h5),
+.draft-body :deep(h6) , .revise-preview :deep(h6) { font-size: 13.5px; font-weight: 600; margin: 12px 0 6px; }
+.draft-body :deep(ul), .revise-preview :deep(ul),
+.draft-body :deep(ol), .revise-preview :deep(ol) { margin: 0 0 12px; padding-left: 22px; }
+.draft-body :deep(li), .revise-preview :deep(li) { margin: 3px 0; }
+.draft-body :deep(blockquote), .revise-preview :deep(blockquote) {
+  margin: 8px 0 12px; padding: 6px 12px; color: var(--text-secondary);
+  border-left: 3px solid var(--accent-border); background: var(--bg-surface-border, transparent);
+}
+.draft-body :deep(pre), .revise-preview :deep(pre) { background: var(--bg-input); padding: 10px 12px; border-radius: var(--radius-sm); overflow-x: auto; margin: 8px 0; }
+.draft-body :deep(code), .revise-preview :deep(code) { font-family: var(--font-mono); font-size: 12px; }
+.draft-body :deep(strong), .revise-preview :deep(strong) { font-weight: 700; }
+.draft-body :deep(em), .revise-preview :deep(em) { font-style: italic; }
+.draft-body :deep(.cite-mark), .revise-preview :deep(.cite-mark) { color: var(--accent); font-weight: 600; }
+.draft-body :deep(.data-mark), .revise-preview :deep(.data-mark) { background: rgba(245, 158, 11, 0.18); color: #f59e0b; font-weight: 600; padding: 1px 5px; border-radius: var(--radius-xs); }
 </style>

@@ -21,13 +21,11 @@ export function useChat() {
   const conversationId = ref(loadConvId())  // 从 localStorage 恢复
   const messagesRef = ref(null)
   const messageSentCount = ref(0)  // 每发一条消息+1，父组件 watch 后刷新侧栏
-  const writingMode = ref(false)  // 写作模式开关（智能选择流程：简单任务单Agent，复杂任务多智能体）
 
   // 上下文用量（环形指示器数据）：{ current_tokens, trigger_tokens, percent, compressed_rounds, saved_tokens, just_compressed, role }
   const contextUsage = ref(null)
 
-  // 当前正在调用的智能体 role 集合（用于侧边栏圆圈高亮）
-  // 写作模式：collaborate 事件的 role；单 Agent 模式：load_skill 触发 'general'
+  // 当前正在调用的智能体 role 集合（用于侧边栏圆圈高亮，来自 collaborate 事件的 role）
   const activeAgentRoles = reactive(new Set())
 
   let currentAssistant = null
@@ -373,9 +371,6 @@ export function useChat() {
       if (settings) {
         body.settings = settings
       }
-      if (writingMode.value) {
-        body.mode = 'writing'
-      }
       // 池模式标记：后端据此将 search_literature 路由到跨工作空间检索
       if (poolMode.value) {
         body.pool_mode = true
@@ -710,7 +705,6 @@ export function useChat() {
     conversationId,
     messagesRef,
     messageSentCount,
-    writingMode,
     contextUsage,
     activeAgentRoles,
     sendMessage,

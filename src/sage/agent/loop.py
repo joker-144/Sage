@@ -29,8 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from sage.agent.system_prompt import get_system_prompt
-from sage.agents.reflection import ReflectionEngine, ReflectionContext, create_reflection_engine
+from sage.agent.system_prompt import build_tools_catalog, get_system_prompt
+from sage.agents.reflection import ReflectionContext, create_reflection_engine
 from sage.config import get_config
 from sage.context.manager import ContextManager
 from sage.context.model_limits import COMPRESSION_TRIGGER_RATIO, get_context_window
@@ -111,6 +111,16 @@ class AgentLoop:
         """AgentLoop
 
         Args:
+            workspace: 工作空间根目录（文件操作的基准路径）。默认取配置。
+            llm: LLM 客户端实例。默认新建 LLMClient。
+            tools: 工具引擎实例。默认基于 workspace 新建 ToolEngine。
+            context: 上下文管理器。默认基于 workspace + system_prompt 新建。
+            system_prompt: 显式系统提示（如写作模式 worker 的角色 prompt）。
+                传入时不强制追加通用工具清单；为空则使用通用 prompt + 动态工具目录。
+            conversation_id: 对话 ID。默认运行时自动生成。
+            enable_reflection: 是否启用工具执行后的反思修正。
+            enable_observability: 是否启用可观测性统计（Token/Trace/工具记录）。
+            writing_mode: 写作模式（多智能体协作）。开启时将 LLM 最大输出提升至 16384。
             persist: 是否持久化对话到 SQLite。写作模式内部的 worker 子 Agent
                 设置为 False，避免产生一堆无意义的历史对话记录污染对话列表。
         """
@@ -123,7 +133,16 @@ class AgentLoop:
         if writing_mode:
             self.llm.max_tokens = 16384
         self.tools = tools or ToolEngine(self.workspace)
-        self.system_prompt = system_prompt or get_system_prompt()
+        if system_prompt:
+            # 显式传入的（如写作模式 worker 的 agent.json 角色 prompt）原样使用，
+            # 不强制追加通用工具清单，避免引入与角色无关的工具
+            self.system_prompt = system_prompt
+        else:
+            # 默认通用 prompt：动态追加 ToolEngine 注册表生成的工具清单，
+            # 消灭手工清单与注册表不同步（新增/改名工具自动跟进）
+            self.system_prompt = get_system_prompt() + "\n\n" + build_tools_catalog(
+                self.tools.get_schemas()
+            )
 
         # 注入当前工作空间路径，让 Agent 明确知道文件操作的实际位置
         self.system_prompt += (
@@ -496,10 +515,12 @@ class AgentLoop:
                         if call.name in ("write_file", "edit_file", "delete_file"):
                             _dedup_cache.clear()
                         else:
-                            _dedup_cache[dedup_key] = result.output
+                            _dedup_cache[dedup_key] = self._tool_result_text(result)
 
                     # 将完整结果加入 LLM 上下文（summary 会截断到 200 字符，导致 LLM 只能看到部分结果）
-                    tool_output = result.output if result.success else f"错误: {result.error}"
+                    # FileOps 类工具把结果放在 data 字段（output 为空），需兜底取 data，
+                    # 否则 LLM 收到空结果，表现为"看不见"工作空间内容
+                    tool_output = self._tool_result_text(result) if result.success else f"错误: {result.error}"
                     self.context.add_tool_result(call.id, call.name, tool_output)
                     self._persist_message(
                         "tool", tool_output,
@@ -856,6 +877,92 @@ class AgentLoop:
         """格式化工具调用用于展示"""
         args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
         return f"[工具 {name}]({args_str})"
+
+    def restore_history_from_db(self):
+        """从 SQLite 恢复历史消息到当前上下文（避免 AI 失忆）
+
+        带 token 预算控制：从最新消息往前累计，超出预算（压缩触发阈值）
+        的更早消息被丢弃，并在上下文开头插入系统提示。
+        供多轮对话恢复（API 层与编排器 worker 共用）。
+        """
+        try:
+            from sage.memory.store import get_store
+            from sage.context.tokenizer import count_tokens
+            store = get_store()
+            msgs = store.get_messages(self.conversation_id, limit=500)
+            if not msgs:
+                return
+
+            # 预算使用 Agent 已按当前模型动态计算的压缩触发阈值，
+            # 与后续压缩触发逻辑保持一致，避免不同来源导致历史恢复上限漂移。
+            budget = int(self.context.history.summary_trigger_tokens or 45000)
+
+            # 从最新往前选，控制总 token 数在预算内
+            selected: list[dict] = []
+            used = 0
+            omitted = 0
+            for msg in reversed(msgs):
+                content = msg.get("content") or ""
+                tool_args_raw = msg.get("tool_args") or ""
+                est = count_tokens(content) + count_tokens(tool_args_raw) + 4
+                if used + est > budget and selected:
+                    omitted += 1
+                    continue
+                selected.append(msg)
+                used += est
+
+            if omitted:
+                self.context.add_user_message(
+                    f"（系统提示：更早的 {omitted} 条历史消息因上下文长度限制未加载，"
+                    "如需回顾请直接提问。）"
+                )
+
+            for msg in reversed(selected):  # 恢复为时间顺序
+                role = msg.get("role")
+                content = msg.get("content") or ""
+                tool_name = msg.get("tool_name")
+                tool_args_raw = msg.get("tool_args")
+                tool_call_id = msg.get("tool_call_id")
+
+                if role == "user":
+                    self.context.add_user_message(content)
+                elif role == "assistant":
+                    tool_calls = []
+                    if tool_args_raw:
+                        try:
+                            tool_calls = json.loads(tool_args_raw)
+                        except Exception:
+                            pass
+                    self.context.add_assistant_message(content, tool_calls if tool_calls else None)
+                elif role == "tool":
+                    self.context.add_tool_result(
+                        tool_call_id=tool_call_id or "",
+                        tool_name=tool_name or "",
+                        result=content,
+                    )
+        except Exception as e:
+            logger.warning("恢复历史消息失败 (conversation_id=%s): %s", self.conversation_id, e)
+
+    @staticmethod
+    def _tool_result_text(result) -> str:
+        """提取工具结果的完整文本，供 LLM 上下文与去重缓存使用
+
+        不同工具族返回字段约定不同：
+          - paper_ops 等使用 output（可读文本）
+          - file_ops 等使用 data（字符串）
+        优先 output，为空时兜底取 data（与 ToolResult.summary 的取值逻辑对齐，
+        但不截断），保证 LLM 能拿到完整结果。
+        """
+        if result.output:
+            return result.output
+        if isinstance(result.data, str) and result.data:
+            return result.data
+        if result.data not in ("", None, [], {}):
+            try:
+                return json.dumps(result.data, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return str(result.data)
+        return ""
 
 
 def create_agent(

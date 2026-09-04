@@ -74,7 +74,7 @@ onMounted(loadData)
   <div class="agents-view">
     <header class="view-header">
       <h1>自定义智能体</h1>
-      <p class="subtitle">由智能体自主创建并经审核通过的自定义智能体，可在单 Agent 模式下使用</p>
+      <p class="subtitle">由智能体自主创建并经审核通过的自定义智能体，可在对话中直接使用</p>
     </header>
 
     <div v-if="loading" class="loading-state">加载中...</div>

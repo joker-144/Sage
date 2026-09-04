@@ -65,21 +65,19 @@ app = FastAPI(
 # CORS 允许前端直连后端（绕过 Vite 代理的 SSE 缓冲问题）
 # 开发模式：仅允许 Vite dev server
 # 生产模式（PyInstaller 打包或 Electron）：允许任意 localhost 端口 + file:// + app://
+# 注意：Starlette 的 allow_origins 不做端口通配（"http://localhost:*" 无效），
+# 任意 localhost 端口需用 allow_origin_regex 正则匹配；file:// 页面 Origin 为 "null"。
 if getattr(sys, 'frozen', False) or os.environ.get("SAGE_PRODUCTION", ""):
-    _cors_origins = [
-        "http://localhost:*",
-        "https://localhost:*",
-        "http://127.0.0.1:*",
-        "file://",
-        "app://",
-        "tauri://localhost",
-    ]
+    _cors_origins = ["file://", "null", "app://", "tauri://localhost"]
+    _cors_origin_regex = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$"
 else:
     _cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    _cors_origin_regex = None
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=_cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -130,74 +128,9 @@ _ENV_WRITE_LOCK = threading.Lock()
 
 
 async def _pool_search_literature(query: str, top_k: int | None = None):
-    """跨工作空间文献检索（池模式包装函数）
-
-    遍历所有工作空间的索引库，合并检索结果并按相关度排序。
-    每条结果标注来源工作空间，返回格式与 PaperOps.search_literature 一致。
-    """
-    from sage.workspace_manager import get_workspace_manager
-    from sage.tools.paper_ops import PaperOps
-    from sage.tools.types import ToolResult
-
-    manager = get_workspace_manager()
-    all_workspaces = manager.list_workspaces()
-    all_results = []
-    for ws in all_workspaces:
-        ws_id = ws.get("id")
-        if not ws_id:
-            continue
-        ws_path = manager.get_workspace_path(ws_id)
-        db_path = ws_path / ".sage" / "index.db"
-        if not db_path.exists():
-            continue
-        try:
-            ops = PaperOps(ws_path)
-            result = await ops.search_literature(query=query, top_k=top_k)
-            if result.success and result.data:
-                ws_tag = ws.get("domain_tag", ws_id)
-                for r in result.data:
-                    r["workspace_id"] = ws_id
-                    r["workspace_tag"] = ws_tag
-                    all_results.append(r)
-        except Exception as e:
-            logger.warning("池模式检索工作空间 %s 失败: %s", ws_id, e)
-            continue
-
-    if not all_results:
-        return ToolResult(
-            success=True,
-            output="未找到相关文献。池模式已遍历所有工作空间，可能尚未建立索引或相关度不足。",
-            data=[],
-        )
-
-    all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-    limit = top_k or 10
-    all_results = all_results[:limit]
-
-    formatted = []
-    for i, r in enumerate(all_results, 1):
-        source_parts = []
-        if r.get("title"):
-            source_parts.append(f"标题: {r['title']}")
-        if r.get("authors"):
-            source_parts.append(f"作者: {r['authors']}")
-        if r.get("year"):
-            source_parts.append(f"年份: {r['year']}")
-        if r.get("doi"):
-            source_parts.append(f"DOI: {r['doi']}")
-        source_parts.append(f"工作空间: {r.get('workspace_tag', '')}")
-        source_line = " | ".join(source_parts)
-        formatted.append(
-            f"### 结果 {i}（相关度: {r.get('score', 0):.3f}）\n"
-            f"**来源**: {source_line}\n"
-            f"**文件**: {r.get('file', '')}\n"
-        )
-
-    return ToolResult(
-        success=True,
-        output="\n".join(formatted),
-        data=all_results,
-    )
+    """跨工作空间文献检索（池模式包装函数）— 委托给 paper_ops 的统一实现"""
+    from sage.tools.paper_ops import pool_search_literature
+    return await pool_search_literature(query=query, top_k=top_k)
 
 
 def _apply_pool_mode(agent, pool_mode: bool):
@@ -256,74 +189,15 @@ def _get_or_create_agent(conversation_id: str | None = None):
 
 
 def _restore_agent_context(agent, conversation_id: str):
-    """从 SQLite 恢复历史消息到 Agent 的 ContextManager 中
-
-    这样 Agent 在回答前就知道之前对话的全部内容，避免 AI 失忆。
-
-    带 token 预算控制：从最新消息往前累计，超出预算（默认取配置
-    summary_trigger_tokens）的更早消息被丢弃，并在上下文开头插入系统提示，
-    避免超长对话恢复后直接顶满上下文窗口。
-    """
-    import json as _json
+    """从 SQLite 恢复历史消息到 Agent 的 ContextManager 中（委托给 AgentLoop 统一实现）"""
     try:
-        from sage.memory.store import get_store
-        from sage.context.tokenizer import count_tokens
-        store = get_store()
-        msgs = store.get_messages(conversation_id, limit=500)
-        if not msgs:
-            return
-
-        # 预算使用 Agent 已按当前模型动态计算的压缩触发阈值，
-        # 与后续压缩触发逻辑保持一致，避免不同来源导致历史恢复上限漂移。
-        budget = int(agent.context.history.summary_trigger_tokens or 45000)
-
-        # 从最新往前选，控制总 token 数在预算内
-        selected: list[dict] = []
-        used = 0
-        omitted = 0
-        for msg in reversed(msgs):
-            content = msg.get("content") or ""
-            tool_args_raw = msg.get("tool_args") or ""
-            est = count_tokens(content) + count_tokens(tool_args_raw) + 4
-            if used + est > budget and selected:
-                omitted += 1
-                continue
-            selected.append(msg)
-            used += est
-
-        if omitted:
-            agent.context.add_user_message(
-                f"（系统提示：更早的 {omitted} 条历史消息因上下文长度限制未加载，"
-                "如需回顾请直接提问。）"
-            )
-
-        for msg in reversed(selected):  # 恢复为时间顺序
-            role = msg.get("role")
-            content = msg.get("content") or ""
-            tool_name = msg.get("tool_name")
-            tool_args_raw = msg.get("tool_args")
-            tool_call_id = msg.get("tool_call_id")
-
-            if role == "user":
-                agent.context.add_user_message(content)
-            elif role == "assistant":
-                tool_calls = []
-                if tool_args_raw:
-                    try:
-                        tool_calls = _json.loads(tool_args_raw)
-                    except Exception as e:
-                        logger.warning("解析历史 tool_calls 失败 conversation_id=%s: %s", conversation_id, e)
-                agent.context.add_assistant_message(content, tool_calls if tool_calls else None)
-            elif role == "tool":
-                agent.context.add_tool_result(
-                    tool_call_id=tool_call_id or "",
-                    tool_name=tool_name or "",
-                    result=content,
-                )
+        agent.restore_history_from_db()
 
         # 恢复上次持久化的压缩统计（已压缩轮数 / 累计节省），
         # 使切换对话回来时环形指示器能继续显示历史压缩情况。
         try:
+            from sage.memory.store import get_store
+            store = get_store()
             stats = store.get_context_stats(conversation_id)
             agent.context.compression_stats["rounds"] = stats.get("compressed_rounds", 0)
             agent.context.compression_stats["saved_tokens"] = stats.get("saved_tokens", 0)
@@ -340,7 +214,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息", min_length=1)
     conversation_id: str | None = Field(None, description="对话 ID（首次对话不传，后续传入以保持上下文）")
     settings: dict | None = Field(None, description="前端设置覆盖（已弃用，配置从 .env 读取）")
-    mode: str = Field("single", description="运行模式: single=单Agent, writing=写作模式(智能选择流程)")
+    mode: str = Field("single", description="已废弃：统一链路自动做意图分析路由（简单任务单Agent，复杂任务多智能体），该字段被忽略")
     pool_mode: bool = Field(False, description="全选池模式：True 时检索覆盖所有工作空间")
     force_role: str | None = Field(None, description="写作模式下强制指定处理角色（如 literature/coder/reviewer/debugger），跳过意图分析")
 
@@ -426,14 +300,29 @@ async def check_update():
 
 
 @app.get("/debug/webfiles")
-async def debug_web_files():
-    """调试接口：列出 WEB_DIR 路径和文件（仅开发环境可用）
+async def debug_web_files(request: Request):
+    """调试接口：列出 WEB_DIR 路径和文件（仅本机可用）
 
-    打包（生产）环境直接禁用：该接口暴露本地 WEB 路径与文件清单，
-    仅在源码运行（开发调试）时提供诊断能力。
+    安全收紧（防局域网暴露）：
+      1. 打包（生产）环境直接禁用（404）：该接口暴露本地 WEB 路径与文件清单。
+      2. 设置 SAGE_DEBUG_ACCESS_TOKEN 后，需请求头携带 X-Sage-Debug-Token 且一致。
+      3. 未设置令牌时，仅允许环回地址（127.0.0.1 / ::1）访问，
+         其它来源一律拒绝——加固后端绑定 0.0.0.0 时被局域网其它机器探测。
     """
     if getattr(sys, "frozen", False):
         raise HTTPException(status_code=404, detail="Not Found")
+    # 访问令牌校验：配置了令牌则强制要求携带，环回也不例外
+    _token = get_config().debug_access_token
+    if _token:
+        _provided = request.headers.get("X-Sage-Debug-Token", "")
+        if _provided != _token:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    else:
+        # 未配置令牌：仅环回地址可访问
+        _client = request.client
+        _host = (_client.host if _client else "") or ""
+        if _host not in ("127.0.0.1", "::1", "localhost"):
+            raise HTTPException(status_code=403, detail="Forbidden")
     web_path = str(WEB_DIR)
     exists = WEB_DIR.exists()
     index_exists = (WEB_DIR / "index.html").exists()
@@ -458,7 +347,7 @@ async def debug_web_files():
 # ── 对话接口 ──
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: Request):
     """SSE 流式输出 — 实时返回 Agent 的思考和操作
 
     事件类型:
@@ -471,116 +360,11 @@ async def chat_stream(req: ChatRequest):
       - event: done         完成（data 中含 conversation_id）
 
     通过传入 conversation_id 实现多轮对话上下文保持。
-    mode=writing 时启动写作模式（智能选择流程：简单任务单Agent，复杂任务多智能体）。
+    统一链路：所有对话先做意图分析——简单任务路由到单个 Agent 直接回复，
+    复杂任务（完整论文/多章节等）自动进入多智能体协作（mode 字段已废弃，忽略）。
     """
-    # 写作模式走多 Agent 流程（内部根据任务复杂度智能选择单/多智能体）
-    if req.mode == "writing":
-        return StreamingResponse(
-            _collaborate_stream(req),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-store",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    agent, conv_id = _get_or_create_agent(req.conversation_id)
-    # 根据请求的池模式标记切换 search_literature 工具注册
-    # （每次请求都同步，确保缓存 agent 的工具注册与当前池模式状态一致）
-    _apply_pool_mode(agent, req.pool_mode)
-
-    async def event_stream():
-        # 并发保护：同一会话已有请求在处理中 → busy 提示，避免上下文互相污染
-        if conv_id in _conv_busy:
-            yield f"event: busy\ndata: {json.dumps({'content': '该对话上一条消息仍在处理中，请稍候再发送。'}, ensure_ascii=False)}\n\n"
-            yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-            return
-        _conv_busy.add(conv_id)
-
-        event_queue: asyncio.Queue = asyncio.Queue()
-
-        async def agent_producer():
-            """后台任务：运行 Agent，将事件放入队列"""
-            try:
-                async for event in agent.run(req.message):
-                    await event_queue.put(("event", event))
-            except Exception as e:
-                await event_queue.put(("error", str(e)))
-
-        producer_task = asyncio.create_task(agent_producer())
-        heartbeat_interval = 10  # 秒（低于前端 30s 超时）
-
-        try:
-            while True:
-                try:
-                    item_type, item_data = await asyncio.wait_for(
-                        event_queue.get(),
-                        timeout=heartbeat_interval,
-                    )
-                except asyncio.TimeoutError:
-                    # 10 秒无事件 — 发送心跳，保持连接活跃
-                    if producer_task.done():
-                        break
-                    yield ": heartbeat\n\n"
-                    continue
-
-                if item_type == "event":
-                    event = item_data
-                    if event.type == "tool_start":
-                        # 智能体调用识别：只有 load_skill(name="xxx") 且指定了技能名时才标记
-                        is_agent = bool(event.skill_name) and event.tool_name == "load_skill"
-                        yield f"event: tool_start\ndata: {json.dumps({'tool': event.tool_name, 'args': event.tool_args, 'content': event.content, 'tokens': event.tokens or {}, 'is_agent': is_agent, 'agent_name': event.skill_name or ''}, ensure_ascii=False)}\n\n"
-                    elif event.type == "tool_result":
-                        # 拦截删除确认请求：delete_file 返回 __DELETE_CONFIRM_REQUIRED__ 标记
-                        content = event.content or ""
-                        if "__DELETE_CONFIRM_REQUIRED__" in content:
-                            # 解析 token 和 path
-                            token = ""
-                            del_path = ""
-                            del_type = ""
-                            for line in content.split("\n"):
-                                if line.startswith("token:"):
-                                    token = line.split(":", 1)[1].strip()
-                                elif line.startswith("path:"):
-                                    del_path = line.split(":", 1)[1].strip()
-                                elif line.startswith("type:"):
-                                    del_type = line.split(":", 1)[1].strip()
-                            yield f"event: delete_confirm_required\ndata: {json.dumps({'tool': event.tool_name, 'token': token, 'path': del_path, 'type': del_type}, ensure_ascii=False)}\n\n"
-                        else:
-                            yield f"event: tool_result\ndata: {json.dumps({'tool': event.tool_name, 'content': event.content}, ensure_ascii=False)}\n\n"
-                    elif event.type == "reasoning":
-                        yield f"event: reasoning\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
-                    elif event.type == "progress":
-                        # 长任务进度通知（索引/OCR/查重等）
-                        pa = event.tool_args or {}
-                        yield f"event: progress\ndata: {json.dumps({'content': event.content, 'tool': pa.get('tool', ''), 'current': pa.get('current'), 'total': pa.get('total')}, ensure_ascii=False)}\n\n"
-                    elif event.type == "text":
-                        yield f"event: text\ndata: {json.dumps({'content': event.content}, ensure_ascii=False)}\n\n"
-                    elif event.type == "retry":
-                        # LLM 调用重试通知 — 前端展示 "重试中 (1/3)..."
-                        yield f"event: retry\ndata: {json.dumps({'content': event.content, 'attempt': (event.tool_args or {}).get('attempt', 0), 'max_retries': (event.tool_args or {}).get('max_retries', 0), 'delay': (event.tool_args or {}).get('delay', 0), 'error': (event.tool_args or {}).get('error', '')}, ensure_ascii=False)}\n\n"
-                    elif event.type == "context_usage":
-                        # 上下文用量通知 — 前端环形指示器展示
-                        yield f"event: context_usage\ndata: {json.dumps(event.tool_args or {}, ensure_ascii=False)}\n\n"
-                    elif event.type == "error":
-                        yield f"event: error\ndata: {json.dumps({'content': event.content, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-                    elif event.type == "done":
-                        yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-                        break
-                elif item_type == "done":
-                    yield f"event: done\ndata: {json.dumps({'conversation_id': item_data}, ensure_ascii=False)}\n\n"
-                    break
-                elif item_type == "error":
-                    yield f"event: error\ndata: {json.dumps({'content': item_data, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-                    break
-        finally:
-            if not producer_task.done():
-                producer_task.cancel()
-            _conv_busy.discard(conv_id)
-
     return StreamingResponse(
-        event_stream(),
+        _collaborate_stream(req, request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-store",
@@ -590,17 +374,29 @@ async def chat_stream(req: ChatRequest):
     )
 
 
-async def _collaborate_stream(req: ChatRequest):
-    """写作模式 SSE 流（智能选择流程：简单任务单Agent，复杂任务多智能体）
+async def _collaborate_stream(req: ChatRequest, request: Request):
+    """统一对话 SSE 流（意图分析：简单任务单Agent，复杂任务多智能体）
 
-    与 chat_stream 一样采用 producer task + 心跳保活机制：
-    写作模式中意图分析、工具执行、_run_worker 收集输出等阶段可能长时间无事件，
+    与原 chat_stream 一样采用 producer task + 心跳保活机制：
+    意图分析、工具执行、_run_worker 收集输出等阶段可能长时间无事件，
     需要定期发送 SSE 心跳注释（: heartbeat\\n\\n）防止前端 60s 超时 abort。
     """
     from sage.agents.orchestrator import create_orchestrator
+    from sage.memory.store import get_store
 
     conv_id = req.conversation_id or str(uuid.uuid4())
-    orchestrator = create_orchestrator(workspace=_current_workspace(), conversation_id=conv_id)
+    orchestrator = create_orchestrator(
+        workspace=_current_workspace(), conversation_id=conv_id, pool_mode=req.pool_mode
+    )
+
+    # 持久化用户消息（统一链路后所有对话均有历史，worker 的上下文恢复依赖这些记录）
+    try:
+        store = get_store()
+        store.create_conversation(conv_id)
+        store.add_message(conversation_id=conv_id, role="user", content=req.message)
+        store.update_conversation_title(conv_id, req.message)
+    except Exception as e:
+        logger.warning("持久化用户消息失败 (conversation_id=%s): %s", conv_id, e)
 
     async def event_stream():
         """实际的事件生成器，由 producer task 驱动"""
@@ -611,6 +407,20 @@ async def _collaborate_stream(req: ChatRequest):
             yield ("done", None)
             return
         _conv_busy.add(conv_id)
+
+        assistant_text_parts: list[str] = []
+
+        def _persist_assistant():
+            """将本轮完整回复持久化（失败不影响主流程）"""
+            text = "".join(assistant_text_parts).strip()
+            if not text:
+                return
+            # 兜底规整：修复个别 LLM 把回复按 token 打散成逐词竖排的畸形输出
+            text = _normalize_vertical_text(text)
+            try:
+                get_store().add_message(conversation_id=conv_id, role="assistant", content=text)
+            except Exception as e:
+                logger.warning("持久化回复消息失败 (conversation_id=%s): %s", conv_id, e)
 
         try:
             async for event in orchestrator.collaborate(req.message, force_role=req.force_role):
@@ -629,7 +439,30 @@ async def _collaborate_stream(req: ChatRequest):
                     meta = event.metadata or {}
                     yield ("event", f"event: progress\ndata: {json.dumps({'content': event.content, 'role': event.role, 'tool': meta.get('tool', ''), 'current': meta.get('current'), 'total': meta.get('total')}, ensure_ascii=False)}\n\n")
                 elif event.type == "text":
+                    assistant_text_parts.append(event.content)
                     yield ("event", f"event: text\ndata: {json.dumps({'content': event.content, 'role': event.role}, ensure_ascii=False)}\n\n")
+                elif event.type == "tool_start":
+                    # 工具调用开始 — 前端展示工具卡片（与单Agent链路一致）
+                    meta = event.metadata or {}
+                    yield ("event", f"event: tool_start\ndata: {json.dumps({'tool': meta.get('tool', ''), 'args': meta.get('args', {}), 'content': event.content, 'tokens': event.tokens or {}, 'is_agent': False, 'agent_name': ''}, ensure_ascii=False)}\n\n")
+                elif event.type == "tool_result":
+                    # 工具执行结果 — 拦截删除确认请求（delete_file 返回 __DELETE_CONFIRM_REQUIRED__ 标记）
+                    content = event.content or ""
+                    if "__DELETE_CONFIRM_REQUIRED__" in content:
+                        token = ""
+                        del_path = ""
+                        del_type = ""
+                        for line in content.split("\n"):
+                            if line.startswith("token:"):
+                                token = line.split(":", 1)[1].strip()
+                            elif line.startswith("path:"):
+                                del_path = line.split(":", 1)[1].strip()
+                            elif line.startswith("type:"):
+                                del_type = line.split(":", 1)[1].strip()
+                        yield ("event", f"event: delete_confirm_required\ndata: {json.dumps({'tool': (event.metadata or {}).get('tool', ''), 'token': token, 'path': del_path, 'type': del_type}, ensure_ascii=False)}\n\n")
+                    else:
+                        meta = event.metadata or {}
+                        yield ("event", f"event: tool_result\ndata: {json.dumps({'tool': meta.get('tool', ''), 'content': event.content}, ensure_ascii=False)}\n\n")
                 elif event.type == "retry":
                     # LLM 调用重试通知 — 前端展示 "重试中 (1/3)..."
                     meta = event.metadata or {}
@@ -638,10 +471,12 @@ async def _collaborate_stream(req: ChatRequest):
                     # 上下文用量通知 — 前端环形指示器展示（多智能体模式下带角色）
                     yield ("event", f"event: context_usage\ndata: {json.dumps({**(event.metadata or {}), 'role': event.role}, ensure_ascii=False)}\n\n")
                 elif event.type == "done":
+                    _persist_assistant()
                     yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
                     yield ("done", None)
                     return
         except Exception as e:
+            _persist_assistant()
             yield ("event", f"event: error\ndata: {json.dumps({'content': str(e), 'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
             yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
             yield ("done", None)
@@ -663,6 +498,10 @@ async def _collaborate_stream(req: ChatRequest):
 
     try:
         while True:
+            # 用户中断：客户端断开连接时立即停止消费并取消后台 producer，
+            # 终止后续 LLM/工具轮次，节省 token（不断开则正常继续）
+            if await request.is_disconnected():
+                break
             try:
                 item_type, item_data = await asyncio.wait_for(
                     event_queue.get(),
@@ -722,6 +561,259 @@ async def get_messages(conversation_id: str, limit: int = 100):
     store = get_store()
     messages = store.get_messages(conversation_id, limit=limit)
     return {"conversation_id": conversation_id, "messages": messages}
+
+
+def _normalize_vertical_text(text: str) -> str:
+    """竖排文本规范化 — 防御性修复被按 token 打散成\"每行极短\"的回复。
+
+    成因：个别 LLM（尤其推理模型在流式/非流式切换时）会产出每 token 换行的
+    畸形 content，被原样持久化后，marked（breaks:true）把每个换行渲染为 <br>，
+    导致中文逐词竖排。这里在写入历史前做一次兜底。
+
+    策略：不整段暴力合并（那会破坏列表/标题/代码块），而是**按连续短行簇**
+    局部合并——凡一段文本内连续 ≥ 阈值的短行（≤4 字，多为被拆散的 token），
+    且不含 markdown 块级标记（#/|/-/*/>/行号/```），就把这一簇合并为一行，
+    保持长行与块结构原样，避免误伤。
+
+    Returns: 规整后的文本（不匹配时原样返回）。
+    """
+    if not text:
+        return text
+
+    # 属于块级 markdown 结构的行，作为\"硬边界\"不参与合并
+    def _is_block_marker(line: str) -> bool:
+        return bool(line.strip()) and (
+            line.strip().startswith(("#", "|", "- ", "* ", "+ ", ">", "```"))
+            or (len(line.strip()) >= 2 and line.strip()[0].isdigit() and line.strip()[1] == ".")
+        )
+
+    out_lines: list[str] = []
+    i = 0
+    lines = text.split("\n")
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip() or _is_block_marker(line):
+            out_lines.append(line)
+            i += 1
+            continue
+        # 收集从 i 开始的连续短行簇
+        j = i
+        cluster: list[str] = []
+        while j < n:
+            l = lines[j]
+            if not l.strip():
+                break
+            if _is_block_marker(l):
+                break
+            if len(l.strip()) > 4:
+                break
+            cluster.append(l.strip())
+            j += 1
+        if len(cluster) >= 4:
+            # 连续短行簇：是打散的碎片，合并为一行（去多余空白直接相接）
+            out_lines.append("".join(cluster))
+            i = j
+        else:
+            # 不足以判定为碎片，作为普通行保留
+            out_lines.append(line)
+            i += 1
+    # 第二道兜底：合并"空行分隔的短碎片簇"（逐词/短语一行且行间插空行的竖排）
+    merged = _normalize_blank_split_fragments("\n".join(out_lines))
+    # 第三道兜底：重建被打散的 markdown 表格（还原为可渲染 <table> 的标准表）
+    return _rebuild_scrambled_tables(merged)
+
+
+def _normalize_blank_split_fragments(text: str) -> str:
+    """处理另一种竖排形态：把连续词/短语一个一行、行间插入空行。
+
+    成因：个别 LLM 在流式输出时逐 token 打散并额外补换行，正文被拆成
+    “短语 + 空行 + 短语 + 空行…”，常把 `占` / `位`、`14` / `条`、`100` / `%`
+    乃至把 `-**位置**` 列表项挤到正文里。这里把"一段连续短实体行(每行非块、
+    非空、≤60字)"收集为簇，若 ≥3 行则合并为一行，恢复横排。
+
+    已用 113 列表项 / 53 表格行 / 35 标题项实测：块级结构完整保留不破坏。
+    """
+    if not text:
+        return text
+
+    def _is_block(l: str) -> bool:
+        s = l.strip()
+        if not s:
+            return False
+        if s.startswith(("#", "|", "-", ">", "```")) or s.startswith("*") or s.startswith("+"):
+            return True
+        if set(s) <= set("*-=_"):
+            return True  # --- 分隔线
+        return len(s) >= 2 and s[0].isdigit() and s[1] == "."
+
+    lines = text.split("\n")
+    n = len(lines)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        l = lines[i]
+        s = l.strip()
+        if s == "" or _is_block(l):
+            out.append(l)
+            i += 1
+            continue
+        j = i
+        rows: list[str] = []
+        while j < n:
+            lj = lines[j]
+            sj = lj.strip()
+            if sj == "":
+                j += 1
+                continue
+            if _is_block(lj):
+                break
+            if len(sj) > 60:
+                break
+            rows.append(sj)
+            j += 1
+        if len(rows) >= 3:
+            out.append("".join(rows))
+            i = j
+        else:
+            out.append(l)
+            i += 1
+    return "\n".join(out)
+
+
+def _is_table_separator(s: str) -> bool:
+    """是否 markdown 表格分隔线，如 |---|---|（被打散的表格碎片也含 | 和 -）。"""
+    if not s or "|" not in s:
+        return False
+    return set(s) <= set("|- ")
+
+
+def _parse_scrambled_table(lines: list[str]) -> str | None:
+    """把"竖线分隔+词内拆分"的表格碎片重组为 markdown 表格；失败返回 None。
+
+    成因：LLM 输出时把 `| 章节 | 估算字数 |` 打散成逐格一行（`|` / `章节` / ` |` …），
+    并夹带词内拆分（`估算`+`字数`、`≈`+`420`、` **`+`超`+`**`）。这里按"竖线为列界、
+    行首 `|` 与行尾 ` |` 用前导空格区分"重组为标准表格，使其被前端 marked 识别为 <table>。
+    """
+    rows: list[list[str]] = []
+    row: list[str] = []
+    cur: list[str] = []
+    saw_sep = False
+    for raw in lines:
+        r = raw.rstrip("\n")
+        s = r.strip()
+        if not s:
+            continue
+        if s == "|":  # 既可能是行首 "|"，也可能是单元格边界 " |"
+            if r.startswith(" "):  # 行尾边界 " |"
+                if cur:
+                    row.append("".join(cur)); cur = []
+            else:  # 行首 "|"
+                if cur:
+                    row.append("".join(cur)); cur = []
+                if row:
+                    rows.append(row); row = []
+            continue
+        if _is_table_separator(s):  # 分隔线 "|---|---"
+            if cur:
+                row.append("".join(cur)); cur = []
+            if row:
+                rows.append(row); row = []
+            saw_sep = True
+            continue
+        cur.append(s)  # 单元格文本（跨行合并词内碎片）
+    if cur:
+        row.append("".join(cur))
+    if row:
+        rows.append(row)
+    if not saw_sep or not rows:
+        return None
+    # 表头 = 首个 row，剔除前置说明长句（>40 的 prose 单元格）
+    header = [cell.strip() for cell in rows[0] if cell and len(cell) <= 40]
+    if len(header) < 2:
+        return None
+    cols = len(header)
+    tbl = ["| " + " | ".join(header) + " |", "|" + ("---|" * cols).rstrip("|") + "|"]
+    for rawrow in rows[1:]:
+        rr = [cell.strip() for cell in rawrow]
+        while len(rr) > cols:  # 词内拆分使格数偏多，合并行末碎片（如 "**"）
+            rr[-2] = rr[-2] + rr[-1]
+            rr = rr[:-1]
+        if len(rr) == cols:
+            tbl.append("| " + " | ".join(rr) + " |")
+    return "\n".join(tbl)
+
+
+def _rebuild_scrambled_tables(text: str) -> str:
+    """在归一化文本上，把被打散的表格碎片重建为标准 markdown 表格。"""
+    if not text:
+        return text
+    lines = text.split("\n")
+    n = len(lines)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        cluster: list[str] = []
+        saw_sep = False
+        blanks = 0
+        j = i
+        while j < n and lines[j].strip() == "":
+            j += 1
+        st = j
+        while j < n:
+            lj = lines[j]
+            s = lj.strip()
+            if s == "":
+                blanks += 1
+                if blanks >= 2 and cluster:
+                    break
+                j += 1
+                continue
+            if s.startswith("#") or s.startswith("```"):
+                break
+            if not s.startswith("|") and len(s) > 60:  # 前置/正文长句不入簇
+                break
+            cluster.append(lj)
+            blanks = 0
+            if _is_table_separator(s):
+                saw_sep = True
+            j += 1
+        if len(cluster) >= 4 and saw_sep:
+            tbl = _parse_scrambled_table(cluster)
+            if tbl:
+                out.append(tbl)
+                i = j
+                continue
+        if j > st:
+            out.extend(lines[st:st + 1])
+            i = st + 1
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
+def _replace_nth_data_placeholder(text: str, nth: int, value: str) -> tuple[str, int]:
+    """把文本中第 nth 个【数据】占位直接替换为 value（nth 为 0-based）。
+
+    Args:
+        nth: 0 起计数，即第几个【数据】占位。
+    Returns:
+        (替换后的文本, 实际替换次数)。
+    """
+    import re as _re
+
+    pat = _re.compile(_re.escape("【数据】"))
+    count = 0
+    def _rep(m: "_re.Match") -> str:
+        nonlocal count
+        if count == nth:
+            count += 1
+            return value
+        count += 1
+        return m.group(0)
+    replaced = pat.sub(_rep, text)
+    return replaced, (1 if count > nth else 0)
 
 
 def _context_usage_payload(agent) -> dict:
@@ -819,6 +911,81 @@ def _review_project(conversation_id: Optional[str] = None) -> "PaperProject":
     return PaperProject(ws)
 
 
+class ExportDocxRequest(BaseModel):
+    conversation_id: Optional[str] = Field(None, description="要导出的对话草稿 ID；缺省回退工作区旧稿")
+
+
+@app.post("/api/review/export-docx")
+async def review_export_docx(req: ExportDocxRequest):
+    """导出 Word — 把成稿审阅的全部有效章节按大纲顺序拼接后转 .docx
+
+    与前端成稿审阅的归并规则保持一致：跳过 `_preamble` 与纯数字标题章节，
+    其内容并入首个有效章节；导出内容 = 左侧所有完整章节正文，而非右侧单章。
+    """
+    import re as _re
+    import tempfile
+
+    from sage.paper_export import to_docx
+
+    project = _review_project(req.conversation_id)
+    try:
+        project.load()
+    except Exception as e:
+        logger.warning("导出草稿加载失败: %s", e)
+
+    tree = list(project.review_tree() or [])
+    # 归并无意义章节：与前端 loadDraft 一致
+    useful: list[dict] = []
+    carry = ""
+    for s in tree:
+        title = str(s.get("title") or "").strip()
+        if s.get("key") == "_preamble" or _re.fullmatch(r"\d+", title):
+            if s.get("content"):
+                carry = (carry + "\n\n" if carry else "") + s["content"]
+            continue
+        useful.append(s)
+    if carry and useful:
+        useful[0]["content"] = carry + "\n\n" + (useful[0].get("content") or "")
+
+    if not useful:
+        raise HTTPException(status_code=404, detail="当前工作区还没有可导出的论文草稿")
+
+    parts: list[str] = []
+    for s in useful:
+        c = s.get("content") or ""
+        parts.append((f"## {title}\n\n{c}" if (title := str(s.get("title") or "").strip()) else c))
+    draft = "\n\n".join(parts)
+
+    # 文件名：优先取首章标题或成稿文件名，兜底「论文成稿」
+    stem = Path(project._draft_path).stem
+    fname = stem if stem and stem != "paper" else (useful[0].get("title") or "论文成稿")
+
+    fd, tmp = tempfile.mkstemp(suffix=".docx")
+    os.close(fd)
+    tmp_path = Path(tmp)
+    try:
+        # 先完整写出 .docx，再读为 bytes 返回，避免 FileResponse 在 finally 清理前尚未发送
+        await asyncio.to_thread(to_docx, draft, tmp_path)
+        data = await asyncio.to_thread(tmp_path.read_bytes)
+        from fastapi.responses import Response
+
+        # RFC 5987：filename* 用 UTF-8 百分号编码，支持中文文件名
+        from urllib.parse import quote
+
+        ascii_name = (fname or "export").encode("ascii", "ignore").decode() or "export"
+        content_disposition = (
+            f"attachment; filename=\"{ascii_name}.docx\"; "
+            f"filename*=UTF-8''{quote(f'{fname}.docx')}"
+        )
+        return Response(
+            data,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": content_disposition},
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 class DetectAIRequest(BaseModel):
     text: str = Field(..., description="要检测 AI 痕迹的文本")
 
@@ -890,6 +1057,8 @@ async def review_rewrite(req: RewriteRequest):
     if not rewritten:
         raise HTTPException(status_code=502, detail="LLM 改写无返回，请重试")
 
+    # 版本快照：改写前自动存档，便于回滚
+    project.snapshot(f"改写 {req.section_key}")
     section.content = rewritten
     project.finalize()
     return {
@@ -909,13 +1078,12 @@ class DataFillRequest(BaseModel):
 
 @app.post("/api/review/data-fill")
 async def review_data_fill(req: DataFillRequest):
-    """数据回填 — 将章节内某处【数据】占位替换为真实数据，并调用 LLM 重生成结果描述
+    """数据回填 — 将章节内某处【数据】占位直接替换为真实数据（纯字符串替换，不走 LLM）
 
-    锁定章节拒绝回填。改写后写回章节并落盘。
+    锁定章节拒绝回填。替换后写回章节并落盘。
     """
     from sage.paper_project import PaperProject
     from sage.paper_data import find_data_placeholders
-    import asyncio as _asyncio
 
     ws = _current_workspace()
     project = _review_project(req.conversation_id)
@@ -929,43 +1097,19 @@ async def review_data_fill(req: DataFillRequest):
         raise HTTPException(status_code=404, detail=f"章节不存在或为空: {req.section_key}")
 
     placeholders = list(find_data_placeholders(section.content))
-    if req.placeholder_index >= len(placeholders):
-        raise HTTPException(status_code=404, detail=f"章节内没有第 {req.placeholder_index + 1} 处【数据】占位")
-    ph = placeholders[req.placeholder_index]
+    # req.placeholder_index 是节内第 N 处（1-based），转 0-based 下标
+    if not (1 <= req.placeholder_index <= len(placeholders)):
+        raise HTTPException(status_code=404, detail=f"章节内没有第 {req.placeholder_index} 处【数据】占位")
+    idx0 = req.placeholder_index - 1
 
-    agent, _ = _get_or_create_agent()
-    prompt = (
-        "你是学术论文写作助手。原文某处使用了【数据】占位（因为写作时真实数据未知）。"
-        "现在用户提供了真实数据，请重写数据所在的整个段落（或最接近的完整句子群），"
-        "把【数据】替换为真实数据，并相应改写结果描述/讨论，使其与数据一致、表述学术规范。\n\n"
-        "要求：\n"
-        "1. 不改变段落之外的上下文与引用编号\n"
-        "2. 只输出改写后的段落文本\n\n"
-        f"占位上下文：\n{ph.context}\n\n"
-        f"用户提供的真实数据：\n{req.value}"
-    )
-    messages = [
-        {"role": "system", "content": "你是严谨的学术论文写作助手，只输出改写后的段落。"},
-        {"role": "user", "content": prompt},
-    ]
-    new_para = await _asyncio.to_thread(
-        lambda: agent.llm.chat(messages, temperature=0.3, max_tokens=min(agent.llm.max_tokens or 8192, 4096))
-    )
-    new_para = (new_para or "").strip()
-    if not new_para:
-        raise HTTPException(status_code=502, detail="LLM 重写无返回，请重试")
+    # 数据回填：直接字符串替换第 idx0 个占位（节内第 req.placeholder_index 处），不再调用 LLM
+    new_content, n_replaced = _replace_nth_data_placeholder(section.content, idx0, req.value)
+    if n_replaced == 0:
+        raise HTTPException(status_code=500, detail="未在原文中找到可替换的占位")
 
-    # 在原文中替换占位所在段落
-    replaced = False
-    paragraphs = section.content.split("\n\n")
-    for i, para in enumerate(paragraphs):
-        if "[数据]" in para or "【数据】" in para:
-            paragraphs[i] = new_para
-            replaced = True
-            break
-    if not replaced:
-        raise HTTPException(status_code=500, detail="未在原文中找到可替换的占位段落")
-    section.content = "\n\n".join(paragraphs)
+    # 版本快照：数据回填前自动存档，便于回滚
+    project.snapshot(f"数据回填 {req.section_key}")
+    section.content = new_content
     project.finalize()
     return {
         "success": True,
@@ -996,6 +1140,8 @@ async def review_revise(req: ReviseRequest):
     section = next((s for s in project.outline if s.key == req.section_key), None)
     if section is None:
         raise HTTPException(status_code=404, detail=f"章节不存在: {req.section_key}")
+    # 版本快照：修订前自动存档，便于回滚
+    project.snapshot(f"修订 {req.section_key}")
     section.content = req.content or ""
     project.finalize()
     return {"success": True, "section_key": req.section_key, "word_count": len(section.content)}
@@ -1023,6 +1169,67 @@ async def review_lock(req: LockRequest):
     if not ok:
         raise HTTPException(status_code=404, detail=f"章节不存在: {req.section_key}")
     return {"success": True, "section_key": req.section_key, "locked": req.locked}
+
+
+class VersionListRequest(BaseModel):
+    conversation_id: Optional[str] = None
+
+
+@app.get("/api/review/versions")
+async def review_versions(conversation_id: Optional[str] = None):
+    """版本历史 — 列出当前草稿的全部快照（新→旧），含原因/时间/字数）"""
+    project = _review_project(conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    return {"success": True, "versions": project.list_snapshots()}
+
+
+class VersionRestoreRequest(BaseModel):
+    conversation_id: Optional[str] = None
+    version_id: str = Field(..., description="要恢复的版本快照 id（文件名）")
+
+
+@app.post("/api/review/versions/restore")
+async def review_version_restore(req: VersionRestoreRequest):
+    """版本恢复 — 用指定快照覆盖当前草稿并落盘"""
+    project = _review_project(req.conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    ok = project.restore_snapshot(req.version_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"版本快照不存在或无效: {req.version_id}")
+    return {"success": True, "version_id": req.version_id}
+
+
+class CitationVerifyRequest(BaseModel):
+    conversation_id: Optional[str] = None
+
+
+@app.post("/api/review/verify-references")
+async def review_verify_references(req: CitationVerifyRequest):
+    """引用真实性硬校验 — 对当前草稿的参考文献逐条 CrossRef/维普/万方验证
+
+    编造引用是学术写作最致命的失信点。此端点为确定性校验（不依赖 LLM），
+    结果持久化到 paper_project.json，审阅页可随时重新验证。
+    """
+    from sage.citation_verify import verify_references
+
+    project = _review_project(req.conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    report = await verify_references(project.read_draft(), workspace=project.workspace)
+    project.citation_report = report.to_dict()
+    project.save()
+    return {"success": True, **report.to_dict()}
+
+
+@app.get("/api/review/citation-report")
+async def review_citation_report(conversation_id: Optional[str] = None):
+    """读取最近一次引用验证报告（不重新联网验证）"""
+    project = _review_project(conversation_id)
+    if not project.load():
+        raise HTTPException(status_code=404, detail="工作区没有可审阅的草稿")
+    return {"success": True, "report": project.citation_report or None}
 
 
 @app.get("/api/review/drafts")
@@ -1074,6 +1281,43 @@ async def review_drafts():
             })
     items.sort(key=lambda x: x["updated_at"] or "", reverse=True)
     return {"drafts": items}
+
+
+class FixVerticalMessagesRequest(BaseModel):
+    conversation_id: Optional[str] = Field(None, description="要修复的对话 ID；缺省修复全部对话")
+    dry_run: bool = False
+
+
+@app.post("/api/review/fix-vertical-messages")
+async def review_fix_vertical_messages(req: FixVerticalMessagesRequest):
+    """修复历史消息竖排 — 对 assistant 消息应用竖排规范化并落库
+
+    个别 LLM 会产出\"每 token 换行\"的畸形回复，导致历史记录逐词竖排。
+    此端点遍历（指定或全部）对话的 assistant 消息，用 _normalize_vertical_text
+    规整后写回。返回修复条数（dry_run=True 时不写库，仅报告将修复哪些）。
+
+    不改变输入接口与其它逻辑，仅用于历史数据补救。
+    """
+    from sage.memory.store import get_store
+
+    store = get_store()
+    convs = store.list_conversations(limit=10000)
+    targets = [c["id"] for c in convs] if not req.conversation_id else [req.conversation_id]
+
+    fixed = 0
+    repaired_list: list[dict] = []
+    for cid in targets:
+        for m in store.get_messages(cid, limit=100000):
+            if m.get("role") != "assistant":
+                continue
+            raw = m.get("content") or ""
+            norm = _normalize_vertical_text(raw)
+            if norm != raw:
+                repaired_list.append({"conversation_id": cid, "message_id": m.get("id"), "old_len": len(raw), "new_len": len(norm)})
+                fixed += 1
+                if not req.dry_run:
+                    store.update_message_content(m["id"], norm)
+    return {"success": True, "dry_run": req.dry_run, "conversations": len(targets), "fixed": fixed, "entries": repaired_list}
 
 
 @app.delete("/conversations/{conversation_id}")
@@ -1657,7 +1901,7 @@ def _stream_download_hf_model(model_type: str, retry_mode: str = "resume"):
     yield emit("info", 0, "正在获取文件列表...")
 
     try:
-        from huggingface_hub import list_repo_files, hf_hub_download, hf_hub_url
+        from huggingface_hub import list_repo_files, hf_hub_download
         import httpx
         import tempfile
         import shutil
@@ -3379,7 +3623,7 @@ class SageFormatRefsRequest(BaseModel):
 
 
 class SagePlagiarismRequest(BaseModel):
-    """查重检测请求"""
+    """查重检测请求（与本地文献库的重复比对）"""
     content: str = Field(..., description="要检测的论文内容")
     threshold: float = Field(default=0.8, description="相似度阈值（0-1）")
 
@@ -3504,7 +3748,7 @@ async def sage_format_references(req: SageFormatRefsRequest):
 
 @app.post("/api/sage/check-plagiarism")
 async def sage_check_plagiarism(req: SagePlagiarismRequest):
-    """查重检测，识别与已索引文献库的重复内容"""
+    """与本地文献库的重复比对（仅比对上传文献，不联网、非全网查重）"""
     ops = _get_paper_ops()
     result = await ops.check_plagiarism(content=req.content, threshold=req.threshold)
     return {

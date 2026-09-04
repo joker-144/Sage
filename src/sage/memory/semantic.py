@@ -122,7 +122,7 @@ class SemanticMemory:
         替代原先逐行 np.dot/norm 的 Python 循环（记忆量大时慢数量级）。
 
         Args:
-            query: 当前用户问题的 Embedding 查询
+            query: 当前用户问题的原始文本（内部会先转为 Embedding 向量再检索）
             top_k: 返回条数
         """
         try:

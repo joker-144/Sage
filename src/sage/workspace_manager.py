@@ -760,6 +760,20 @@ class WorkspaceStore:
         )
         self._conn.commit()
 
+    def count_indexed(self) -> tuple[int, int]:
+        """统计当前库中已索引的文件数与块数（用于增量索引完成提示）
+
+        Returns:
+            (files, chunks)：distinct 文件数、索引块总数
+        """
+        file_row = self._conn.execute(
+            "SELECT COUNT(DISTINCT file_path) FROM file_index"
+        ).fetchone()
+        chunk_row = self._conn.execute(
+            "SELECT COUNT(*) FROM file_index"
+        ).fetchone()
+        return (int(file_row[0] or 0), int(chunk_row[0] or 0))
+
     def load_all_embeddings(self) -> list[dict]:
         """加载所有向量（供向量搜索）"""
         rows = self._conn.execute(
@@ -1029,7 +1043,18 @@ class IndexTaskManager:
             task["status"] = "done"
             task["stats"] = stats
             task["finished_at"] = datetime.now().isoformat()
-            task["message"] = f"索引完成：{stats['files']} 个文件，{stats['chunks']} 个块"
+            # 统计当前库中实际有效的索引（增量场景下未修改的文件仍保留旧索引）
+            indexed_files, indexed_chunks = store.count_indexed()
+            if stats["files"] > 0:
+                task["message"] = (
+                    f"索引完成：本次新增 {stats['files']} 个文件、{stats['chunks']} 个块，"
+                    f"跳过 {stats['skipped']} 个未修改；库中共 {indexed_files} 个文件（{indexed_chunks} 个块）"
+                )
+            else:
+                task["message"] = (
+                    f"索引完成：{indexed_files} 个文件（{indexed_chunks} 个块）均已是最新索引，"
+                    f"无需重新索引"
+                )
             await self._emit(ws_id, {
                 "type": "done",
                 "stats": stats,
