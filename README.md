@@ -2,7 +2,7 @@
 
 > 面向 **SCI / SSCI / CSSCI / EI** 等高水平期刊与会议的论文写作辅助系统，由 8 个专业智能体协同完成从选题、文献调研、方法设计、撰写、引用管理到审校核查的完整写作流程。
 
-**当前版本：1.2.2** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
+**当前版本：1.2.5** · Python ≥ 3.11 · Windows / macOS / Linux / Electron 桌面端
 
 ***
 
@@ -44,7 +44,7 @@
 
 ## 核心特性
 
-- **写作模式（智能选择流程）**：内置意图分析结构（规则快速判断 + LLM 精细分析），简单任务自动路由到匹配角色 Agent 或通用助手，复杂任务启动 8 智能体完整协作流程，兼顾效率与质量。
+- **统一对话链路**：所有对话（不再区分单 Agent / 写作模式入口）统一经意图分析路由——**长输入（≥30 字）用 LLM 主判、短输入用规则快判**，简单任务路由到匹配角色 Agent 或通用助手，复杂任务自动启动 8 智能体完整协作流程，`mode` 字段已废弃。高风险任务（复杂 / 低置信度）在执行前会经**意图确认闸门**回显意图供用户确认或纠正，避免误执行。
 
 - **多智能体协作**：8 个角色分工（主编 / 文献调研员 / 方法论专家 / 撰写员 / 引用管理员 / 整理汇报员 / 审校核查员 / 修订员），采用"主编动态调度 + 批次并行执行"协作模式。
 
@@ -78,7 +78,7 @@
 
 - **修订保留率校验**：多轮修订闭环中若 LLM 产出大幅缩水（字数 < 修订前原文 70%），判定为截断/遗漏并拒绝覆盖旧草稿，给出告警而非静默丢内容。
 
-- **可靠性加固（多轮代码审查修复）**：上下文压缩采用滚动摘要（历史摘要并入新摘要，不丢失早期决策）；工具去重缓存随写操作失效（`write_file`/`edit_file`/`delete_file` 后清缓存，杜绝读到过期内容）；并行批次单队列 FIFO 真流式转发、异常自动取消剩余任务；阻塞操作（搜索、版本安装、会话记忆保存）全部移出事件循环；SQLite 单例加写锁 + WAL 并发安全；工具执行按类型超时（检索 30s / 解析 120s，超时返回错误让 LLM 换路径）；网络抓取带 SSRF 防护与 2MB 限量读取；LLM 错误分类边界匹配（状态码不再误命中拼接数字）。
+- **可靠性加固（多轮代码审查修复）**：上下文压缩采用滚动摘要（历史摘要并入新摘要，不丢失早期决策）；**只读工具并行执行**（`read_file`/`list_dir`/`search_literature`/联网检索等同批次 ≥2 且全为只读时并发，墙钟时间从"求和"降为"取最大"）；工具去重缓存精细化失效（写类工具按路径失效相关条目、`list_dir` 全量、无关只读结果保留，杜绝读到过期内容）；并行批次单队列 FIFO 真流式转发、异常自动取消剩余任务；阻塞操作（搜索、版本安装、会话记忆保存）全部移出事件循环；SQLite 单例加写锁 + WAL 并发安全；工具执行按类型超时（检索 30s / 解析 120s，超时返回错误让 LLM 换路径）；网络抓取带 SSRF 防护与 2MB 限量读取；LLM 错误分类边界匹配（状态码不再误命中拼接数字）；断路器按 LLM base_url 共享（同一服务商一次熔断，全员限流保护）。
 
 - **会话并发保护**：同一会话同一时刻只允许一个 SSE 请求，冲突时返回 `busy` 事件并提示"上一条消息仍在处理中"；Agent 缓存采用 LRU 淘汰，跳过运行中会话避免误删。
 
@@ -94,7 +94,7 @@
 
 - **多格式引用管理**：支持 APA / MLA / GB-T7714 / Vancouver / Chicago / IEEE 六大引用格式，自动插入与格式化。
 
-- **降 AI 味改写**：识别并改写 AI 生成文本的典型痕迹，规避 AI 检测，保留原意与引用。
+- **降 AI 味改写**：`reduce_ai_pattern` 用规则库检测 AI 典型痕迹（套话 / 句式重复 / 连接词堆砌 / 绝对化断言 / 空泛抽象词 / 机械排比），`rewrite_deai` 基于检测结果做 LLM 深度改写（句式多样化、术语具体化、保持原意与引用），规避 AI 检测。
 
 - **多工作空间管理**：按"时间戳\_领域标签"命名（如 `20260721_143022_CS-AI`），每个工作空间独立 SQLite 索引库，互不污染。
 
@@ -197,8 +197,8 @@ Sage 采用 6 层架构，自底向上：
 | **2. 开发框架层**       | `agent/loop.py`, `agent/system_prompt.py`                                             | 自研 Agentic Loop（思考 → 调用工具 → 观察结果 → 继续思考）                           |
 | **3. 记忆与上下文层**     | `memory/`, `context/`                                                                 | SQLite 持久化 + 向量 Embedding + 对话历史压缩                                 |
 | **4. 工具与集成层**      | `tools/`, `skill_system.py`                                                           | 18+ Sage 专用工具 + 技能系统 + SkillHub 远程技能下载                             |
-| **5. 多 Agent 协同层** | `agents/`, `paper_project.py`, `paper_quality.py`, `paper_data.py`, `paper_export.py` | 8 个角色智能体 + 主编动态调度 + 批次并行执行 + 共享草稿文档 + 确定性质量门 + 二次复核 + 数据占位 + 多格式导出 |
-| **6. 运维与治理层**      | `core/observability.py`, `core/resilience.py`, `core/mcp.py`                          | 可观测性 + 弹性重试 + 断路器 + MCP 协议支持                                       |
+| **5. 多 Agent 协同层** | `agents/`, `paper_project.py`, `paper_quality.py`, `paper_data.py`, `paper_export.py`, `citation_verify.py` | 8 个角色智能体 + 主编动态调度 + 批次并行执行 + 共享草稿文档 + 确定性质量门 + 二次复核 + 数据占位 + 引用真实性硬校验 + 多格式导出 |
+| **6. 运维与治理层**      | `core/observability.py`, `core/resilience.py`, `core/mcp.py`, `core/crossref.py` | 可观测性 + 弹性重试 + 断路器 + MCP 协议支持 + CrossRef 共享客户端 |
 
 ### 协作流程
 
@@ -209,11 +209,14 @@ Sage 采用 6 层架构，自底向上：
      │
      ▼
 ┌──────────────────────────────────────────┐
-│  意图分析（主编）                         │
-│  1. 规则快速判断：动词+宾语模式精细匹配   │
-│     （撰写>文献>引用>审校>修订）          │
-│  2. LLM 精细分析：不确定时调用 LLM 输出   │
-│     {complexity, role, reason}            │
+│  意图分析（主编 · 统一对话链路）          │
+│  1. 澄清回路：信息严重不足先反问澄清      │
+│  2. 长输入(≥30字) → LLM 主判             │
+│     短输入(<30字) → 规则快判（优先）      │
+│     产出 {complexity, role, reason,       │
+│           confidence:high/medium/low}     │
+│  3. 确认闸门：复杂 或 low 置信度 → 暂停   │
+│     回显意图供确认/纠正（纠正反哺记忆）   │
 └──────────────────┬───────────────────────┘
                    │
         ┌──────────┴──────────┐
@@ -284,20 +287,30 @@ Sage 采用 6 层架构，自底向上：
                      ▼                                      ▼
                      ┌──────────────────────┐  ┌──────────────────┐
                      │ 审校→修订二次复核    │  │ 直接进入下一步   │
-                     │ （上限 2 轮）        │  └────────┬─────────┘
-                     │ 修订后再跑 LLM 软复核│           │
+                     │ （上限 2 轮）：       │  └────────┬─────────┘
+                     │  修订员定点覆盖（只  │           │
+                     │  输出被修改章节）+拍  │           │
+                     │  扑无效产出；修订后  │           │
+                     │  跑 LLM 软复核       │           │
                      └──────────┬───────────┘           │
                                 └──────────┬────────────┘
                                            ▼
                      ┌────────────────────────────────────────────┐
-                     │  Step 6: 数据占位扫描 + 成稿落盘           │
+                     │  Step 6: 引用真实性硬校验（可选，不阻塞成稿）│
+                     │  verify_references 逐条 CrossRef/维普/万方   │
+                     │  （确定性、不走 LLM），报告持久化到快照       │
+                     └──────────────────┬─────────────────────────┘
+                                        │
+                                        ▼
+                     ┌────────────────────────────────────────────┐
+                     │  Step 7: 数据占位扫描 + 成稿落盘           │
                      │  paper_data.py 扫描【数据】占位生成来源建议│
                      │  PaperProject.finalize() 落盘 paper.md     │
                      └──────────────────┬─────────────────────────┘
                                         │
                                         ▼
                      ┌────────────────────────────────────────────┐
-                     │  Step 7: 多格式导出                         │
+                     │  Step 8: 多格式导出                         │
                      │  paper_export.py 自动导出 paper.tex        │
                      │  支持 LaTeX / Word 导出                    │
                      └──────────────────┬─────────────────────────┘
@@ -305,7 +318,7 @@ Sage 采用 6 层架构，自底向上：
         ┌──────────┬───────────────────┘
         │          │
         ▼          ▼
-     最终论文输出（paper.md + paper.tex）
+     最终论文输出（paper.md + paper.tex + citations.md 引用对照清单）
 ```
 
 **关键设计**：
@@ -318,11 +331,13 @@ Sage 采用 6 层架构，自底向上：
 
 - 意图分析 / 计划生成 / 大纲生成等编排环节的 LLM 调用统一带重试，失败仍回退到各自兜底（经典流水线 / 默认大纲 / 通用助手）
 
-- 共享草稿 [`PaperProject`](src/sage/paper_project.py)：各角色完整产出写入草稿，下游读全文（仅超 45000 token 预算才安全阀截断），解决"前序产出只剩 2000 字符残片"的全文一致性瓶颈
+- 共享草稿 [`PaperProject`](src/sage/paper_project.py)：各角色完整产出写入草稿，下游读全文（仅超 45000 token 预算才安全阀截断），解决"前序产出只剩 2000 字符残片"的全文一致性瓶颈；任一 worker 产出即边写边落盘，审阅视图实时可见过程版本
 
-- 确定性质量门与二次复核：[`paper_quality.py`](src/sage/paper_quality.py) 硬校验触发"审校→修订→再查"闭环（上限 2 轮），修订后 LLM 软复核二次验证
+- 确定性质量门与二次复核：[`paper_quality.py`](src/sage/paper_quality.py) 硬校验触发"审校→修订→再查"闭环（上限 2 轮）；修订采用**定点覆盖**（仅输出被修改章节，未改动章节保留原样，不整篇重建省 token），并校验产物是否含章节标题判定完整性，防止截断内容静默丢失；修订后再跑 LLM 软复核
 
-- 多轮修订路由：修订类指令（"把结论改保守"）读已有草稿修改并写回；新论文任务清空旧稿
+- 引用真实性硬校验：[`citation_verify.py`](src/sage/citation_verify.py) 对全文 `[CITE:]` 与文末条目逐条做 CrossRef/维普/万方硬校验（确定性、不走 LLM），网络失败仅标记不阻塞成稿；引用管理员产出写入 `citations.md` 引用对照清单供逐处核对
+
+- 多轮修订路由：修订类指令（"把结论改保守"）读已有草稿修改并写回；新论文任务清空旧稿；断点续写（"继续写"）基于已有草稿续写未完成章节
 
 - LLM 调用重试通过 SSE `retry` 事件透传，全过程对用户可见
 
@@ -330,23 +345,33 @@ Sage 采用 6 层架构，自底向上：
 
 ## 写作模式
 
-写作模式（`mode=writing`）是 Sage 的核心工作模式，采用**意图分析 → 智能路由**的分层架构，根据任务复杂度自动选择单 Agent 或多智能体协作流程，兼顾效率与质量。
+写作模式是 Sage 的核心工作模式，采用**意图分析 → 智能路由**的统一分层架构：所有对话（普通对话与论文写作都走同一入口）都先分析意图，简单任务路由到单个角色 Agent，复杂任务自动切换多智能体协作流程，兼顾效率与质量。
 
-### 意图分析结构
+### 统一对话链路与意图分析
 
-意图分析由 [`AgentOrchestrator._analyze_intent()`](src/sage/agents/orchestrator.py) 实现，采用**规则 + LLM 混合**两阶段策略：
+所有对话统一走[`_collaborate_stream`](src/sage/api.py)（`/chat/stream`），先做意图分析再路由（`mode` 字段已废弃）。分析由 [`AgentOrchestrator._analyze_intent()`](src/sage/agents/orchestrator.py) 实现，按输入长度选择策略并产出**意图置信度**：
 
-#### 第一层：规则快速判断（`_quick_classify`）
+| 策略 | 适用 | 说明 |
+| --- | --- | --- |
+| **规则快速判断** `_quick_classify` | 短输入（<30 字）优先 | 毫秒级规则匹配，命中则 `confidence=high` |
+| **LLM 精细分析** `_analyze_intent_with_llm` | 长输入（≥30 字）主判 | 长输入易被规则误命中，交由 LLM；规则兜底 |
+| **降级兜底** | 任一策略失败 | 降级为复杂任务，`confidence=low`（触发确认闸门） |
 
-无需 LLM 调用，毫秒级响应，按优先级依次匹配：
+**置信度**（`IntentResult.confidence`）：`high`（规则命中）/ `medium`（LLM 判定）/ `low`（降级兜底）。低置信度与复杂任务 → 触发[意图确认闸门](#意图确认闸门)。
+
+#### 规则快速判断（`_quick_classify`）
+
+按优先级依次匹配：
 
 | 优先级 | 判断规则                                      | 路由结果              |
 | --- | ----------------------------------------- | ----------------- |
-| 1   | 包含完整论文写作关键词（完整论文/多章节/SCI/SSCI/毕业论文/开题报告等） | 复杂任务 → 多智能体协作     |
-| 2   | 动词+宾语模式精细匹配（`_match_role_by_patterns`）    | 简单任务 → 匹配角色 Agent |
-| 3   | 问候/简单对话（你好/谢谢等）                           | 简单任务 → 通用助手       |
-| 4   | 短问题（<30字）兜底匹配                             | 简单任务 → 匹配角色 Agent |
-| —   | 其他不确定情况                                   | 交给第二层 LLM 分析      |
+| 1   | 修订意图（修改/润色 + 论文/内容/段落等）                 | 简单任务 → 修订员 debugger |
+| 2   | 论文局部写作（论文的摘要/目录/第N章等）                  | 简单任务 → 撰写员 coder   |
+| 3   | 完整论文写作关键词（完整论文/多章节/SCI/SSCI/开题报告等）    | 复杂任务 → 多智能体协作     |
+| 4   | 动词+宾语模式精细匹配（`_match_role_by_patterns`）    | 简单任务 → 匹配角色 Agent |
+| 5   | 问候/简单对话（你好/谢谢等）                           | 简单任务 → 通用助手       |
+| 6   | 短问题（<30字）兜底匹配（关键词命中具体角色时）            | 简单任务 → 匹配角色 Agent |
+| —   | 其他不确定情况                                   | 交给 LLM 分析          |
 
 **动词+宾语模式匹配**（`_match_role_by_patterns`）按以下优先级精细分配智能体，避免"文献调研"等前缀干扰真实写作意图：
 
@@ -358,9 +383,9 @@ Sage 采用 6 层架构，自底向上：
 | 4   | 审校任务（审校/审查/核查 + 逻辑/规范/质量）    | reviewer（审校核查员）   |
 | 5   | 修订任务（修改/修订/润色 + 论文/内容/段落）    | debugger（修订员）     |
 
-#### 第二层：LLM 精细分析（`_analyze_intent_with_llm`）
+#### LLM 精细分析（`_analyze_intent_with_llm`）
 
-规则无法确定时调用 LLM（不带工具，`max_tokens=200`），输出结构化 JSON：
+调用 LLM（不带工具，`max_tokens=200`）输出结构化 JSON，并按规则校验 `complexity` / `role`（complex 强制 `role=supervisor`）：
 
 ```json
 {
@@ -370,7 +395,11 @@ Sage 采用 6 层架构，自底向上：
 }
 ```
 
-LLM 分析失败时降级为复杂任务（多智能体兜底，确保不漏），不中断服务。
+此路径会从语义记忆**反哺召回**过往的[意图纠正](#意图确认闸门)记录（`intent_correction`），提示 LLM 避免重复误判。分析失败时降级为复杂任务（多智能体兜底，确保不漏）。LLM 独特之处：长输入可能被规则误命中，故 `len>=30` 时优先 LLM 主判。
+
+#### 澄清回路
+
+信息严重不足（极短，或"帮我写论文"这种无主题裸请求）时先反问澄清，而非盲目开工。
 
 ### 路由结果
 
@@ -379,19 +408,33 @@ LLM 分析失败时降级为复杂任务（多智能体兜底，确保不漏）�
 | **简单任务** | 由意图分析选择匹配角色 Agent 处理，无匹配时用通用助手兜底      | "帮我检索 Transformer 相关文献" → literature |
 | **复杂任务** | 主编用 LLM 生成动态执行计划，按批次并行调度子智能体，最终执行质量检查 | "写一篇关于注意力机制的完整论文"                    |
 
+> **确认闸门触发**：凡被判定为复杂任务，或意图分析为 `low` 置信度降级兜底的高风险任务，需先经[意图确认闸门](#意图确认闸门)由用户确认/纠正后才会真正执行。
+
 ### 前端交互
 
-写作模式通过前端按钮切换（默认关闭，点击开启），开启后：
+所有对话统一经意图分析路由（无需手动切换写作模式）：
 
-- 用户发送消息时携带 `mode=writing` 参数
-
-- 主编先进行意图分析，过程通过 `reflection` 事件展示：`[主编] 反思: 意图分析结果: 简单任务 → 文献调研员`
+- 主编先进行意图分析，过程通过 `reflection` 事件展示：`意图分析结果: 简单任务 → 文献调研员`
 
 - 简单任务的回复带角色前缀：`**[文献调研员]** 内容`
 
 - 复杂任务由主编生成执行计划，通过 `reflection` 事件展示计划内容（如"批次1: 文献调研员 + 方法论专家（并行）"），每个子智能体的进度通过 `collaborate` 事件实时展示
 
 - LLM 调用重试通过 `retry` 事件实时反馈，状态栏显示`[角色名] 重试中 (1/3)，2.0秒后重试...`，工具区展示橙色重试卡片
+
+### 意图确认闸门
+
+对**高风险任务**（复杂任务，或置信度为 `low`——即 LLM 意图分析失败后的降级兜底）在执行前暂停，弹出[`IntentConfirm`](web/src/components/IntentConfirm.vue) 对话框，在用户操作前**不执行任何任务**：
+
+- 对话框回显主编分析出的**意图结论**（任务复杂度 / 匹配角色 / 置信度 / 判断理由），用户可：
+
+  - **确认继续**——按当前意图执行
+  - **纠正**——修改「角色 / 复杂度」并补充说明，触发重新分析（形成纠错闭环）
+  - **取消**——放弃本次任务
+
+- 闸门通过 `intent_confirm_required` SSE 事件触发；已确认 / 显式指定 `force_role` / `force_complexity` / `auto_confirm` 时跳过，避免确认后死循环
+
+- **意图纠正反哺**：用户在闸门处的纠正会记录为 `intent_correction`（写库 + 语义记忆，形成用户画像），供后续意图分析召回，让系统"记住"你的偏好，越用越准（零额外 LLM 调用）
 
 ### 思考内容与 token 显示
 
@@ -483,7 +526,7 @@ ToolCall.vue (渲染橙色 llm_retry 卡片：↻ 图标 + 尝试次数 + 错误
 | **literature-index**   | 文献向量索引、语义检索、引用管理、查重检测                                                    | `index_papers`, `search_literature`, `extract_references`, `insert_citation`, `format_references`, `check_plagiarism` |
 | **writing-assistant**  | 大纲生成、段落撰写、学术润色、逻辑检查                                                      | `generate_outline`, `write_paragraph`, `polish_academic`, `check_logic`                                               |
 | **external-search**    | Google Scholar / arXiv / CrossRef / Semantic Scholar 外部学术检索，含 CNKI 元数据认证 | `search_scholar`, `search_arxiv`, `search_crossref`, `search_semantic_scholar`, `search_cnki`                         |
-| **ai-pattern-reducer** | 降 AI 味改写，规避 AI 检测                                                        | `reduce_ai_pattern`                                                                                                   |
+| **ai-pattern-reducer** | 降 AI 味改写，规避 AI 检测                                                        | `reduce_ai_pattern`, `rewrite_deai`                                                                              |
 
 技能加载通过 [`sage.skill_system.SkillLoader`](src/sage/skill_system.py) 实现，远程技能搜索/下载通过内置的 [`sage.skill_hub_client.SkillHubClient`](src/sage/skill_hub_client.py)（不依赖外部 CLI）。
 
@@ -525,11 +568,13 @@ ToolCall.vue (渲染橙色 llm_retry 卡片：↻ 图标 + 尝试次数 + 错误
 
 - `generate_outline` / `write_paragraph` / `polish_academic` / `check_logic` — 写作辅助
 
-- `reduce_ai_pattern` — 降 AI 味改写
+- `reduce_ai_pattern` / `rewrite_deai` — 降 AI 味检测（规则库）与深度改写（LLM，可基于检测结果）
 
-- `search_scholar` / `search_arxiv` / `search_crossref` / `search_semantic_scholar` — 外部学术检索
+- `search_scholar` / `search_arxiv` / `search_crossref` / `search_crossref_by_query` / `search_semantic_scholar` — 外部学术检索（`search_crossref` 按 DOI 验证单条；`search_crossref_by_query` 关键词检索列候选）
 
 - `search_cnki` — 通过维普/万方 web 检索 + CrossRef API 回退认证论文元数据（期刊名、栏目、ISSN 等）
+
+> CrossRef 请求统一经 [`core/crossref.py`](src/sage/core/crossref.py) 共享客户端：User-Agent 携带 mailto 进入 polite pool（`SAGE_CROSSREF_MAILTO`），全局限速（默认 0.2s 间隔）+ 429/5xx 指数退避，提升稳定性并规避批量验证时的限流。
 
 ### 通用技能与网络（[`tools/skill_ops.py`](src/sage/tools/skill_ops.py), [`tools/web.py`](src/sage/tools/web.py)）
 
@@ -617,6 +662,7 @@ Sage 支持多工作空间，按"时间戳\_领域标签"命名（如 `20260721_
 | 环境变量             | 说明                                                                                       |
 | ---------------- | ---------------------------------------------------------------------------------------- |
 | `TAVILY_API_KEY` | Tavily AI 高质量搜索 API Key（每月 1000 次免费），获取地址：<https://tavily.com> — 留空则仅使用免费的 DuckDuckGo 搜索 |
+| `SAGE_CROSSREF_MAILTO` | CrossRef 礼貌池联系方式（邮箱）。携带后进入 CrossRef 礼貌池，请求更快更稳、更不易被限流。默认占位 `sage@example.com`，生产建议替换为真实可达邮箱 |
 
 ***
 
@@ -675,7 +721,7 @@ Sage 采用\*\*单一来源（single source of truth）\*\*版本号管理：项
 
 ```
               ┌─────────────────────┐
-              │  /VERSION  (1.1.7)  │   ← 唯一权威
+              │  /VERSION  (1.2.5)  │   ← 唯一权威
               └──────────┬──────────┘
                          │
         ┌────────────────┼────────────────┐
@@ -699,9 +745,9 @@ Sage 采用\*\*单一来源（single source of truth）\*\*版本号管理：项
 python scripts/bump_version.py show
 
 # Patch / Minor / Major 升级
-python scripts/bump_version.py patch    # 1.1.7 -> 1.1.8
-python scripts/bump_version.py minor    # 1.1.7 -> 1.2.0
-python scripts/bump_version.py major    # 1.1.7 -> 2.0.0
+python scripts/bump_version.py patch    # 1.2.5 -> 1.2.6
+python scripts/bump_version.py minor    # 1.2.5 -> 1.3.0
+python scripts/bump_version.py major    # 1.2.5 -> 2.0.0
 
 # 预发布版本
 python scripts/bump_version.py pre --tag rc
@@ -794,7 +840,7 @@ python scripts/bump_version.py set 1.2.3
 
 | 方法       | 路径                                       | 说明                                                                                                                                                            |
 | -------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST     | `/chat/stream`                           | 流式对话（SSE，支持 `mode=single` 单Agent / `mode=writing` 写作模式；事件类型：`tool_start` / `tool_result` / `text` / `reasoning` / `collaborate` / `retry` / `error` / `done`） |
+| POST     | `/chat/stream`                           | 流式对话（SSE，统一链路自动意图分析路由：简单任务单 Agent / 复杂任务多智能体；`mode` 已废弃。事件类型：`tool_start` / `tool_result` / `text` / `reasoning` / `collaborate` / `retry` / `progress` / `context_usage` / `intent_confirm_required` / `delete_confirm_required` / `error` / `done`；请求体支持 `pool_mode` / `force_role` / `force_complexity` / `confirmed_intent` / `intent_correction`） |
 | GET      | `/conversations`                         | 列出历史对话                                                                                                                                                        |
 | POST     | `/conversations`                         | 创建新对话                                                                                                                                                         |
 | GET      | `/conversations/{id}/messages`           | 获取对话消息                                                                                                                                                        |
