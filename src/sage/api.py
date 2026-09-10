@@ -217,6 +217,9 @@ class ChatRequest(BaseModel):
     mode: str = Field("single", description="已废弃：统一链路自动做意图分析路由（简单任务单Agent，复杂任务多智能体），该字段被忽略")
     pool_mode: bool = Field(False, description="全选池模式：True 时检索覆盖所有工作空间")
     force_role: str | None = Field(None, description="写作模式下强制指定处理角色（如 literature/coder/reviewer/debugger），跳过意图分析")
+    force_complexity: str | None = Field(None, description="P2-2：强制指定任务复杂度（simple/complex），跳过意图分析")
+    confirmed_intent: dict | None = Field(None, description="P2-2 阶段二：用户已确认的意图 {complexity, role}，跳过意图分析与确认闸门")
+    intent_correction: dict | None = Field(None, description="P2-2：本次意图纠正记录 {original_input, orig:{complexity,role}, corrected:{complexity,role}, supplement}，用于生成用户画像")
 
 
 class HealthResponse(BaseModel):
@@ -374,6 +377,71 @@ async def chat_stream(req: ChatRequest, request: Request):
     )
 
 
+def _build_intent_diff_text(original_input: str, orig: dict, corrected: dict, supplement: str) -> str:
+    """P2-2：把一次意图纠正组织成结构化差异文本（零额外 LLM 调用）
+
+    形如：用户请求「…」被系统判为 简单任务/撰写员，用户纠正为 完整论文(多智能体)/主编。
+    写入语义记忆后，供后续意图分析（_analyze_intent_with_llm）召回反哺。
+    """
+    from sage.agents.orchestrator import _ROLE_LABELS
+
+    def _label(c: str, r: str) -> str:
+        rl = _ROLE_LABELS.get(r, r) if r else "—"
+        cl = "完整论文(多智能体)" if c == "complex" else "简单任务"
+        return f"{cl}/{rl}"
+
+    text = (
+        f"用户请求「{(original_input or '')[:80]}」的意图被系统判为 "
+        f"{_label(orig.get('complexity', ''), orig.get('role', ''))}，"
+        f"用户纠正为 {_label(corrected.get('complexity', ''), corrected.get('role', ''))}。"
+    )
+    if supplement:
+        text += f" 用户补充说明：{supplement[:120]}。"
+    return text
+
+
+def record_intent_correction(conv_id: str, correction: dict) -> None:
+    """P2-2：记录一次意图纠正 → 写 intent_feedback 表 + 语义记忆（生成用户画像、反哺后续意图分析）
+
+    correction 结构: {original_input, orig:{complexity,role}, corrected:{complexity,role}, supplement}
+    纯副作用，失败仅告警不影响主流程。
+    """
+    if not correction:
+        return
+    try:
+        orig = correction.get("orig") or {}
+        corrected = correction.get("corrected") or {}
+        original_input = correction.get("original_input", "") or ""
+        supplement = correction.get("supplement", "") or ""
+
+        from sage.memory.store import get_store
+        get_store().add_intent_feedback(
+            conversation_id=conv_id,
+            original_input=original_input,
+            orig_complexity=orig.get("complexity", ""),
+            orig_role=orig.get("role", ""),
+            corrected_complexity=corrected.get("complexity", ""),
+            corrected_role=corrected.get("role", ""),
+            supplement=supplement,
+        )
+
+        # 结构化差异文本写入语义记忆，供后续意图分析召回反哺（零额外 LLM 调用）
+        diff_text = _build_intent_diff_text(original_input, orig, corrected, supplement)
+        from sage.memory.memory_orch import create_memory_orchestrator
+        mem = create_memory_orchestrator()
+        if mem and mem.semantic:
+            mem.semantic.store(
+                content=diff_text,
+                memory_type="intent_correction",
+                conversation_id=conv_id,
+                importance=0.7,
+            )
+            # store() 不自动失效向量缓存，手动失效使新纠正立即可被后续 search 命中
+            mem.semantic.invalidate_cache()
+    except Exception as e:
+        logger.warning("记录意图纠正反馈失败 (conversation_id=%s): %s", conv_id, e)
+
+
 async def _collaborate_stream(req: ChatRequest, request: Request):
     """统一对话 SSE 流（意图分析：简单任务单Agent，复杂任务多智能体）
 
@@ -393,10 +461,17 @@ async def _collaborate_stream(req: ChatRequest, request: Request):
     try:
         store = get_store()
         store.create_conversation(conv_id)
-        store.add_message(conversation_id=conv_id, role="user", content=req.message)
-        store.update_conversation_title(conv_id, req.message)
+        # P2-2：阶段二确认重跑（带 confirmed_intent）复用已持久化的原始消息，不重复写入 user 气泡
+        if not req.confirmed_intent:
+            store.add_message(conversation_id=conv_id, role="user", content=req.message)
+            store.update_conversation_title(conv_id, req.message)
     except Exception as e:
         logger.warning("持久化用户消息失败 (conversation_id=%s): %s", conv_id, e)
+
+    # P2-2：本次请求若携带意图纠正（用户在确认闸门改判/补充说明），记录反馈生成用户画像。
+    # embedding 首次调用可能加载模型（较慢），放线程执行避免阻塞事件循环。
+    if req.intent_correction:
+        await asyncio.to_thread(record_intent_correction, conv_id, req.intent_correction)
 
     async def event_stream():
         """实际的事件生成器，由 producer task 驱动"""
@@ -423,7 +498,12 @@ async def _collaborate_stream(req: ChatRequest, request: Request):
                 logger.warning("持久化回复消息失败 (conversation_id=%s): %s", conv_id, e)
 
         try:
-            async for event in orchestrator.collaborate(req.message, force_role=req.force_role):
+            async for event in orchestrator.collaborate(
+                req.message,
+                force_role=req.force_role,
+                force_complexity=req.force_complexity,
+                confirmed_intent=req.confirmed_intent,
+            ):
                 if event.type == "task_created":
                     yield ("event", f"event: collaborate\ndata: {json.dumps({'phase': 'plan', 'role': event.role, 'content': event.content}, ensure_ascii=False)}\n\n")
                 elif event.type == "worker_start":
@@ -470,9 +550,13 @@ async def _collaborate_stream(req: ChatRequest, request: Request):
                 elif event.type == "context_usage":
                     # 上下文用量通知 — 前端环形指示器展示（多智能体模式下带角色）
                     yield ("event", f"event: context_usage\ndata: {json.dumps({**(event.metadata or {}), 'role': event.role}, ensure_ascii=False)}\n\n")
+                elif event.type == "intent_confirm_required":
+                    # P2-2：意图确认闸门 — 高风险任务暂停，回显意图供前端确认/纠正
+                    m = event.metadata or {}
+                    yield ("event", f"event: intent_confirm_required\ndata: {json.dumps({'complexity': m.get('complexity'), 'role': m.get('role'), 'confidence': m.get('confidence'), 'reason': event.content, 'echo_message': m.get('echo_message', '')}, ensure_ascii=False)}\n\n")
                 elif event.type == "done":
                     _persist_assistant()
-                    yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id}, ensure_ascii=False)}\n\n")
+                    yield ("event", f"event: done\ndata: {json.dumps({'conversation_id': conv_id, 'tokens': event.tokens or {}}, ensure_ascii=False)}\n\n")
                     yield ("done", None)
                     return
         except Exception as e:
@@ -3771,7 +3855,9 @@ async def sage_search_external(req: SageExternalSearchRequest):
     elif req.source == "arxiv":
         result = await ops.search_arxiv(query=req.query, max_results=req.max_results)
     elif req.source == "crossref":
-        result = await ops.search_crossref(query=req.query, max_results=req.max_results)
+        # crossref 源按关键词检索候选列表（search_crossref(doi) 仅按 DOI 验证单条，
+        # 二者契约不同：端点收 query/max_results，故调用专门的 by-query 方法）
+        result = await ops.search_crossref_by_query(query=req.query, max_results=req.max_results)
     elif req.source == "semantic_scholar":
         result = await ops.search_semantic_scholar(query=req.query, max_results=req.max_results)
     else:

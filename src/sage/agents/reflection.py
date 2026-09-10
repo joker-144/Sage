@@ -99,19 +99,35 @@ class ReflectionEngine:
         if success and result and not self._is_low_quality(result):
             return ReflectionResult(needs_correction=False)
 
-        # 2. 参数错误类问题不重试（用相同参数重试没有意义）
-        #    例如：文件不存在、参数错误、权限问题 — 重试只会重复失败
-        non_retryable_markers = (
-            "文件不存在", "No such file", "参数错误", "参数", "Permission",
-            "权限不足", "未找到", "路径", "未知工具",
+        # 2. 确定性错误不重试（相同参数重试必然重复失败）
+        #    P1-3：措辞对齐 file_ops/engine/paper_ops 的真实错误返回 ——
+        #    补充遗漏项（"不是目录"/"未在文件中找到匹配"/"匹配多处"/"路径不存在"），
+        #    收窄无效宽泛单字（"参数"→由"参数错误"覆盖；"路径"→精确为"路径不存在"；
+        #    "Permission"→"permission denied"）。保留"未找到"（实证匹配
+        #    paper_ops"未找到标记"、mcp/engine"未找到工具"，均为确定性错误）。
+        #    不采用 core.resilience.classify_error：它面向英文 API/网络错误域，
+        #    对中文工具错误（"文件不存在"等）一律 fallback 为 RETRYABLE，不适用于此。
+        _non_retryable_markers = (
+            # 文件 / 目录 / 路径（file_ops 真实措辞）
+            "文件不存在", "路径不存在", "不是目录", "no such file",
+            # 编辑定位失败（edit_file：相同 old_str 重试必然仍不匹配）
+            "未在文件中找到匹配", "匹配多处",
+            # 引用标记 / 工具不存在（paper_ops"未找到标记"、engine/mcp"未找到工具"）
+            "未找到", "未知工具",
+            # 参数错误（engine 将 TypeError 包装为 "参数错误: ..."）
+            "参数错误",
+            # 权限
+            "权限不足", "permission denied",
         )
-        if error and any(m in error for m in non_retryable_markers):
-            return ReflectionResult(
-                needs_correction=False,
-                trigger=ReflectionTrigger.TOOL_FAILED,
-                analysis=f"工具 {tool_name} 失败（不重试）: {error}",
-                suggestion=f"参数/路径问题，Agent 需先校验后再调用: {error[:200]}",
-            )
+        if error:
+            error_l = error.lower()
+            if any(m.lower() in error_l for m in _non_retryable_markers):
+                return ReflectionResult(
+                    needs_correction=False,
+                    trigger=ReflectionTrigger.TOOL_FAILED,
+                    analysis=f"工具 {tool_name} 失败（确定性错误，不重试）: {error}",
+                    suggestion=f"路径/参数/权限/定位问题，Agent 需先校验或修正参数后再调用: {error[:200]}",
+                )
 
         # 3. 检查重试次数
         current_retries = self._retry_counts.get(tool_name, 0)

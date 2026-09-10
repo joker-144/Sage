@@ -25,12 +25,18 @@ export function useChat() {
   // 上下文用量（环形指示器数据）：{ current_tokens, trigger_tokens, percent, compressed_rounds, saved_tokens, just_compressed, role }
   const contextUsage = ref(null)
 
+  // P2-2：意图确认闸门 — 高风险任务暂停时后端回显的待确认意图
+  // { complexity, role, confidence, reason, echoMessage }；非空时前端弹出 IntentConfirm 对话框
+  const pendingIntentConfirm = ref(null)
+
   // 当前正在调用的智能体 role 集合（用于侧边栏圆圈高亮，来自 collaborate 事件的 role）
   const activeAgentRoles = reactive(new Set())
 
   let currentAssistant = null
   let abortController = null
   let sseTimedOut = false   // 标记是否因 SSE 超时而 abort（区分用户主动取消）
+  // P2-2：跨"纠正→重分析"循环暂存的意图纠正记录，用户最终确认时随请求上报（生成用户画像）
+  let _pendingCorrection = null
 
   function scrollToBottom() {
     nextTick(() => {
@@ -44,6 +50,8 @@ export function useChat() {
     conversationId.value = null
     saveConvId(null)
     contextUsage.value = null  // 新对话上下文清零，环形指示器归位
+    pendingIntentConfirm.value = null  // P2-2：清空待确认意图
+    _pendingCorrection = null
     // 新建对话时同样重置模块级引用 + 中断残留 SSE
     currentAssistant = null
     sseTimedOut = false
@@ -296,9 +304,6 @@ export function useChat() {
   async function sendMessage(text) {
     if (!text.trim() || isProcessing.value) return
 
-    isProcessing.value = true
-    statusText.value = 'Agent 思考中...'
-
     // 添加用户消息
     messages.value.push({
       role: 'user',
@@ -306,6 +311,17 @@ export function useChat() {
       tools: [],
     })
     scrollToBottom()
+
+    await _runAssistantTurn(text, {})
+  }
+
+  // 执行一次"助手回合"：新建 assistant 容器 → 流式请求 → 收尾复位。
+  // sendMessage（用户新输入）与 P2-2 意图确认/纠正（复用已发送消息、不重复推 user 气泡）共用。
+  async function _runAssistantTurn(message, opts) {
+    if (isProcessing.value) return
+
+    isProcessing.value = true
+    statusText.value = 'Agent 思考中...'
 
     // 创建助手消息容器（push 后重新获取响应式代理引用）
     messages.value.push({
@@ -318,7 +334,7 @@ export function useChat() {
     scrollToBottom()
 
     try {
-      await streamChat(text)
+      await streamChat(message, opts)
     } catch (err) {
       // 切换对话时 currentAssistant 可能已被重置为 null，需做 null 检查
       if (currentAssistant) {
@@ -343,7 +359,55 @@ export function useChat() {
     }
   }
 
-  function streamChat(message) {
+  // P2-2：用户在意图确认对话框点"✓ 正确，继续" → 以确认意图从断点续跑（阶段二）
+  async function confirmIntent() {
+    const pending = pendingIntentConfirm.value
+    if (!pending || isProcessing.value) return
+    const confirmedIntent = { complexity: pending.complexity, role: pending.role }
+    const opts = { confirmedIntent }
+    // 若确认前发生过纠正（重分析循环），随本次请求上报纠正记录以生成用户画像
+    if (_pendingCorrection) {
+      opts.intentCorrection = { ..._pendingCorrection, corrected: confirmedIntent }
+      _pendingCorrection = null
+    }
+    pendingIntentConfirm.value = null
+    await _runAssistantTurn(pending.echoMessage, opts)
+  }
+
+  // P2-2：用户点"修正/重新分析" → 记录纠正，带补充说明重跑阶段一（重新分析），循环直到用户点"继续"
+  async function correctIntent({ complexity, role, supplement } = {}) {
+    const pending = pendingIntentConfirm.value
+    if (!pending || isProcessing.value) return
+    const corrected = {
+      complexity: complexity || pending.complexity,
+      role: role || pending.role,
+    }
+    const correction = {
+      original_input: pending.echoMessage,
+      orig: { complexity: pending.complexity, role: pending.role },
+      corrected,
+      supplement: supplement || '',
+    }
+    pendingIntentConfirm.value = null
+    const sup = (supplement || '').trim()
+    if (sup) {
+      // 有补充说明 → 暂存纠正记录，带补充重跑阶段一重新分析（可能再次命中闸门 → 继续循环）
+      _pendingCorrection = correction
+      await _runAssistantTurn(`${pending.echoMessage}\n\n补充说明：${sup}`, {})
+    } else {
+      // 仅改角色/复杂度（无补充）→ 直接按用户纠正的意图执行（阶段二）+ 上报纠正记录
+      _pendingCorrection = null
+      await _runAssistantTurn(pending.echoMessage, { confirmedIntent: corrected, intentCorrection: correction })
+    }
+  }
+
+  // P2-2：用户关闭意图确认对话框（放弃本次执行）
+  function cancelIntent() {
+    pendingIntentConfirm.value = null
+    _pendingCorrection = null
+  }
+
+  function streamChat(message, opts = {}) {
     abortController = new AbortController()
     sseTimedOut = false   // 重置超时标记
 
@@ -374,6 +438,16 @@ export function useChat() {
       // 池模式标记：后端据此将 search_literature 路由到跨工作空间检索
       if (poolMode.value) {
         body.pool_mode = true
+      }
+      // P2-2：意图确认闸门 — 阶段二确认 / 纠正记录透传
+      if (opts.confirmedIntent) {
+        body.confirmed_intent = opts.confirmedIntent
+      }
+      if (opts.forceComplexity) {
+        body.force_complexity = opts.forceComplexity
+      }
+      if (opts.intentCorrection) {
+        body.intent_correction = opts.intentCorrection
       }
 
       // SSE 超时兜底：60 秒无任何数据则中止（后端 10s 心跳保活，超时说明后端异常）
@@ -685,10 +759,26 @@ export function useChat() {
         scrollToBottom()
         break
 
+      case 'intent_confirm_required':
+        // P2-2：意图确认闸门 — 高风险任务暂停，弹出对话框供用户确认/纠正
+        pendingIntentConfirm.value = {
+          complexity: data.complexity,
+          role: data.role,
+          confidence: data.confidence,
+          reason: data.reason,
+          echoMessage: data.echo_message || '',
+        }
+        statusText.value = '等待确认意图...'
+        break
+
       case 'done':
         if (data.conversation_id) {
           conversationId.value = data.conversation_id
           saveConvId(data.conversation_id)
+        }
+        // P2-1：把本次对话累计 token 用量挂到助手消息，供 ChatMessage 页脚展示
+        if (data.tokens && data.tokens.total) {
+          currentAssistant.tokens = data.tokens
         }
         if (!currentAssistant.content && currentAssistant.tools.length === 0) {
           currentAssistant.content = '（无回复）'
@@ -707,7 +797,11 @@ export function useChat() {
     messageSentCount,
     contextUsage,
     activeAgentRoles,
+    pendingIntentConfirm,
     sendMessage,
+    confirmIntent,
+    correctIntent,
+    cancelIntent,
     cancel,
     reset,
     loadConversation,

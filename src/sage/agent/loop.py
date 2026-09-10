@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -63,6 +64,41 @@ def _get_shared_circuit_breaker(base_url: str = "") -> CircuitBreaker:
         cb = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
         _CIRCUIT_BREAKERS[key] = cb
     return cb
+
+
+# P1-1：只读、无副作用、无进度上报的工具白名单 —— 同一批次内可安全并行执行。
+# 判定原则（宁可漏并，不可误并）：
+#   ✓ 纳入：本地读（read_file/list_dir）、本地检索/解析（search_literature/
+#     extract_references/format_references/list_skills）、联网只读检索
+#     （web_search/web_fetch/search_scholar/search_arxiv/search_crossref/
+#     search_semantic_scholar）—— 均无文件/状态副作用、不声明 progress 参数。
+#   ✗ 排除：写类（write_file/edit_file/delete_file/insert_citation/create_agent/
+#     install_skill/load_skill）；重任务且带进度（index_papers/ocr_document/
+#     check_plagiarism/parse_pdf 等，进度队列是引擎级单例，并行会串扰）；
+#     LLM 生成类（generate_outline/write_paragraph/polish_academic/check_logic/
+#     reduce_ai_pattern，并行放大 Provider 限流风险且结果可能有先后依赖）。
+_PARALLELIZABLE_TOOLS = frozenset({
+    "read_file", "list_dir",
+    "search_literature", "extract_references", "format_references",
+    "list_skills",
+    "web_search", "web_fetch",
+    "search_scholar", "search_arxiv", "search_crossref", "search_semantic_scholar",
+})
+
+
+# P3-1：写类工具（成功后触发去重缓存的精细化失效）——与 run() 串行写分支一致。
+_WRITE_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
+
+# 增删文件、可能改变父目录列表的写工具 → 额外失效所有 list_dir 缓存。
+# （list_dir 重跑成本低，宁可多清，规避"新建父目录波及祖先列表"的漏判；
+#   edit_file 仅改文件内容、不增删条目，不动目录列表，故不在此集。）
+_DIR_AFFECTING_WRITE_TOOLS = frozenset({"write_file", "delete_file"})
+
+# 读取本地文件内容的工具（path/file_path 参数指向文件）→ 仅当缓存路径 == 写入路径时失效。
+_FILE_CONTENT_READ_TOOLS = frozenset({
+    "read_file", "extract_references", "extract_metadata",
+    "parse_pdf", "parse_docx", "parse_latex",
+})
 
 
 @dataclass
@@ -316,6 +352,8 @@ class AgentLoop:
 
         rounds = 0
         total_tool_calls = 0
+        # P2-1：本次对话（单次 run 调用）累计 token 用量，供 done 事件汇总上报
+        turn_tokens = {"prompt": 0, "completion": 0, "total": 0}
         # 工具调用去重缓存：同一轮对话中，相同工具+相同参数只执行一次
         # key: "tool_name:args_json", value: 工具执行结果摘要
         _dedup_cache: dict[str, str] = {}
@@ -393,6 +431,8 @@ class AgentLoop:
             llm_duration = (time.time() - llm_start) * 1000
             # 该轮 LLM 调用的 token 用量（供 tool_start 事件携带 + 持久化）
             round_usage = response.usage or {}
+            # P2-1：累计到本次对话总量（每轮只累加一次，避免 tool_start 多次携带导致重复计数）
+            self._accumulate_tokens(turn_tokens, round_usage)
             # 可观测性：记录 LLM 调用
             if self.observability and round_usage:
                 self.observability.record_llm_call(
@@ -440,7 +480,24 @@ class AgentLoop:
                              + round_usage.get("completion_tokens", 0),
                 }
 
-                # 5. 逐个执行工具（带反思修正）
+                # 5. 执行工具（带反思修正）
+                #    P1-1：本批次 >=2 个调用且全部为只读工具时并行执行（省时）；
+                #    否则（单个调用 / 含写类或重任务）走原串行路径，行为完全不变。
+                _calls = response.tool_calls
+                if self._should_run_parallel(_calls):
+                    # 预判去重命中数（仅用于 total_tool_calls 计数，与串行路径口径一致：
+                    # 命中缓存的跳过执行不计数）
+                    _pre_cached = sum(
+                        1 for c in _calls if self._dedup_key(c) in _dedup_cache
+                    )
+                    async for _ev in self._run_tools_parallel(
+                        _calls, round_tokens, _dedup_cache, session_id
+                    ):
+                        yield _ev
+                    total_tool_calls += (len(_calls) - _pre_cached)
+                    continue
+
+                # 逐个执行工具（带反思修正）
                 for call in response.tool_calls:
                     # 技能调用识别：load_skill 代表 AI 决定使用某个技能
                     skill_name = ""
@@ -511,9 +568,12 @@ class AgentLoop:
                     # 缓存成功的工具调用结果（使用完整 output，非截断 summary）
                     if result.success:
                         # 写类工具（写/编辑/删除文件）会改变后续读取结果：
-                        # 成功后清空整个去重缓存，避免后续 read_file 等命中过期内容
-                        if call.name in ("write_file", "edit_file", "delete_file"):
-                            _dedup_cache.clear()
+                        # P3-1 精细化失效——仅清除与写入路径相关的缓存键，保留无关的
+                        # 昂贵只读结果（其它文件的 read_file/parse_pdf、联网检索等）
+                        if call.name in _WRITE_TOOLS:
+                            self._invalidate_cache_for_write(
+                                _dedup_cache, call.name, call.arguments
+                            )
                         else:
                             _dedup_cache[dedup_key] = self._tool_result_text(result)
 
@@ -574,7 +634,7 @@ class AgentLoop:
                     pass
 
                 self._persist_context_usage()
-                yield LoopEvent(type="done")
+                yield LoopEvent(type="done", tokens=turn_tokens)
                 return
 
         # 超过最大轮数 — 不直接报错，让 LLM 基于已有上下文生成一条总结性回复
@@ -608,7 +668,7 @@ class AgentLoop:
             pass
 
         self._persist_context_usage()
-        yield LoopEvent(type="done")
+        yield LoopEvent(type="done", tokens=turn_tokens)
 
     async def _generate_limit_summary(self, session_id: str, request_start: float) -> str:
         """达到工具调用上限时，调用 LLM（不带工具）生成总结性回复
@@ -836,6 +896,109 @@ class AgentLoop:
 
         return result  # 返回最后一次结果
 
+    async def _run_tools_parallel(self, calls, round_tokens, dedup_cache, session_id):
+        """并行执行一批只读工具调用（P1-1）。
+
+        调用方保证：len(calls) >= 2 且全部命中 _PARALLELIZABLE_TOOLS（只读、无副作用、
+        无进度上报）。设计要点：
+
+          - 并发执行：asyncio.gather 同时跑所有未命中缓存的调用，墙钟时间从"求和"
+            降为"取最大"（如并行读 3 个文件 / 3 个联网检索）。
+          - 事件顺序：先静默并发执行，全部完成后按【原序】成对发 tool_start→tool_result。
+            前端 useChat.js 把 tool_result 附加到"最后一个 tool 卡片"（位置配对），
+            严格交替的 start→result 保证配对正确，无需改动前端。
+          - 上下文顺序：add_tool_result 按原序调用，与 response.tool_calls 一致，
+            避免 tool_call_id→结果 乱序导致 LLM 400（见 _execute_tool_with_reflection 注释）。
+          - 去重：命中 dedup_cache 的直接复用；执行成功的只读结果写回缓存
+            （只读工具不清空缓存 —— 写类工具不会进入并行批次）。
+          - 容错：单个工具异常经 gather(return_exceptions=True) 隔离，
+            仍为其 tool_call_id 生成错误结果，保证每个调用都有响应。
+          - 持久化在主协程按序串行执行（_execute_tool_with_reflection 内无 SQLite 写），
+            避免并发写库。
+
+        Yields:
+            LoopEvent: 与串行路径一致的 tool_start / tool_result 事件（按原序成对）。
+        """
+        # 1) 去重分流：命中缓存的复用，其余待并发执行
+        cached_by_idx: dict[int, str] = {}
+        to_run: list[tuple[int, object, str]] = []
+        for idx, call in enumerate(calls):
+            dedup_key = self._dedup_key(call)
+            if dedup_key in dedup_cache:
+                cached_by_idx[idx] = dedup_cache[dedup_key]
+            else:
+                to_run.append((idx, call, dedup_key))
+
+        # 2) 并发执行未命中缓存的调用（无进度队列：白名单工具均不声明 progress 参数）
+        exec_by_idx: dict[int, tuple] = {}
+        if to_run:
+            async def _run_one(idx, call, dedup_key):
+                r = await self._execute_tool_with_reflection(call=call, session_id=session_id)
+                return idx, dedup_key, r
+
+            gathered = await asyncio.gather(
+                *[_run_one(i, c, dk) for (i, c, dk) in to_run],
+                return_exceptions=True,
+            )
+            for item in gathered:
+                if isinstance(item, BaseException):
+                    logger.warning("并行工具执行异常（已隔离）: %s", item)
+                    continue
+                idx, dedup_key, r = item
+                exec_by_idx[idx] = (r, dedup_key)
+
+        # 3) 按原序成对发事件 + 写上下文 + 持久化 + 回填缓存
+        for idx, call in enumerate(calls):
+            yield LoopEvent(
+                type="tool_start",
+                tool_name=call.name,
+                tool_args=call.arguments,
+                content=self._format_tool_call(call.name, call.arguments),
+                tokens=round_tokens,
+                skill_name="",  # 白名单不含 load_skill
+            )
+
+            if idx in cached_by_idx:
+                cached = cached_by_idx[idx]
+                self.context.add_tool_result(call.id, call.name, cached)
+                self._persist_message(
+                    "tool", cached, tool_call_id=call.id, tool_name=call.name,
+                )
+                yield LoopEvent(
+                    type="tool_result",
+                    tool_name=call.name,
+                    content=f"[跳过重复调用] {cached}",
+                )
+                continue
+
+            entry = exec_by_idx.get(idx)
+            if entry is None:
+                # gather 中该任务抛异常的兜底：仍需为该 tool_call_id 生成响应
+                tool_output = "错误: 工具并行执行异常"
+                self.context.add_tool_result(call.id, call.name, tool_output)
+                self._persist_message(
+                    "tool", tool_output, tool_call_id=call.id, tool_name=call.name,
+                )
+                yield LoopEvent(
+                    type="tool_result", tool_name=call.name, content=tool_output,
+                )
+                continue
+
+            result, dedup_key = entry
+            if result.success:
+                dedup_cache[dedup_key] = self._tool_result_text(result)
+            tool_output = (
+                self._tool_result_text(result) if result.success
+                else f"错误: {result.error}"
+            )
+            self.context.add_tool_result(call.id, call.name, tool_output)
+            self._persist_message(
+                "tool", tool_output, tool_call_id=call.id, tool_name=call.name,
+            )
+            yield LoopEvent(
+                type="tool_result", tool_name=call.name, content=tool_output,
+            )
+
     def _persist_message(
         self,
         role: str,
@@ -963,6 +1126,87 @@ class AgentLoop:
             except (TypeError, ValueError):
                 return str(result.data)
         return ""
+
+    @staticmethod
+    def _dedup_key(call) -> str:
+        """构造工具调用去重键 "tool_name:args_json"（与 run() 串行去重逻辑一致）"""
+        args_key = json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
+        return f"{call.name}:{args_key}"
+
+    @staticmethod
+    def _should_run_parallel(calls) -> bool:
+        """P1-1 判定：本批次工具调用是否可并行执行。
+
+        条件：>=2 个调用，且全部命中 _PARALLELIZABLE_TOOLS 只读白名单。
+        混合批次（含写类/重任务/LLM 生成类）或单个调用 → False（走串行路径）。
+        """
+        return len(calls) >= 2 and all(
+            c.name in _PARALLELIZABLE_TOOLS for c in calls
+        )
+
+    @staticmethod
+    def _accumulate_tokens(acc: dict, usage: dict) -> None:
+        """P2-1：把一轮 LLM 调用的 usage 累加到本次对话总量 acc（就地修改）。
+
+        usage 形如 {"prompt_tokens": int, "completion_tokens": int}（OpenAI 口径）；
+        acc 形如 {"prompt": int, "completion": int, "total": int}。缺失字段按 0 计。
+        """
+        p = usage.get("prompt_tokens", 0) or 0
+        c = usage.get("completion_tokens", 0) or 0
+        acc["prompt"] = acc.get("prompt", 0) + p
+        acc["completion"] = acc.get("completion", 0) + c
+        acc["total"] = acc.get("total", 0) + p + c
+
+    def _normalize_cache_path(self, raw) -> str:
+        """把工具路径参数归一化为可比较的绝对路径字符串（P3-1）。
+
+        相对路径按 workspace 解析，再用 os.path.normpath 折叠 ../. 与冗余分隔符、
+        os.path.normcase 统一大小写（Windows 路径大小写不敏感）。不触碰文件系统。
+        """
+        p = Path(str(raw))
+        if not p.is_absolute():
+            p = self.workspace / p
+        return os.path.normcase(os.path.normpath(str(p)))
+
+    def _invalidate_cache_for_write(self, cache: dict, tool_name: str, args: dict) -> None:
+        """P3-1：写类工具成功后，精细化失效去重缓存（替代旧的 _dedup_cache.clear()）。
+
+        仅失效真正可能被本次写入影响的条目，保留无关的昂贵只读结果：
+          - 读文件内容类（read_file/parse_*/extract_*）：仅当缓存路径 == 写入路径时失效
+          - list_dir：write_file(可能新建)/delete_file(删除)会改变目录列表 → 全部失效；
+                     edit_file 仅改内容不动列表 → 不失效
+          - 联网检索 / 纯文本类（search_*/web_*/format_references 等）：不读本地文件内容 → 保留
+        任何解析异常都回退为全清（等同旧行为，安全兜底）。
+        """
+        try:
+            raw = args.get("path") or args.get("file_path")
+            written = self._normalize_cache_path(raw) if raw else None
+            drop_list_dir = tool_name in _DIR_AFFECTING_WRITE_TOOLS
+            for key in list(cache.keys()):
+                name, sep, args_json = key.partition(":")
+                if not sep:
+                    continue
+                if name == "list_dir":
+                    if drop_list_dir:
+                        del cache[key]
+                    continue
+                if name not in _FILE_CONTENT_READ_TOOLS:
+                    continue
+                if written is None:
+                    # 写入路径未知（异常入参）→ 保守失效所有文件内容读取缓存
+                    del cache[key]
+                    continue
+                try:
+                    cached_args = json.loads(args_json)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(cached_args, dict):
+                    continue
+                cached_raw = cached_args.get("path") or cached_args.get("file_path")
+                if cached_raw and self._normalize_cache_path(cached_raw) == written:
+                    del cache[key]
+        except Exception:
+            cache.clear()
 
 
 def create_agent(

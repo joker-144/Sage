@@ -118,12 +118,26 @@ CREATE TABLE IF NOT EXISTS token_usage (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 意图纠正反馈 — P2-2：用户判定意图分析有误并给出正确意图，沉淀为用户画像数据
+CREATE TABLE IF NOT EXISTS intent_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT,
+    original_input TEXT,
+    orig_complexity TEXT,
+    orig_role TEXT,
+    corrected_complexity TEXT,
+    corrected_role TEXT,
+    supplement TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_file_index_path ON file_index(file_path);
 CREATE INDEX IF NOT EXISTS idx_session_summaries_conv ON session_summaries(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_type ON memory_embeddings(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_importance ON memory_embeddings(importance DESC);
 CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_intent_feedback_conv ON intent_feedback(conversation_id);
 """
 
 
@@ -484,6 +498,42 @@ class MemoryStore:
         """获取最近 N 条会话摘要"""
         rows = self._conn.execute(
             "SELECT * FROM session_summaries ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── 意图纠正反馈（P2-2 用户画像数据）──
+
+    def add_intent_feedback(
+        self,
+        conversation_id: str,
+        original_input: str,
+        orig_complexity: str = "",
+        orig_role: str = "",
+        corrected_complexity: str = "",
+        corrected_role: str = "",
+        supplement: str = "",
+    ) -> int:
+        """记录一次意图纠正（用户判定系统意图分析有误并给出正确意图）
+
+        作为用户画像数据沉淀，供后续意图分析反哺（见 record_intent_correction）。
+        """
+        cur = self._conn.execute(
+            """INSERT INTO intent_feedback
+               (conversation_id, original_input, orig_complexity, orig_role,
+                corrected_complexity, corrected_role, supplement)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (conversation_id, original_input, orig_complexity or None,
+             orig_role or None, corrected_complexity or None,
+             corrected_role or None, supplement or None),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def get_intent_feedback(self, limit: int = 50) -> list[dict]:
+        """获取最近 N 条意图纠正反馈"""
+        rows = self._conn.execute(
+            "SELECT * FROM intent_feedback ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

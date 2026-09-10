@@ -16,6 +16,7 @@ import ReviewView from './components/ReviewView.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import StatsModal from './components/StatsModal.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import IntentConfirm from './components/IntentConfirm.vue'
 import DownloadNotification from './components/DownloadNotification.vue'
 import IndexNotification from './components/IndexNotification.vue'
 import UpdateNotification from './components/UpdateNotification.vue'
@@ -24,6 +25,7 @@ const {
   messages, isProcessing, statusText, conversationId, messagesRef, messageSentCount,
   contextUsage, activeAgentRoles, sendMessage, cancel, reset, loadConversation, deleteConversation,
   recheckContextOnModelSwitch,
+  pendingIntentConfirm, confirmIntent, correctIntent, cancelIntent,
 } = useChat()
 
 const activeView = ref('chat')
@@ -167,6 +169,15 @@ onMounted(() => { reset() })
       message="确定要删除此对话吗？此操作不可恢复。"
       @confirm="doDelete"
       @cancel="confirmDelete = { show: false, convId: null }"
+    />
+
+    <!-- P2-2：意图确认闸门 — 高风险任务执行前暂停，由用户确认或纠正意图 -->
+    <IntentConfirm
+      :visible="!!pendingIntentConfirm"
+      :intent="pendingIntentConfirm"
+      @confirm="confirmIntent"
+      @correct="correctIntent"
+      @cancel="cancelIntent"
     />
 
     <!-- 全局下载通知（右上角） -->

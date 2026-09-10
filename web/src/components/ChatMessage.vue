@@ -107,6 +107,17 @@ const renderedContent = computed(() => {
     return DOMPurify.sanitize(marked.parse(text))
   } catch { return text }
 })
+
+// P2-1：本次对话 token 用量页脚（仅在 done 事件带回 tokens 时显示）
+const tokenSummary = computed(() => {
+  const t = props.message.tokens
+  if (!t || !t.total) return ''
+  const fmt = (n) => (n || 0).toLocaleString('en-US')
+  const detail = (t.prompt || t.completion)
+    ? `（提示 ${fmt(t.prompt)} / 补全 ${fmt(t.completion)}）`
+    : ''
+  return `本次消耗 ${fmt(t.total)} tokens${detail}`
+})
 </script>
 
 <template>
@@ -157,6 +168,8 @@ const renderedContent = computed(() => {
       <div v-if="(!message.content || isTyping) && message.tools.length === 0 && !typedContent && !hasReasoning" class="typing">
         <span></span><span></span><span></span>
       </div>
+
+      <div v-if="tokenSummary" class="token-footer">{{ tokenSummary }}</div>
     </div>
   </div>
 </template>
@@ -305,4 +318,13 @@ const renderedContent = computed(() => {
 }
 .typing span:nth-child(2) { animation-delay: 0.2s; }
 .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+/* P2-1：本次对话 token 用量页脚 */
+.token-footer {
+  margin: 6px 0 0 26px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  letter-spacing: 0.01em;
+}
 </style>

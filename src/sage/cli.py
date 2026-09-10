@@ -757,7 +757,7 @@ async def _run_agent_loop(agent, user_input: str):
 async def _run_collaboration(orchestrator, user_input: str):
     """运行多 Agent 协同并流式输出"""
     try:
-        async for event in orchestrator.collaborate(user_input):
+        async for event in orchestrator.collaborate(user_input, auto_confirm=True):
             if event.type == "task_created":
                 console.print(f"[dim yellow]📋 {event.content}[/dim yellow]")
             elif event.type == "worker_start":

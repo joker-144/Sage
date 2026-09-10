@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from sage.tools.types import ToolResult
+from sage.core.crossref import crossref_get
 
 logger = logging.getLogger(__name__)
 
@@ -778,22 +779,107 @@ class PaperOps:
     async def search_crossref(self, doi: str) -> ToolResult:
         """通过 DOI 验证引用文献是否存在"""
         try:
-            from sage.tools.web import WebFetchTool
-            fetch_tool = WebFetchTool(self.workspace)
-            url = f"https://api.crossref.org/works/{doi}"
-            result = await fetch_tool.web_fetch(url, max_length=4000)
-            if result.success and "title" in result.output:
+            # P1-2：统一走 core.crossref 共享客户端（mailto 礼貌池 + 限速 + 429/5xx 退避）
+            status_code, data = await crossref_get(f"works/{doi}", timeout=15)
+            if status_code == 200 and data:
+                msg = data.get("message", {})
+                titles = msg.get("title", [])
+                title = titles[0] if titles else ""
+                containers = msg.get("container-title", [])
+                journal = containers[0] if containers else ""
+                date_parts = msg.get("published", {}).get("date-parts", [[]])
+                year = str(date_parts[0][0]) if date_parts and date_parts[0] else ""
+                lines = [f"DOI 验证成功: {doi}", f"标题: {title}"]
+                if journal:
+                    lines.append(f"期刊: {journal}")
+                if year:
+                    lines.append(f"年份: {year}")
                 return ToolResult(
                     success=True,
-                    output=f"DOI 验证成功: {doi}\n{result.output[:1000]}",
-                    data={"doi": doi, "verified": True},
+                    output="\n".join(lines),
+                    data={"doi": doi, "verified": True, "title": title,
+                          "journal": journal, "year": year},
+                )
+            if status_code == 404:
+                return ToolResult(
+                    success=False,
+                    error=f"DOI 验证失败: {doi} 不存在（CrossRef 返回 404）",
                 )
             return ToolResult(
                 success=False,
-                error=f"DOI 验证失败: {doi} 可能不存在",
+                error=f"DOI 验证失败: {doi}（CrossRef 返回 {status_code}，可能网络问题）",
             )
         except Exception as e:
             return ToolResult(success=False, error=f"Crossref 验证失败: {e}")
+
+    async def search_crossref_by_query(self, query: str, max_results: int = 5) -> ToolResult:
+        """通过关键词检索 CrossRef，返回候选文献列表（标题/作者/期刊/年份/DOI 等）
+
+        与 search_scholar / search_arxiv / search_semantic_scholar 一致，支持关键词检索，
+        供 /api/sage/search-external 端点的 crossref 源使用。区别于：
+          - search_crossref(doi)：按 DOI 精确验证单条（LLM 工具契约，参数只有 doi）
+          - _search_crossref_by_title：按标题相似度取单条最佳匹配（元数据认证内部用）
+        统一走 core.crossref 共享客户端（mailto 礼貌池 + 限速 + 429/5xx 退避）。
+        """
+        try:
+            import urllib.parse
+
+            if not query or not query.strip():
+                return ToolResult(success=False, error="检索查询为空")
+            encoded_query = urllib.parse.quote(query.strip())
+            # rows 保护：至少 1，至多 20（端点默认 5，避免异常入参拉取过量）
+            rows = max(1, min(int(max_results or 5), 20))
+            status_code, data = await crossref_get(
+                f"works?query.bibliographic={encoded_query}&rows={rows}", timeout=15
+            )
+            if status_code != 200 or not data:
+                if status_code == 0:
+                    return ToolResult(
+                        success=False,
+                        error=f"CrossRef 检索失败: 网络错误或请求被限流（query={query}）",
+                    )
+                return ToolResult(
+                    success=False,
+                    error=f"CrossRef 检索失败: 返回 {status_code}（query={query}）",
+                )
+
+            items = data.get("message", {}).get("items", [])
+            candidates = []
+            for item in items:
+                md = self._parse_crossref_item(item)
+                if md.get("title"):  # 无标题的条目对检索无意义，跳过
+                    candidates.append(md)
+
+            if not candidates:
+                return ToolResult(
+                    success=True,
+                    output=f"CrossRef 未找到与 '{query}' 匹配的文献。",
+                    data=[],
+                )
+
+            formatted = []
+            for i, c in enumerate(candidates, 1):
+                lines = [f"### 结果 {i}", f"**标题**: {c.get('title', '')}"]
+                if c.get("authors"):
+                    lines.append(f"**作者**: {c['authors']}")
+                if c.get("journal"):
+                    lines.append(f"**期刊**: {c['journal']}")
+                if c.get("year"):
+                    lines.append(f"**年份**: {c['year']}")
+                if c.get("doi"):
+                    lines.append(f"**DOI**: {c['doi']}")
+                formatted.append("\n".join(lines))
+
+            return ToolResult(
+                success=True,
+                output=(
+                    f"CrossRef 检索到 {len(candidates)} 条候选文献（query={query}）:\n\n"
+                    + "\n\n".join(formatted)
+                ),
+                data=candidates,
+            )
+        except Exception as e:
+            return ToolResult(success=False, error=f"CrossRef 检索失败: {e}")
 
     async def search_semantic_scholar(self, query: str, max_results: int = 5) -> ToolResult:
         """检索 Semantic Scholar 学术数据库"""
@@ -939,21 +1025,16 @@ class PaperOps:
         避免中文标题被 CrossRef 匹配到完全不相关的英文文献。
         """
         try:
-            import httpx
             import urllib.parse
 
             encoded_title = urllib.parse.quote(title)
+            # P1-2：统一走 core.crossref 共享客户端（mailto 礼貌池 + 限速 + 429/5xx 退避）
             # 请求 5 条候选，用于相似度筛选
-            url = f"https://api.crossref.org/works?query.bibliographic={encoded_title}&rows=5"
-
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    url,
-                    headers={"User-Agent": "Sage/1.0 (mailto:sage@example.com)"},
-                )
-                if resp.status_code != 200:
-                    return None
-                data = resp.json()
+            status_code, data = await crossref_get(
+                f"works?query.bibliographic={encoded_title}&rows=5", timeout=15
+            )
+            if status_code != 200 or not data:
+                return None
 
             items = data.get("message", {}).get("items", [])
             if not items:
@@ -975,48 +1056,7 @@ class PaperOps:
                 if score <= best_score:
                     continue
 
-                metadata = {}
-                # 期刊名
-                container_titles = item.get("container-title", [])
-                if container_titles:
-                    metadata["journal"] = container_titles[0]
-                # 标题
-                metadata["title"] = candidate_title
-                # 作者
-                authors = item.get("author", [])
-                if authors:
-                    author_names = []
-                    for a in authors:
-                        given = a.get("given", "")
-                        family = a.get("family", "")
-                        name = f"{family}{given}".strip() if family or given else ""
-                        if name:
-                            author_names.append(name)
-                    if author_names:
-                        metadata["authors"] = ", ".join(author_names)
-                # 年份
-                date_parts = item.get("published", {}).get("date-parts", [[]])
-                if date_parts and date_parts[0]:
-                    metadata["year"] = str(date_parts[0][0])
-                # 卷期页
-                if item.get("volume"):
-                    metadata["volume"] = item["volume"]
-                if item.get("issue"):
-                    metadata["issue"] = item["issue"]
-                if item.get("page"):
-                    metadata["pages"] = item["page"]
-                # DOI
-                if item.get("DOI"):
-                    metadata["doi"] = item["DOI"]
-                # 摘要（CrossRef 摘要可能含 XML 标签）
-                if item.get("abstract"):
-                    abstract = re.sub(r"<[^>]+>", "", item["abstract"])
-                    metadata["abstract"] = abstract[:500]
-                # 关键词
-                subjects = item.get("subject", [])
-                if subjects:
-                    metadata["keywords"] = ", ".join(subjects)
-
+                metadata = self._parse_crossref_item(item)
                 # 必须有期刊名才算认证成功
                 if metadata.get("journal"):
                     best_metadata = metadata
@@ -1025,6 +1065,57 @@ class PaperOps:
             return best_metadata
         except Exception:
             return None
+
+    def _parse_crossref_item(self, item: dict) -> dict:
+        """从单条 CrossRef work item 提取标准化元数据（仅含存在的字段）
+
+        供 _search_crossref_by_title（标题认证取最佳匹配）与
+        search_crossref_by_query（关键词检索列候选）共用，消除重复解析逻辑。
+        字段: journal/title/authors/year/volume/issue/pages/doi/abstract/keywords。
+        """
+        metadata: dict = {}
+        # 期刊名
+        container_titles = item.get("container-title", [])
+        if container_titles:
+            metadata["journal"] = container_titles[0]
+        # 标题
+        titles = item.get("title", [])
+        if titles:
+            metadata["title"] = titles[0]
+        # 作者（CrossRef 拆分为 given/family，中文习惯 family 在前）
+        authors = item.get("author", [])
+        if authors:
+            author_names = []
+            for a in authors:
+                given = a.get("given", "")
+                family = a.get("family", "")
+                name = f"{family}{given}".strip() if family or given else ""
+                if name:
+                    author_names.append(name)
+            if author_names:
+                metadata["authors"] = ", ".join(author_names)
+        # 年份
+        date_parts = item.get("published", {}).get("date-parts", [[]])
+        if date_parts and date_parts[0]:
+            metadata["year"] = str(date_parts[0][0])
+        # 卷期页
+        if item.get("volume"):
+            metadata["volume"] = item["volume"]
+        if item.get("issue"):
+            metadata["issue"] = item["issue"]
+        if item.get("page"):
+            metadata["pages"] = item["page"]
+        # DOI
+        if item.get("DOI"):
+            metadata["doi"] = item["DOI"]
+        # 摘要（CrossRef 摘要可能含 XML 标签，去除后截断）
+        if item.get("abstract"):
+            metadata["abstract"] = re.sub(r"<[^>]+>", "", item["abstract"])[:500]
+        # 关键词
+        subjects = item.get("subject", [])
+        if subjects:
+            metadata["keywords"] = ", ".join(subjects)
+        return metadata
 
     def _parse_journal_metadata_from_text(self, text: str) -> Optional[dict]:
         """从搜索结果文本中解析期刊元数据

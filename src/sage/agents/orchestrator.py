@@ -49,6 +49,11 @@ from sage.paper_quality import run_quality_checks
 
 logger = logging.getLogger(__name__)
 
+# P0-3：并行 worker 的最大并发数 — 一批角色同时运行时，限制并发发起的 LLM 请求数，
+# 避免瞬间大量请求触发服务商限流（429）反而因重试更慢。3 为经验值，可经
+# AgentOrchestrator(max_concurrent_workers=...) 覆盖。
+DEFAULT_MAX_CONCURRENT_WORKERS = 3
+
 
 class AgentRole(Enum):
     """Agent 角色（Sage 论文写作系统）
@@ -88,7 +93,7 @@ class SubTask:
 @dataclass
 class CollaborationEvent:
     """协同事件（供 CLI/Web 展示）"""
-    type: str  # "task_created" | "worker_start" | "worker_done" | "reflection" | "text" | "reasoning" | "retry" | "progress" | "tool_start" | "tool_result" | "context_usage" | "done"
+    type: str  # "task_created" | "worker_start" | "worker_done" | "reflection" | "text" | "reasoning" | "retry" | "progress" | "tool_start" | "tool_result" | "context_usage" | "intent_confirm_required" | "done"
     role: str = ""
     content: str = ""
     metadata: dict = field(default_factory=dict)
@@ -105,6 +110,7 @@ class IntentResult:
     complexity: str  # "simple" | "complex"
     role: str        # AgentRole.value 或 "general"（通用Agent）
     reason: str = ""
+    confidence: str = "medium"  # P2-2：意图置信度 "high"(规则命中) | "medium"(LLM判定) | "low"(降级兜底)
 
 
 # 角色中文名映射（供事件展示）
@@ -128,11 +134,14 @@ class AgentOrchestrator:
         """获取所有 Agent 角色的信息（用于 API 动态展示）"""
         return get_agent_loader().get_all_role_info()
 
-    def __init__(self, workspace: Optional[Path] = None, conversation_id: Optional[str] = None, pool_mode: bool = False):
+    def __init__(self, workspace: Optional[Path] = None, conversation_id: Optional[str] = None, pool_mode: bool = False,
+                 max_concurrent_workers: int = DEFAULT_MAX_CONCURRENT_WORKERS):
         config = get_config()
         self.workspace = workspace or config.workspace
         self.conversation_id = conversation_id
         self.pool_mode = pool_mode
+        # P0-3：并行 worker 最大并发数（Semaphore 限流，防 LLM 限流雪崩）
+        self._max_concurrent_workers = max(1, int(max_concurrent_workers))
         self._workers: dict[AgentRole, AgentLoop] = {}
         self._general_worker: Optional[AgentLoop] = None  # 通用 Agent（不绑定角色）
         self._history: list[SubTask] = []
@@ -144,6 +153,9 @@ class AgentOrchestrator:
         self.project = self._create_project()
         # 跨会话持久草稿：加载上次的 paper_project.json / paper.md
         self.project.load()
+        # P2-1：本次对话（单次 collaborate）跨所有 worker + 编排器自身 LLM 调用累计的
+        # token 用量，由 _map_event / 静默 worker / _llm_call 汇入，supervisor done 统一上报
+        self._turn_tokens = {"prompt": 0, "completion": 0, "total": 0}
 
     def _configure_worker(self, worker: AgentLoop) -> AgentLoop:
         """统一配置 worker：恢复对话历史 + 应用池模式检索路由"""
@@ -218,7 +230,14 @@ class AgentOrchestrator:
         except ValueError:
             return None
 
-    async def collaborate(self, user_input: str, force_role: Optional[str] = None) -> AsyncIterator[CollaborationEvent]:
+    async def collaborate(
+        self,
+        user_input: str,
+        force_role: Optional[str] = None,
+        force_complexity: Optional[str] = None,
+        confirmed_intent: Optional[dict] = None,
+        auto_confirm: bool = False,
+    ) -> AsyncIterator[CollaborationEvent]:
         """写作模式入口 — 智能选择流程
 
         流程:
@@ -229,19 +248,36 @@ class AgentOrchestrator:
         Args:
             user_input: 用户原始需求
             force_role: 用户显式指定处理角色（如"literature"/"coder"），
-                        提供时跳过意图分析、按简单任务路由到该角色
+                        提供时跳过意图分析、按该角色路由
+            force_complexity: P2-2 用户显式指定复杂度（"simple"/"complex"），跳过意图分析
+            confirmed_intent: P2-2 阶段二 — 用户已确认的意图 {"complexity","role"}，
+                        提供时跳过意图分析与确认闸门，直接按确认值从断点执行
+            auto_confirm: P2-2 无确认 UI 的消费端（如 CLI）置 True，跳过闸门直接执行
         """
-        # Step 1: 意图分析（force_role 时跳过，用户已明确指定角色）
-        if force_role:
+        # P2-1：每次对话开始重置 token 累计器（orchestrator 实例按对话复用，避免跨对话累加）
+        self._turn_tokens = {"prompt": 0, "completion": 0, "total": 0}
+
+        # Step 1: 意图分析（用户已确认/显式指定路由时跳过，直接按确认值执行）
+        _confirmed = confirmed_intent or {}
+        if _confirmed or force_role or force_complexity:
+            # 复杂度优先级：confirmed_intent > force_complexity > "simple"（兼容旧 force_role 行为）
+            c_complexity = _confirmed.get("complexity") or force_complexity or "simple"
+            if c_complexity not in ("simple", "complex"):
+                c_complexity = "simple"
+            # 角色优先级：confirmed_intent > force_role > 按复杂度派生（complex→主编，simple→通用）
+            c_role = _confirmed.get("role") or force_role or ("supervisor" if c_complexity == "complex" else "general")
+            # 兼容既有断言：仅 force_role（无 confirmed_intent）时理由保持"用户指定角色"
+            _reason = "用户确认意图" if _confirmed else "用户指定角色"
             intent = IntentResult(
-                complexity="simple",
-                role=force_role,
-                reason="用户指定角色",
+                complexity=c_complexity,
+                role=c_role,
+                reason=_reason,
+                confidence="high",
             )
             yield CollaborationEvent(
                 type="task_created",
                 role="supervisor",
-                content=f"用户指定角色: {_ROLE_LABELS.get(force_role, force_role)}",
+                content=f"用户指定角色: {_ROLE_LABELS.get(c_role, c_role)}",
             )
         else:
             # 澄清回路：信息严重不足时反问，而非盲目开工
@@ -254,7 +290,7 @@ class AgentOrchestrator:
                         "需要完整论文，还是某个部分（摘要/目录/引言/结论/某一章节）？"
                     ),
                 )
-                yield CollaborationEvent(type="done", role="supervisor")
+                yield self._done_event()
                 return
             yield CollaborationEvent(
                 type="task_created",
@@ -270,6 +306,25 @@ class AgentOrchestrator:
             content=f"意图分析结果: {'复杂任务(多智能体协作)' if intent.complexity == 'complex' else '简单任务'} → {role_label}。理由: {intent.reason}",
         )
 
+        # P2-2：意图确认闸门 — 高风险任务（复杂 / 低置信度）先暂停，
+        # 发 intent_confirm_required 事件回显意图，由前端确认或纠正后再从断点续跑。
+        # 已确认/显式指定/无确认 UI（auto_confirm）时跳过，避免确认 complex 意图后死循环。
+        _skip_gate = bool(_confirmed or force_role or force_complexity or auto_confirm)
+        if self._should_confirm_intent(intent, has_confirmed=_skip_gate):
+            yield CollaborationEvent(
+                type="intent_confirm_required",
+                role="supervisor",
+                content=intent.reason,
+                metadata={
+                    "complexity": intent.complexity,
+                    "role": intent.role,
+                    "confidence": getattr(intent, "confidence", "medium"),
+                    "echo_message": user_input,
+                },
+            )
+            yield self._done_event()
+            return
+
         # 断点续写：已有草稿 + 续写意图 → 续写未完成章节（优先于常规路由）
         if _is_continuation(user_input) and self.project.read_draft().strip():
             missing = self.project.missing_sections()
@@ -279,7 +334,7 @@ class AgentOrchestrator:
                     role="supervisor",
                     content="所有章节均已完成，如需修改请使用修订指令（如“把结论改保守”）。",
                 )
-                yield CollaborationEvent(type="done", role="supervisor")
+                yield self._done_event()
                 return
             yield CollaborationEvent(
                 type="reflection",
@@ -315,7 +370,7 @@ class AgentOrchestrator:
                     role="supervisor",
                     content=f"续写完成，草稿已更新: {path}（{self.project.outline_progress()}）",
                 )
-            yield CollaborationEvent(type="done", role="supervisor")
+            yield self._done_event()
             return
 
         # Step 2: 简单任务 — 路由到匹配角色 Agent 或通用 Agent
@@ -361,7 +416,7 @@ class AgentOrchestrator:
                     content=f"草稿已更新: {path}",
                 )
 
-            yield CollaborationEvent(type="done", role="supervisor")
+            yield self._done_event()
             return
 
         # Step 3: 复杂任务 — 主编动态调度子智能体（按批次并行）
@@ -579,7 +634,7 @@ class AgentOrchestrator:
                 metadata={"error": str(e)},
             )
 
-        yield CollaborationEvent(type="done", role="supervisor")
+        yield self._done_event()
 
     async def _run_worker(self, role: AgentRole, prompt: str) -> str:
         """运行一个 Worker 并收集文本输出
@@ -618,15 +673,18 @@ class AgentOrchestrator:
                 logger.warning("长输入 LLM 意图分析失败，回退规则: %s", e)
                 quick = self._quick_classify(user_input)
                 if quick is not None:
+                    quick.confidence = "high"  # P2-2：规则命中 → 高置信度
                     return quick
                 return IntentResult(
                     complexity="complex", role="supervisor",
                     reason="LLM 分析失败，降级为复杂任务",
+                    confidence="low",  # P2-2：降级兜底 → 低置信度，触发确认闸门
                 )
 
         # ── 短输入：规则快判优先，未命中再 LLM ──
         quick = self._quick_classify(user_input)
         if quick is not None:
+            quick.confidence = "high"  # P2-2：规则命中 → 高置信度
             return quick
         try:
             return await self._analyze_intent_with_llm(user_input)
@@ -637,7 +695,21 @@ class AgentOrchestrator:
                 complexity="complex",
                 role="supervisor",
                 reason=f"意图分析 LLM 调用失败，降级为复杂任务: {e}",
+                confidence="low",  # P2-2：降级兜底 → 低置信度，触发确认闸门
             )
+
+    def _should_confirm_intent(self, intent: IntentResult, has_confirmed: bool) -> bool:
+        """P2-2：判断是否需要暂停并向用户确认意图（意图确认闸门）
+
+        仅高风险时触发（避免高置信度简单任务被无谓打断）：
+          - 复杂任务（complexity=="complex"，多智能体全流程，代价高、误判损失大）
+          - 低置信度（confidence=="low"，LLM 分析失败降级兜底，意图不可靠）
+        用户已确认/显式指定意图（has_confirmed=True）时不再重复确认。
+        getattr 防御：兼容未带 confidence 字段的旧 IntentResult / 测试替身。
+        """
+        if has_confirmed:
+            return False
+        return intent.complexity == "complex" or getattr(intent, "confidence", "medium") == "low"
 
     def _quick_classify(self, user_input: str) -> Optional[IntentResult]:
         """快速规则判断 — 基于动词+宾语模式直接匹配智能体，不确定返回 None 触发 LLM 分析
@@ -710,11 +782,16 @@ class AgentOrchestrator:
         # ── 第六优先级：短问题兜底匹配 ──
         if len(user_input) < 30:
             fallback_role = self._match_role_by_keywords(user_input)
-            return IntentResult(
-                complexity="simple",
-                role=fallback_role,
-                reason="短问题，由匹配角色处理",
-            )
+            # 关键词命中具体角色 → 规则快速路由（省一次 LLM 调用）
+            if fallback_role != "general":
+                return IntentResult(
+                    complexity="simple",
+                    role=fallback_role,
+                    reason="短问题，由匹配角色处理",
+                )
+            # 连关键词都无法确定角色（general 兜底）→ 不武断路由到通用助手，
+            # 返回 None 交给 LLM 精判：避免"AI 伦理""polish abstract"等
+            # 模糊或英文短输入因词表未覆盖被错分，丢失真实意图（P0-1）
 
         # ── 不确定 — 交给 LLM 分析 ──
         return None
@@ -802,17 +879,42 @@ class AgentOrchestrator:
         last_error = None
         for attempt in range(1, 4):
             try:
-                return await self._llm.achat_with_tools(
+                response = await self._llm.achat_with_tools(
                     messages=messages,
                     tools=[],
                     max_tokens=max_tokens,
                 )
+                # P2-1：编排器自身的 LLM 调用（意图/计划/大纲）也计入本次对话 token
+                self._accumulate_turn_tokens(getattr(response, "usage", None))
+                return response
             except Exception as e:
                 last_error = e
                 logger.warning("编排 LLM 调用失败（第 %d 次尝试）: %s", attempt, e)
                 if attempt < 3:
                     await asyncio.sleep(1.0 * (2 ** (attempt - 1)))
         raise last_error
+
+    def _intent_feedback_hint(self, user_input: str) -> str:
+        """P2-2：从语义记忆召回与当前请求相似的历史意图纠正，组成提示附加到意图分析 system prompt
+
+        仅 LLM 意图分析路径调用（纯规则快判不查记忆以保低延迟）。无命中/异常返回空串。
+        """
+        try:
+            from sage.memory.memory_orch import create_memory_orchestrator
+            mem = create_memory_orchestrator()
+            if not mem or not mem.semantic:
+                return ""
+            hits = mem.semantic.search(user_input, top_k=3)
+            relevant = [h for h in hits if h.get("memory_type") in ("intent_correction", "preference")]
+            if not relevant:
+                return ""
+            lines = ["\n\n## 过往意图纠正提示（避免重复误判）"]
+            for h in relevant[:3]:
+                lines.append(f"- {h.get('content', '')[:160]}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning("召回意图纠正反馈失败（忽略，不影响意图分析）: %s", e)
+            return ""
 
     async def _analyze_intent_with_llm(self, user_input: str) -> IntentResult:
         """使用 LLM 进行精细意图分析
@@ -843,6 +945,9 @@ class AgentOrchestrator:
 
 必须输出 JSON 格式（不要任何其他内容）:
 {"complexity": "simple" 或 "complex", "role": "角色名", "reason": "简短理由(不超过30字)"}"""
+
+        # P2-2：反哺注入 — 召回与当前请求相似的历史意图纠正，提示 LLM 避免重复误判（无命中则不加）
+        system_prompt += self._intent_feedback_hint(user_input)
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1100,6 +1205,8 @@ class AgentOrchestrator:
         async for event in worker.run(prompt):
             if event.type == "text":
                 results.append(event.content)
+            elif event.type == "done":
+                self._accumulate_turn_tokens(event.tokens)
         return "\n".join(results)
 
     async def _review_round(self) -> str:
@@ -1120,6 +1227,8 @@ class AgentOrchestrator:
         async for event in worker.run(prompt):
             if event.type == "text":
                 results.append(event.content)
+            elif event.type == "done":
+                self._accumulate_turn_tokens(event.tokens)
         return "\n".join(results)
 
     async def _generate_data_suggestions(self) -> str:
@@ -1179,6 +1288,10 @@ class AgentOrchestrator:
         # worker 完成信号 (role_name, text_output, ok) 也走同一队列，
         # 保证「worker_start → 过程事件 → 完成信号」的相对顺序不丢（单队列无竞态）
         event_queue: asyncio.Queue = asyncio.Queue()
+        # P0-3：并发信号量 — 限制同时运行的 worker 数，避免一批角色瞬间发起
+        # 大量 LLM 请求触发服务商限流（429）。超额 worker 在获取额度前排队，
+        # 排队期间不发 worker_start，避免前端误显示"已开始"。
+        sem = asyncio.Semaphore(self._max_concurrent_workers)
 
         async def run_single(role_name: str):
             """运行单个 worker，事件边产边入队（不再等完整结束才 yield）"""
@@ -1205,19 +1318,21 @@ class AgentOrchestrator:
                     ))
                     return
 
-                await event_queue.put(CollaborationEvent(
-                    type="worker_start",
-                    role=role_name,
-                    content=f"{role_label}开始工作...",
-                ))
+                # 获取并发额度后才真正启动 worker（并发受限时在此排队）
+                async with sem:
+                    await event_queue.put(CollaborationEvent(
+                        type="worker_start",
+                        role=role_name,
+                        content=f"{role_label}开始工作...",
+                    ))
 
-                async for event in worker.run(prompt):
-                    mapped = self._map_event(event, role_name)
-                    if mapped:
-                        # 实时转发给前端（不等 worker 结束）
-                        await event_queue.put(mapped)
-                        if mapped.type == "text":
-                            text_parts.append(mapped.content)
+                    async for event in worker.run(prompt):
+                        mapped = self._map_event(event, role_name)
+                        if mapped:
+                            # 实时转发给前端（不等 worker 结束）
+                            await event_queue.put(mapped)
+                            if mapped.type == "text":
+                                text_parts.append(mapped.content)
                 ok = True  # 正常产出完毕
             except asyncio.CancelledError:
                 raise
@@ -1232,7 +1347,7 @@ class AgentOrchestrator:
                 # 完成信号：跑完（无论成败）都会入队，供主循环收尾
                 await event_queue.put((role_name, _join_stream_text(text_parts), ok))
 
-        # 并行启动所有 worker
+        # 并行启动所有 worker（实际 LLM 并发由 sem 限流）
         tasks = [asyncio.create_task(run_single(r)) for r in roles]
         finished = 0
         try:
@@ -1283,12 +1398,6 @@ class AgentOrchestrator:
                     t.cancel()
             raise
 
-    def _has_file_changes(self, agent: AgentLoop) -> bool:
-        """检查 Agent 是否进行了实际文件修改（Sage 不依赖 git）"""
-        # Sage 论文写作系统不使用 git 检测文件变更，
-        # 简化实现：只要 Agent 调用了 write_file/edit_file 工具即视为有修改
-        return True
-
     def _persist_citation_manifest(self, citation_output: str, project: PaperProject):
         """引用管理员产出中包含的「引用说明对照清单」落盘为 workspace/citations.md
 
@@ -1321,8 +1430,40 @@ class AgentOrchestrator:
         except Exception as e:
             logger.warning("引用说明对照清单落盘失败: %s", e)
 
+    def _accumulate_turn_tokens(self, tokens: Optional[dict]) -> None:
+        """P2-1：把一次 token 用量并入本次对话累计（就地修改 self._turn_tokens）。
+
+        兼容两种口径：LoopEvent/turn 格式 {"prompt","completion","total"} 与
+        OpenAI usage 格式 {"prompt_tokens","completion_tokens","total_tokens"}。
+        缺失字段按 0 计；total 缺失时用 prompt+completion 兜底。
+        """
+        if not tokens:
+            return
+        p = tokens.get("prompt", tokens.get("prompt_tokens", 0)) or 0
+        c = tokens.get("completion", tokens.get("completion_tokens", 0)) or 0
+        t = tokens.get("total", tokens.get("total_tokens", 0)) or 0
+        if not t:
+            t = p + c
+        self._turn_tokens["prompt"] += p
+        self._turn_tokens["completion"] += c
+        self._turn_tokens["total"] += t
+
+    def _done_event(self) -> CollaborationEvent:
+        """P2-1：构造 supervisor done 事件，附带本次对话累计的 token 用量。"""
+        return CollaborationEvent(
+            type="done",
+            role="supervisor",
+            tokens=dict(self._turn_tokens),
+        )
+
     def _map_event(self, event: LoopEvent, role: str) -> Optional[CollaborationEvent]:
         """将 AgentLoop 事件映射为 CollaborationEvent"""
+        # done 事件：worker 单轮 token 用量并入本次对话累计（由 supervisor done 统一上报）。
+        # 返回 None 不再转发——原默认分支会把 done 误映射成 worker_start，
+        # 在前端产生一张多余的“开始工作”协作卡片（既有瑕疵，随 P2-1 一并修正）。
+        if event.type == "done":
+            self._accumulate_turn_tokens(event.tokens)
+            return None
         # reasoning 事件直接透传（模型思考内容）
         if event.type == "reasoning":
             return CollaborationEvent(

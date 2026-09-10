@@ -26,6 +26,12 @@ from sage.memory.store import MemoryStore, get_store
 
 logger = logging.getLogger(__name__)
 
+# P0-2：语义相似度阈值 — search 时原始余弦相似度低于此值的记忆视为不相关，
+# 不注入 prompt，避免低相关历史噪声污染上下文（对话隔离）。
+# 取值依据：sentence-transformers 类模型语义相关通常 >0.4、不相关 <0.3，
+# 0.35 为偏保守经验值（宁可少召回，也不注入噪声）。置 0 可关闭过滤。
+DEFAULT_MIN_SIMILARITY = 0.35
+
 
 class SemanticMemory:
     """语义记忆管理器 — 基于 Embedding 的智能检索"""
@@ -34,9 +40,12 @@ class SemanticMemory:
     # 只读矩阵，避免每实例重复从 SQLite 反序列化全量向量（内存冗余 + 检索低效）
     _SHARED_CACHE: dict[str, list | None] = {}
 
-    def __init__(self, store: Optional[MemoryStore] = None):
+    def __init__(self, store: Optional[MemoryStore] = None,
+                 min_similarity: float = DEFAULT_MIN_SIMILARITY):
         self.store = store or get_store()
         self._embedder = None
+        # P0-2：语义相似度阈值（原始余弦相似度），低于此值的检索结果被丢弃
+        self.min_similarity = min_similarity
         # 以 db_path 为键共享：指向 _SHARED_CACHE 中当前值（None 表示未构建）
         self._cache_key = str(getattr(self.store, "db_path", ""))
         self._shared = SemanticMemory._SHARED_CACHE.setdefault(self._cache_key, None)
@@ -151,6 +160,12 @@ class SemanticMemory:
         idx = np.argsort(-weighted)[:top_k]
         scored = []
         for i in idx:
+            sim = float(scores[i])
+            # P0-2：原始余弦相似度低于阈值 → 语义不相关，丢弃不注入 prompt。
+            # importance 加权（weights）仅影响排序，不参与相关性判定，
+            # 避免"高重要性但低相关"的记忆污染上下文。
+            if sim < self.min_similarity:
+                continue
             row = meta[i]
             scored.append({
                 "id": row["id"],
@@ -159,6 +174,7 @@ class SemanticMemory:
                 "conversation_id": row["conversation_id"],
                 "importance": row.get("importance", 0.5),
                 "score": round(float(weighted[i]), 4),
+                "similarity": round(sim, 4),
             })
         return scored
 

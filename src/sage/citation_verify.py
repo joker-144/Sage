@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
+from sage.core.crossref import crossref_get
+
 logger = logging.getLogger(__name__)
 
 # 参考文献章节标题（与 paper_quality.check_references 的匹配规则保持一致）
@@ -223,46 +225,34 @@ async def _resolve_doi(doi: str, timeout: float) -> tuple[str, str, float]:
     Returns:
         (status, matched_title, score)：status 为 verified / not_found / network_error
     """
-    import httpx
-    url = f"https://api.crossref.org/works/{doi}"
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
-                url, headers={"User-Agent": "Sage/1.0 (mailto:sage@example.com)"}
-            )
-        if resp.status_code == 200:
-            titles = resp.json().get("message", {}).get("title", [])
-            return "verified", (titles[0] if titles else ""), 1.0
-        if resp.status_code == 404:
-            return "not_found", "", 0.0
-        return "network_error", "", 0.0
-    except Exception as e:
-        logger.debug("DOI 解析失败 %s: %s", doi, e)
-        return "network_error", "", 0.0
+    # P1-2：统一走 core.crossref 共享客户端（mailto 礼貌池 + 限速 + 429/5xx 退避）
+    status_code, data = await crossref_get(f"works/{doi}", timeout=timeout)
+    if status_code == 200 and data:
+        titles = data.get("message", {}).get("title", [])
+        return "verified", (titles[0] if titles else ""), 1.0
+    if status_code == 404:
+        return "not_found", "", 0.0
+    # 0（网络错误/重试耗尽）或其它状态码 → 不作为"编造"依据
+    return "network_error", "", 0.0
 
 
 async def _crossref_bibliographic(query: str, timeout: float) -> list[dict]:
     """CrossRef bibliographic 检索，返回候选 [{title, doi}]"""
-    import httpx
     import urllib.parse
-    url = f"https://api.crossref.org/works?query.bibliographic={urllib.parse.quote(query)}&rows=5"
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
-                url, headers={"User-Agent": "Sage/1.0 (mailto:sage@example.com)"}
-            )
-            if resp.status_code != 200:
-                return []
-            items = resp.json().get("message", {}).get("items", [])
-        candidates = []
-        for item in items:
-            titles = item.get("title") or []
-            if titles:
-                candidates.append({"title": titles[0], "doi": item.get("DOI", "")})
-        return candidates
-    except Exception as e:
-        logger.debug("CrossRef bibliographic 检索失败: %s", e)
+    # P1-2：统一走 core.crossref 共享客户端（mailto 礼貌池 + 限速 + 429/5xx 退避）
+    status_code, data = await crossref_get(
+        f"works?query.bibliographic={urllib.parse.quote(query)}&rows=5",
+        timeout=timeout,
+    )
+    if status_code != 200 or not data:
         return []
+    items = data.get("message", {}).get("items", [])
+    candidates = []
+    for item in items:
+        titles = item.get("title") or []
+        if titles:
+            candidates.append({"title": titles[0], "doi": item.get("DOI", "")})
+    return candidates
 
 
 async def _verify_chinese_db(title: str, workspace) -> tuple[str, str]:
